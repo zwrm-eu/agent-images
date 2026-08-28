@@ -74,7 +74,14 @@ ENV PATH="/usr/local/cargo/bin:${PATH}"
 # -- Bun (system-wide — #1347) ---------------------------------------------------
 # BUN_INSTALL is build-time only: unset at runtime, bun's global installs and
 # cache default under ~/.bun on the workspace volume.
-RUN curl -fsSL https://bun.sh/install | BUN_INSTALL=/usr/local/bun bash
+# HOME=/root + /usr/local/bun/bin pre-set on PATH keep the installer's
+# post-install hands off the seeded agent profile: with the binary already
+# findable its `command -v bun` check passes and it skips writing
+# BUN_INSTALL/PATH exports into $HOME's shell config — which, with the
+# image's inherited HOME=/home/agent, would turn the build-time-only
+# variable into a runtime setting on every workspace (#1347 review).
+RUN curl -fsSL https://bun.sh/install \
+    | HOME=/root PATH="/usr/local/bun/bin:${PATH}" BUN_INSTALL=/usr/local/bun bash
 ENV PATH="/usr/local/bun/bin:${PATH}"
 
 # -- Build-residue cleanup (#1347) -----------------------------------------------
@@ -89,8 +96,13 @@ RUN rm -rf /root/.npm /root/.cache \
 
 USER agent
 
-# -- Go bin for agent user -----------------------------------------------------
-RUN mkdir -p /home/agent/go/bin
+# -- Per-user install bins (seeded empty — #1347 review) ------------------------
+# The boot PATH discovery only records directories that EXIST at boot. The
+# home-installed toolchains used to guarantee ~/.cargo/bin and ~/.bun/bin in
+# the skel; with the toolchains system-wide, seed the dirs empty so a later
+# `cargo install` / `bun add -g` is on PATH in every shell immediately,
+# instead of invisible until a reboot regenerates zwrmd-volume-path.sh.
+RUN mkdir -p /home/agent/go/bin /home/agent/.cargo/bin /home/agent/.bun/bin
 ENV GOPATH="/home/agent/go"
 ENV PATH="/home/agent/go/bin:${PATH}"
 
