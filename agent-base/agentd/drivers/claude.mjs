@@ -4,7 +4,7 @@
 // and the #913 turn-ledger idle derivation all carry over unchanged.
 
 import { accessSync, openSync, readSync, closeSync, constants as fsConstants } from 'node:fs'
-import { homedir } from 'node:os'
+import { userInfo } from 'node:os'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { query, tool, createSdkMcpServer } from '@anthropic-ai/claude-agent-sdk'
@@ -51,8 +51,25 @@ class PromiseQueue {
 // contract as SDK option validation); the daemon's seed gate has cleared by
 // the time a harness spawns, so a missing launcher means a genuinely broken
 // volume, not an in-progress seed.
-export function resolveClaudeExecutable(env = process.env) {
-  const p = env.ZWRM_CLAUDE_BIN || join(env.HOME || homedir(), '.local', 'bin', 'claude')
+//
+// The launcher lives under the AGENT ACCOUNT's home (the native install is
+// always seeded at /home/agent/.local/bin/claude), so resolution uses the
+// passwd home from userInfo(), NOT $HOME — agent secrets may legitimately
+// define a HOME variable, and the boot profile exports it into this process
+// before any session starts (#1347 review). ZWRM_CLAUDE_BIN remains the only
+// env-driven override, and it is explicit.
+export function accountHome() {
+  try {
+    const h = userInfo().homedir
+    if (h) return h
+  } catch {
+    // no passwd entry for the daemon's uid — fall through
+  }
+  return '/home/agent'
+}
+
+export function resolveClaudeExecutable(env = process.env, home = accountHome()) {
+  const p = env.ZWRM_CLAUDE_BIN || join(home, '.local', 'bin', 'claude')
   try {
     accessSync(p, fsConstants.X_OK)
   } catch {
