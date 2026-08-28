@@ -1,0 +1,13 @@
+#!/bin/sh
+# zwrm-reclaim — drop reclaimable guest memory so virtio-balloon free page
+# reporting can hand it back to the host (#851). Moves page cache to the
+# free list (FPR only sees FREE pages) and compacts, shrinking host RSS and
+# the working set a suspend snapshot has to persist.
+#
+# Invoked by zwrm-agentd via sudo at idle/pre-suspend. Deliberately takes no
+# arguments — a fixed, root-owned entry point keeps the privileged surface
+# one auditable line.
+set -eu
+sync
+echo 3 > /proc/sys/vm/drop_caches
+echo 1 > /proc/sys/vm/compact_memory || true

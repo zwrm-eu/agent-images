@@ -1,0 +1,24 @@
+# This repository is a read-only mirror — see README.md. PRs cannot be
+# merged here (the sync would overwrite them), so close them politely and
+# point contributors at issues instead.
+name: Close pull requests (read-only mirror)
+
+on:
+  pull_request_target:
+    types: [opened, reopened]
+
+permissions:
+  pull-requests: write
+
+jobs:
+  close:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Comment and close
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" --body \
+            "Thanks for the contribution! This repository is a **read-only mirror** — its contents are synced automatically from ZWRM's platform repository, so pull requests here would be overwritten on the next sync. Please open an issue describing the change instead, and we'll pick it up in the source repo."
+          gh pr close "$PR" --repo "$GITHUB_REPOSITORY"
