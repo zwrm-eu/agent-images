@@ -1,0 +1,5 @@
+#!/bin/sh
+# Stable launch path for the session daemon; the VM init backgrounds this as
+# the non-root agent user with ZWRM_AGENTD_CONFIG pointing at the boot-config
+# supplied daemon spec.
+exec node /opt/zwrm-agentd/server.mjs "$@"

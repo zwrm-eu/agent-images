@@ -1,0 +1,4 @@
+# .gitignore does not affect the Docker build context: a local npm install in
+# agentd/ would otherwise be shipped into the context and then clobbered by
+# the image's own `npm ci`.
+agentd/node_modules/
