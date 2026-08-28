@@ -7,12 +7,6 @@ Source for the VM images that power [ZWRM](https://zwrm.eu) coding agents:
 | [`agent-base/`](agent-base/) | [`ghcr.io/zwrm-eu/agent-base`](https://github.com/zwrm-eu/agent-images/pkgs/container/agent-base) | GitHub Actions, published on every change |
 | [`agent-default/`](agent-default/) | the default "kitchen sink" agent image | on each ZWRM control plane, from this Dockerfile |
 
-> **This is a read-only mirror.** The source of truth lives in ZWRM's private
-> platform repository and is synced here automatically on every merge, so
-> what you read here is exactly what the published images are built from.
-> **Issues are welcome**; pull requests are closed automatically — if you want
-> a change, open an issue instead.
-
 ## Extending agent-base
 
 `agent-base` is the public base for custom agent templates. Create a GitHub
