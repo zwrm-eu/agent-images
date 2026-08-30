@@ -440,6 +440,12 @@ async function startSession(spec) {
     lastResult: null,
     ending: false,
     driver: null,
+    // The create spec, retained for in-place mutation: the gateway-token
+    // refresh endpoint (#1363) rewrites spec.env and the mcp_servers header
+    // objects, which the MCP bridge holds BY REFERENCE (connectServer) and
+    // which a seed-deferred construction reads later — so a refresh lands no
+    // matter when the driver actually constructs.
+    spec,
   }
 
   // The shared machinery drivers reach back into. Passed explicitly so the
@@ -1106,6 +1112,37 @@ async function handleMode(req, res, s) {
   send(res, 200, { mode: body.mode })
 }
 
+// Gateway-token refresh (#1363, the 'token-refresh' cap): the control plane
+// rotates the session's platform credential in place when the 24h-TTL token
+// minted at session create would expire under a still-live session. Three
+// sinks, all of which resolve the credential late enough for a swap to land:
+//  - process.env: pi resolves the "$ZWRM_GATEWAY_TOKEN" apiKey reference from
+//    the environment on EVERY completion request, so the next turn simply
+//    uses the new token (the daemon hosts one session at a time — process
+//    env IS session env, the same contract driver construction relies on).
+//  - spec.mcp_servers[*].headers: held by reference by the MCP bridge's
+//    transports (connectServer), so bridged connector/skill tools pick the
+//    new bearer up on their next request.
+//  - spec.env: a seed-deferred driver constructs from the spec AFTER this
+//    endpoint may have run; without the rewrite construction would clobber
+//    process.env with the stale create-time token.
+// Deliberately NOT a general env-update endpoint: the gateway credential is
+// platform-owned (secrets/reserved.go) and nothing else needs rotation.
+async function handleGatewayToken(req, res, s) {
+  const body = await readBody(req)
+  const token = typeof body.token === 'string' ? body.token.trim() : ''
+  if (!token) throw badRequest('missing token')
+  process.env.ZWRM_GATEWAY_TOKEN = token
+  s.spec.env = { ...(s.spec.env || {}), ZWRM_GATEWAY_TOKEN: token }
+  for (const cfg of Object.values(s.spec.mcp_servers || {})) {
+    if (cfg && cfg.headers && cfg.headers.Authorization) {
+      cfg.headers.Authorization = `Bearer ${token}`
+    }
+  }
+  log(`session ${s.id}: gateway token refreshed`)
+  send(res, 200, { refreshed: true })
+}
+
 // Graceful end: the current turn finishes (an abrupt stop is what /interrupt
 // is for), but nothing may block on a human anymore — pending approvals are
 // denied and later tool prompts auto-deny via s.ending.
@@ -1195,7 +1232,11 @@ const server = createServer(async (req, res) => {
         // below (and on idle session.status payloads), so the CP may trust a
         // zero. Without the cap the CP treats the count as unknown and keeps
         // today's suspend/complete behavior.
-        caps: ['mcp', 'escalation', 'files', 'file-search', 'message-context', 'park', 'reclaim', 'skillfetch', 'pi-multiprovider', 'pi-gateway', 'background-tasks', 'tool-policy', ...HARNESS_CAPS],
+        // 'token-refresh' (#1363): POST /v1/sessions/{id}/gateway-token
+        // rotates the session's platform credential in place; the CP's
+        // admission-time refresh gates on it (a stale daemon would silently
+        // keep the expired token).
+        caps: ['mcp', 'escalation', 'files', 'file-search', 'message-context', 'park', 'reclaim', 'skillfetch', 'pi-multiprovider', 'pi-gateway', 'background-tasks', 'tool-policy', 'token-refresh', ...HARNESS_CAPS],
         active_session: session && !isDone(session) ? session.id : null,
         state: session?.state ?? null,
         // Live background work (#1251): tasks the harness still tracks after
@@ -1231,6 +1272,7 @@ const server = createServer(async (req, res) => {
       if (req.method === 'POST' && action === 'permissions' && parts.length === 5) return await handlePermission(req, res, s, parts[4])
       if (req.method === 'POST' && action === 'parks' && parts.length === 6 && parts[5] === 'resolve') return await handleParkResolve(req, res, s, parts[4])
       if (req.method === 'POST' && action === 'mode' && parts.length === 4) return await handleMode(req, res, s)
+      if (req.method === 'POST' && action === 'gateway-token' && parts.length === 4) return await handleGatewayToken(req, res, s)
       if (req.method === 'POST' && action === 'end' && parts.length === 4) return handleEnd(res, s)
     }
     send(res, 404, { error: 'not found' })

@@ -17,6 +17,7 @@ import {
   resultPayload,
   sumAssistantUsage,
   toolResultsPayload,
+  turnErrorMessage,
   usagePayload,
 } from '../drivers/pi-translate.mjs'
 
@@ -59,6 +60,42 @@ test('assistantPayload produces the claude assistant message shape', () => {
     cache_read_input_tokens: 2,
     cache_creation_input_tokens: 1,
   })
+})
+
+test('assistantPayload carries the errorMessage of a failed model call (#1363)', () => {
+  const p = assistantPayload({
+    role: 'assistant',
+    content: [],
+    model: 'zwrm/auto',
+    stopReason: 'error',
+    errorMessage: '401 status from gateway',
+  })
+  assert.equal(p.message.stop_reason, 'error')
+  assert.equal(p.message.error_message, '401 status from gateway')
+  // Clean completions carry no error field at all.
+  assert.equal(assistantPayload({ role: 'assistant', content: [], stopReason: 'stop' }).message.error_message, undefined)
+})
+
+test('turnErrorMessage flags a cycle only when its FINAL assistant message errored', () => {
+  assert.equal(
+    turnErrorMessage([
+      { role: 'assistant', content: [], stopReason: 'error', errorMessage: 'expired token' },
+    ]),
+    'expired token',
+  )
+  // Errored mid-cycle but recovered: not a failed turn.
+  assert.equal(
+    turnErrorMessage([
+      { role: 'assistant', content: [], stopReason: 'error', errorMessage: 'blip' },
+      { role: 'assistant', content: [{ type: 'text', text: 'ok' }], stopReason: 'stop' },
+    ]),
+    null,
+  )
+  // Interrupts are not errors; empty cycles are not errors.
+  assert.equal(turnErrorMessage([{ role: 'assistant', content: [], stopReason: 'aborted' }]), null)
+  assert.equal(turnErrorMessage([]), null)
+  // An errored call with no text still yields a non-empty reason.
+  assert.ok(turnErrorMessage([{ role: 'assistant', content: [], stopReason: 'error' }]))
 })
 
 test('toolResultsPayload maps pi tool results to a claude user message', () => {

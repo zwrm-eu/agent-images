@@ -66,7 +66,9 @@ export function usagePayload(u) {
 }
 
 // assistantPayload maps a completed pi assistant message (message_end) to the
-// claude `assistant` stream-json shape.
+// claude `assistant` stream-json shape. errorMessage is pi-ai's failure text
+// on a stopReason:'error' message (#1363) — without mapping it, an errored
+// turn reached the control plane as empty content with no reason anywhere.
 export function assistantPayload(msg) {
   return {
     type: 'assistant',
@@ -76,6 +78,7 @@ export function assistantPayload(msg) {
       model: msg?.model ?? '',
       ...(msg?.usage ? { usage: usagePayload(msg.usage) } : {}),
       ...(msg?.stopReason ? { stop_reason: msg.stopReason } : {}),
+      ...(msg?.errorMessage ? { error_message: msg.errorMessage } : {}),
     },
   }
 }
@@ -152,6 +155,26 @@ export function lastAssistantText(messages) {
     if (texts.length > 0) return texts.join('\n')
   }
   return ''
+}
+
+// turnErrorMessage inspects a cycle's messages (agent_end order) and returns
+// the failure text when the cycle's FINAL assistant message ended
+// stopReason:'error' — pi-ai's shape for "the model call itself failed"
+// (expired gateway credential, upstream 4xx/5xx). null means the cycle
+// settled normally. Only the last assistant message decides: an errored call
+// mid-cycle that pi retried into a clean completion is not a failed turn, and
+// 'aborted' (interrupt) is not an error. This is what stops an errored turn
+// from being recorded as a $0 subtype:success with an empty result — the
+// silent-failure shape #1149 warns about, resurfacing via expired credentials
+// (#1363).
+export function turnErrorMessage(messages) {
+  for (let i = (messages || []).length - 1; i >= 0; i--) {
+    const m = messages[i]
+    if (m?.role !== 'assistant') continue
+    if (m.stopReason !== 'error') return null
+    return m.errorMessage || 'the model call failed with no error text'
+  }
+  return null
 }
 
 // resultPayload builds the claude `result` message for a settled pi prompt

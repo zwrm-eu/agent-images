@@ -138,6 +138,37 @@ test('bearer rides every request; dead servers degrade; abort rejects fast', asy
   }
 })
 
+test('mutating cfg.headers rotates the bearer on a LIVE bridge (#1363)', async () => {
+  // The gateway-token refresh endpoint swaps the platform credential by
+  // mutating the spec's header objects in place; the bridge must hold them
+  // by reference (no defensive copy in connectServer) or every bridged tool
+  // stays pinned to the expired create-time token. This pins that contract
+  // at the HTTP level: same client, no reconnect, new bearer on the wire.
+  const requests = []
+  const srv = statelessMCPServer(requests)
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r))
+  const url = `http://127.0.0.1:${srv.address().port}/mcp`
+  const cfg = { type: 'http', url, headers: { Authorization: 'Bearer stale' } }
+
+  const bridge = await buildBridgedTools({ svc: cfg }, () => {})
+  try {
+    await bridge.tools[0].execute('tc1', {})
+    assert.ok(requests.every((r) => r.auth === 'Bearer stale'))
+
+    cfg.headers.Authorization = 'Bearer fresh'
+    const before = requests.length
+    await bridge.tools[0].execute('tc2', {})
+    const after = requests.slice(before)
+    assert.ok(after.length > 0, 'second call reached the server')
+    for (const r of after) {
+      assert.equal(r.auth, 'Bearer fresh', `stale bearer survived on ${r.method}`)
+    }
+  } finally {
+    bridge.close()
+    srv.close()
+  }
+})
+
 test('isConnectionError gates the retry: transport death yes, timeout/server errors no', () => {
   assert.ok(isConnectionError(new Error('fetch failed')))
   assert.ok(isConnectionError(new Error('socket hang up')))
