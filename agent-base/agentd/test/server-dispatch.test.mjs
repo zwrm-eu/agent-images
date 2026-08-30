@@ -102,3 +102,20 @@ test('claude sessions opt in to runtime Bypass mode changes', async () => {
   const src = await readFile(CLAUDE_DRIVER, 'utf8')
   assert.match(src, /allowDangerouslySkipPermissions:\s*true/)
 })
+
+test('the gateway-token refresh endpoint covers every credential sink (#1363)', async () => {
+  // Source-text pin (the handler needs a booted daemon to exercise): the CP
+  // gates admission-time refresh on the 'token-refresh' cap, so the cap and
+  // the route must ship together, and the handler must rewrite ALL THREE
+  // places the create-time token lives — process.env (pi resolves the
+  // $ZWRM_GATEWAY_TOKEN apiKey reference per completion), spec.env (a
+  // seed-deferred construction re-applies it), and the mcp_servers headers
+  // (held by reference by the bridge transports).
+  const src = await readFile(SERVER, 'utf8')
+  const capsLine = src.split('\n').find((l) => l.trimStart().startsWith('caps:'))
+  assert.ok(capsLine.includes("'token-refresh'"), 'the token-refresh cap must be advertised')
+  assert.match(src, /action === 'gateway-token'/, 'the gateway-token route must be dispatched')
+  assert.match(src, /process\.env\.ZWRM_GATEWAY_TOKEN = token/)
+  assert.match(src, /s\.spec\.env = \{ \.\.\.\(s\.spec\.env \|\| \{\}\), ZWRM_GATEWAY_TOKEN: token \}/)
+  assert.match(src, /s\.spec\.mcp_servers/)
+})

@@ -78,11 +78,19 @@ export function toolDefinitionFor(slug, tool, call) {
 // carry (stdio — the platform never sends those to agent sessions). The
 // configured headers (the platform bearer) ride every request the transport
 // makes — POST, SSE GET, DELETE.
+//
+// cfg.headers is passed BY REFERENCE, not copied: the SDK transport re-reads
+// requestInit.headers on every request, so the gateway-token refresh endpoint
+// (#1363) can rotate the platform bearer on a live session by mutating the
+// spec's header objects — in-flight calls finish on whatever they sent,
+// subsequent requests and reconnects carry the new credential. A defensive
+// copy here would silently pin every bridged tool to the create-time token,
+// which expires under sessions older than its 24h TTL.
 async function connectServer(slug, cfg) {
   if (cfg.type !== 'http' || !cfg.url) return null
   const client = new Client({ name: 'zwrm-agentd-pi-bridge', version: '1.0' })
   const transport = new StreamableHTTPClientTransport(new URL(cfg.url), {
-    requestInit: { headers: { ...(cfg.headers || {}) } },
+    requestInit: { headers: cfg.headers || {} },
   })
   await client.connect(transport)
   return client

@@ -48,6 +48,7 @@ import {
   resultPayload,
   sumAssistantUsage,
   toolResultsPayload,
+  turnErrorMessage,
   usagePayload,
 } from './pi-translate.mjs'
 import { buildBridgedTools } from './mcp-bridge.mjs'
@@ -148,11 +149,12 @@ export async function createPiDriver(s, spec, h) {
   // model that is absent from the provider it is handed: resolveCliModel calls
   // buildFallbackModel, which clones a model from that provider and overwrites
   // its id, so the request goes to the WRONG vendor and returns a bodyless 404.
-  // The session then ends stop_reason=error with zero tokens, which the CP
-  // records as subtype=success with an empty result — nothing throws, so the
-  // `!resolved.model` guard below cannot see it, and the user is left with a
-  // chat that silently returns nothing. That is #1149 exactly, so a
-  // best-effort default here would reintroduce the bug this file exists to fix.
+  // The session then ends stop_reason=error with zero tokens — nothing
+  // throws, so the `!resolved.model` guard below cannot see it. Since #1363
+  // that turn at least lands as an error result instead of an empty
+  // subtype=success, but it is still a wrong-vendor request the user cannot
+  // diagnose. That is #1149 exactly, so a best-effort default here would
+  // reintroduce the bug this file exists to fix.
   //
   // Unattributable means the VM's catalog and the caller disagree: a truncated
   // or unreadable models.json, or a model the control plane knows and this
@@ -314,8 +316,17 @@ export async function createPiDriver(s, spec, h) {
     const stats = session.getSessionStats()
     const cost = Math.max(0, (stats.cost || 0) - costBaseline)
     const usage = sumAssistantUsage(messages) || stats.tokens
+    // A cycle whose final assistant message ended stopReason:'error' is a
+    // FAILED turn (#1363): the model call itself died (expired gateway
+    // credential, upstream 4xx/5xx) and pi settles without throwing, so the
+    // fail() path never sees it. Recording it as subtype=success with an
+    // empty result is the #1149 silent-failure shape — the CP shows a green
+    // "Turn completed" over a chat that returned nothing. The claude error
+    // subtype keeps the CP contract: preview is not overwritten, the
+    // dashboard renders an error result carrying the reason.
+    const turnError = turnErrorMessage(messages)
     s.lastResult = {
-      subtype: 'success',
+      subtype: turnError ? 'error_during_execution' : 'success',
       duration_ms: Date.now() - startMS,
       num_turns: Math.max(1, turnEnds - startTurns),
       total_cost_usd: cost,
@@ -326,7 +337,8 @@ export async function createPiDriver(s, spec, h) {
     // survive that.
     await h.syncToDisk()
     s.pusher.emit('sdk.result', resultPayload({
-      resultText: lastAssistantText(messages),
+      subtype: s.lastResult.subtype,
+      resultText: turnError || lastAssistantText(messages),
       costUSD: cost,
       usage,
       numTurns: s.lastResult.num_turns,
@@ -373,7 +385,16 @@ export async function createPiDriver(s, spec, h) {
         }
         case 'message_end':
           if (ev.message?.role === 'assistant') {
-            s.pusher.emit('sdk.assistant', assistantPayload(ev.message))
+            const payload = assistantPayload(ev.message)
+            // An errored call that produced no content at all has nothing
+            // the timeline can render — it used to surface as a raw-JSON
+            // fallback card (#1363). Drop it: the failure reaches the user
+            // through the error result emitResult builds from the same
+            // message. Partial content (text streamed before the failure)
+            // still ships, carrying error_message.
+            if (payload.message.content.length > 0 || ev.message.stopReason !== 'error') {
+              s.pusher.emit('sdk.assistant', payload)
+            }
           }
           break
         case 'turn_end':
