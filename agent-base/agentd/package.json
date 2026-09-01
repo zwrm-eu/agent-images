@@ -1,6 +1,6 @@
 {
   "name": "zwrm-agentd",
-  "version": "0.13.0",
+  "version": "0.13.1",
   "private": true,
   "type": "module",
   "description": "ZWRM in-VM session daemon: hosts coding-agent sessions (claude / pi / codex harness drivers) behind an HTTP API",

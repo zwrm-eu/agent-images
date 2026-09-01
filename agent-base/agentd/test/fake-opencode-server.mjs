@@ -11,15 +11,22 @@
 // {response}, prompt_async 204, session-cumulative cost on GET /session/:id.
 import { createServer } from 'node:http'
 
-export async function startFakeOpenCode({ password = 'test', expectProvider = 'zwrm' } = {}) {
+export async function startFakeOpenCode({ password = 'test', expectProvider = 'zwrm', commands } = {}) {
   const state = {
     sessions: new Map(), // id -> {id, cost, tokens}
     prompts: [], // validated prompt bodies, in order
+    commandInvocations: [], // validated POST /session/:id/command bodies
     replies: [], // {permissionID, response}
     aborts: 0,
     pendingAsks: new Set(), // permission ids the fake has asked and not seen replied
     violations: [],
     nextSession: 1,
+    // GET /command serves the probed raw shape: name/description/hints
+    // (string array)/template — plus source, which normalization drops.
+    commands: commands ?? [
+      { name: 'greet', description: 'Greets someone warmly', source: 'command', template: 'Say hi to $ARGUMENTS.', hints: ['$ARGUMENTS'] },
+      { name: 'noargs', description: 'No arguments', source: 'command', template: 'State the status.', hints: [] },
+    ],
   }
   const sseClients = new Set()
 
@@ -47,6 +54,10 @@ export async function startFakeOpenCode({ password = 'test', expectProvider = 'z
       res.write('data: {"type":"server.connected","properties":{}}\n\n')
       sseClients.add(res)
       req.on('close', () => sseClients.delete(res))
+      return
+    }
+    if (req.method === 'GET' && url.pathname === '/command') {
+      res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(state.commands))
       return
     }
     if (req.method === 'POST' && url.pathname === '/session') {
@@ -85,11 +96,40 @@ export async function startFakeOpenCode({ password = 'test', expectProvider = 'z
             violate(`prompt model malformed: ${JSON.stringify(body.model)}`)
           }
         }
-        if (body.tools?.question !== false) {
-          violate(`prompt must disable the question tool, got tools=${JSON.stringify(body.tools)}`)
-        }
         state.prompts.push(body)
         res.writeHead(204).end()
+        return
+      }
+      if (req.method === 'POST' && parts[2] === 'command' && parts.length === 3) {
+        let body
+        try {
+          body = JSON.parse(await readBody(req))
+        } catch {
+          violate('command body is not JSON')
+          res.writeHead(400).end()
+          return
+        }
+        // The real endpoint 500s on an unknown name (probed) — the driver
+        // must pre-resolve, so reaching the fake with one is a violation.
+        if (!state.commands.some((c) => c.name === body.command)) {
+          violate(`command invoked with unknown name: ${JSON.stringify(body.command)}`)
+          res.writeHead(500).end(JSON.stringify({ name: 'UnknownError' }))
+          return
+        }
+        if (body.arguments !== undefined && typeof body.arguments !== 'string') {
+          violate(`command arguments must be a string: ${JSON.stringify(body.arguments)}`)
+        }
+        // Unlike prompt_async's {providerID, modelID} object, the command
+        // body's model is the "provider/model" STRING (probed).
+        if (body.model !== undefined &&
+            (typeof body.model !== 'string' || !body.model.startsWith(`${expectProvider}/`) || body.model.length <= expectProvider.length + 1)) {
+          violate(`command model malformed: ${JSON.stringify(body.model)}`)
+        }
+        state.commandInvocations.push(body)
+        // The real endpoint is synchronous until the turn ends; the fake
+        // answers immediately because tests drive the turn over SSE and the
+        // driver never awaits this response.
+        res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ info: {}, parts: [] }))
         return
       }
       if (req.method === 'POST' && parts[2] === 'permissions' && parts.length === 4) {

@@ -24,6 +24,8 @@
 //    field is ignored by the v1 route, so denial text does NOT reach the
 //    model — unlike claude/pi/codex. Documented, not worked around.
 
+import { RUN_TOOL_NAMES } from './opencode-run-tools.mjs'
+
 // OPENCODE_PROVIDER_ID is the provider key the platform's seeded opencode
 // config uses for the gateway (#1392). The driver names it on every prompt;
 // the Go config renderer must emit the same key.
@@ -194,4 +196,92 @@ export function classifyOpenCodeError(err) {
 // pre-#1392 stopgap ignores it rather than refusing the session.
 export function isReservedMCPServer(slug) {
   return slug === 'zwrm'
+}
+
+// ---- #1392: native-MCP connectors, session config, canonical names ----------
+
+// canonicalOpenCodeToolName maps OpenCode's MCP wire name (`<slug>_<tool>`)
+// back to the platform's canonical `mcp__<slug>__<tool>` — the name the
+// escalation gate (isEscalatedTool), the run policy, and the transcript speak
+// on every harness. slugs are the session's configured MCP server names;
+// matching prefers the LONGEST one, because a slug may itself contain the
+// underscore separator. Non-MCP names (native tools, run tools) pass through.
+export function canonicalOpenCodeToolName(wireName, slugs) {
+  const name = String(wireName || '')
+  // The platform run tools' wire names ARE their canonical names; a
+  // connector slugged 'sleep' must not rewrite 'sleep_until' into
+  // mcp__sleep__until (review).
+  if (RUN_TOOL_NAMES.includes(name)) return name
+  let best = ''
+  for (const slug of slugs || []) {
+    if (name.length > slug.length + 1 && name.startsWith(slug + '_') && slug.length > best.length) {
+      best = slug
+    }
+  }
+  if (!best) return name
+  return `mcp__${best}__${name.slice(best.length + 1)}`
+}
+
+// The native tools gated in Ask mode (and auto-answered by the driver in
+// bypass): the mutating/network set, matching what the other harnesses
+// prompt for. Reads (read/glob/grep/skill/todo) stay on OpenCode's allow
+// defaults; doom_loop/external_directory keep their default 'ask' and ride
+// the same gate.
+export const GATED_PERMISSIONS = { bash: 'ask', edit: 'ask', webfetch: 'ask', websearch: 'ask' }
+
+// buildSessionConfig merges the platform config (from
+// /etc/opencode/opencode.json, rendered by build.OpenCodeConfigJSON) with the
+// per-session pieces, producing the object the driver hands to `opencode
+// serve` via OPENCODE_CONFIG_CONTENT:
+//
+//  - mcp: the session's connector servers PLUS the reserved zwrm platform
+//    server, as native remote MCP entries. Unlike codex, OpenCode's own MCP
+//    client DOES raise permission asks when the permission table names the
+//    tool (probed on the pinned binary), so the native client keeps every
+//    call inside the platform gate — no bridge process.
+//  - permission: the gated native set, plus `<slug>_*: ask` for every MCP
+//    server so connector calls surface to the gate in Ask mode and to the
+//    escalation policy on runs — and run tools 'allow' (platform tools are
+//    never gated, matching every other harness).
+//  - instructions: the session's append_system_prompt (platform
+//    instructions + memory + run preamble), delivered as a file path because
+//    OpenCode's `instructions` APPEND to the system prompt — the codex
+//    developerInstructions rule: add, never replace.
+//
+// KNOWN LIMIT (documented on #1392): the gateway-token refresh endpoint
+// (#1363) rewrites spec.env and the MCP header objects in place, which the
+// mcp-bridge picks up BY REFERENCE — but this config is serialized into the
+// child's environment at spawn, so a refresh does not reach a LIVE opencode
+// child; its MCP bearers age until the next session.
+export function buildSessionConfig({ platform, mcpServers, interactive, instructionsPath }) {
+  const cfg = { ...(platform && typeof platform === 'object' ? platform : {}) }
+
+  const mcp = {}
+  const permission = { ...GATED_PERMISSIONS }
+  for (const [slug, server] of Object.entries(mcpServers || {})) {
+    if (!server || server.type !== 'http' || !server.url) continue
+    mcp[slug] = {
+      type: 'remote',
+      url: server.url,
+      ...(server.headers && typeof server.headers === 'object' ? { headers: server.headers } : {}),
+      enabled: true,
+    }
+    permission[`${slug}_*`] = 'ask'
+  }
+  if (Object.keys(mcp).length > 0) cfg.mcp = { ...(cfg.mcp || {}), ...mcp }
+  if (!interactive) {
+    permission.sleep = 'allow'
+    permission.sleep_until = 'allow'
+  }
+  cfg.permission = { ...(cfg.permission || {}), ...permission }
+  // The question tool has no answer channel on this platform's surfaces yet;
+  // without this the model can park a turn on a question nobody sees.
+  // Config-level deliberately (probed): unlike a per-prompt tools override,
+  // it also covers command-invoked turns (#1429), whose endpoint has no
+  // tools field.
+  cfg.tools = { ...(cfg.tools || {}), question: false }
+  if (instructionsPath) {
+    cfg.instructions = [...(Array.isArray(cfg.instructions) ? cfg.instructions : []), instructionsPath]
+  }
+  return cfg
 }

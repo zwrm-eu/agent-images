@@ -112,7 +112,26 @@ RUN curl -fsSL https://registry.npmjs.org/opencode-linux-x64/-/opencode-linux-x6
     && tar -xzf /tmp/opencode.tgz -C /tmp package/bin/opencode \
     && install -m 0755 /tmp/package/bin/opencode /usr/local/bin/opencode \
     && rm -rf /tmp/opencode.tgz /tmp/package
-RUN printf 'export OPENCODE_DISABLE_AUTOUPDATE=1\nexport OPENCODE_DISABLE_MODELS_FETCH=1\nexport OPENCODE_DISABLE_LSP_DOWNLOAD=1\n' > /etc/profile.d/opencode-env.sh
+# OPENCODE_CONFIG_DIR points login shells at the root-owned config root, so
+# the TUI over SSH natively reads the platform provider config and
+# instructions (probed: the configured dir REPLACES ~/.config/opencode as the
+# global AGENTS.md source — review caught the terminal path having neither).
+RUN printf 'export OPENCODE_DISABLE_AUTOUPDATE=1\nexport OPENCODE_DISABLE_MODELS_FETCH=1\nexport OPENCODE_DISABLE_LSP_DOWNLOAD=1\nexport OPENCODE_CONFIG_DIR=/etc/opencode\n' > /etc/profile.d/opencode-env.sh
+# /etc/opencode is the ROOT-OWNED opencode config root (#1392): the boot
+# config's apply step writes opencode.json here, and the run/ subtree carries
+# the platform's baked file tools (sleep, sleep_until — filename = tool name).
+# The agentd driver points OPENCODE_CONFIG_DIR at /etc/opencode for
+# interactive sessions and /etc/opencode/run for unattended runs, which is
+# what keeps the model user out of the config trust path and the sleep tools
+# out of interactive sessions.
+# session/ stays EMPTY: driver sessions point OPENCODE_CONFIG_DIR here so
+# they read neither the terminal AGENTS.md (their instructions arrive via the
+# session config's instructions file — reading both would double the prompt)
+# nor the run tools.
+COPY opencode-tools/ /etc/opencode/run/tool/
+RUN mkdir -p /etc/opencode/session \
+    && chmod 755 /etc/opencode /etc/opencode/run /etc/opencode/run/tool /etc/opencode/session \
+    && chmod 644 /etc/opencode/run/tool/*.ts
 
 # -- zwrm CLI (from official releases) ----------------------------------------
 # Baseline only: this resolves "latest" when the layer is BUILT and the cached

@@ -95,3 +95,60 @@ test('the reserved platform server slug is zwrm alone', () => {
   assert.equal(isReservedMCPServer('zwrm'), true)
   assert.equal(isReservedMCPServer('github'), false)
 })
+
+// ---- #1392 additions --------------------------------------------------------
+import { GATED_PERMISSIONS, buildSessionConfig, canonicalOpenCodeToolName } from '../drivers/opencode-translate.mjs'
+
+test('canonical names: longest slug wins, non-MCP names pass through', () => {
+  const slugs = ['github', 'my_crm', 'zwrm']
+  assert.equal(canonicalOpenCodeToolName('github_create_issue', slugs), 'mcp__github__create_issue')
+  // A slug containing the separator must not be split at the wrong joint.
+  assert.equal(canonicalOpenCodeToolName('my_crm_lookup', slugs), 'mcp__my_crm__lookup')
+  assert.equal(canonicalOpenCodeToolName('zwrm_save_skill', slugs), 'mcp__zwrm__save_skill')
+  assert.equal(canonicalOpenCodeToolName('bash', slugs), 'bash')
+  assert.equal(canonicalOpenCodeToolName('sleep', slugs), 'sleep')
+  assert.equal(canonicalOpenCodeToolName('github_x', []), 'github_x')
+})
+
+test('session config: platform base + native MCP entries + gate table', () => {
+  const platform = { provider: { zwrm: { npm: 'x' } }, disabled_providers: ['opencode'], share: 'disabled' }
+  const cfg = buildSessionConfig({
+    platform,
+    mcpServers: {
+      github: { type: 'http', url: 'http://gw/mcp/github', headers: { Authorization: 'Bearer t' } },
+      broken: { type: 'stdio' },
+    },
+    interactive: true,
+    instructionsPath: '/tmp/x/instr.md',
+  })
+  assert.deepEqual(cfg.provider, platform.provider)
+  assert.deepEqual(cfg.disabled_providers, ['opencode'])
+  assert.deepEqual(cfg.mcp.github, { type: 'remote', url: 'http://gw/mcp/github', headers: { Authorization: 'Bearer t' }, enabled: true })
+  assert.equal(cfg.mcp.broken, undefined)
+  // Config-level so command-invoked turns are covered too (#1429): the
+  // command endpoint has no per-call tools field.
+  assert.deepEqual(cfg.tools, { question: false })
+  // Every gated native tool asks, and every MCP server's tools ask — that is
+  // what routes connector calls through the platform gate.
+  for (const [k, v] of Object.entries(GATED_PERMISSIONS)) assert.equal(cfg.permission[k], v)
+  assert.equal(cfg.permission['github_*'], 'ask')
+  // Interactive sessions carry no run tools, so no allow entries for them.
+  assert.equal(cfg.permission.sleep, undefined)
+  assert.deepEqual(cfg.instructions, ['/tmp/x/instr.md'])
+})
+
+test('session config for runs allows the platform run tools', () => {
+  const cfg = buildSessionConfig({ platform: null, mcpServers: {}, interactive: false })
+  assert.equal(cfg.permission.sleep, 'allow')
+  assert.equal(cfg.permission.sleep_until, 'allow')
+  assert.equal(cfg.mcp, undefined)
+  assert.equal(cfg.instructions, undefined)
+})
+
+test('run-tool wire names never canonicalize, even under a colliding slug', () => {
+  // A connector slugged 'sleep' must not rewrite the platform run tools.
+  assert.equal(canonicalOpenCodeToolName('sleep_until', ['sleep']), 'sleep_until')
+  assert.equal(canonicalOpenCodeToolName('sleep', ['sleep']), 'sleep')
+  // Its own genuine tools still canonicalize.
+  assert.equal(canonicalOpenCodeToolName('sleep_check_alarm', ['sleep']), 'mcp__sleep__check_alarm')
+})

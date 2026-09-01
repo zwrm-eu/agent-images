@@ -31,6 +31,7 @@ import { createHash, randomUUID, timingSafeEqual } from 'node:crypto'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { DRIVERS, HARNESSES, HARNESS_CAPS, unsupportedPermissionMode } from './drivers/registry.mjs'
+import { handlePlatformTool } from './drivers/opencode-run-tools.mjs'
 import { TOOL_POLICIES } from './drivers/tool-policy.mjs'
 import { countBackgroundTasks } from './drivers/claude-tasks.mjs'
 import { seedState, waitSeedClear, SEED_WAIT_MAX_MS, SEED_FAILED_MESSAGE } from './seedgate.mjs'
@@ -131,6 +132,17 @@ const PORT = Number(config.port) || DEFAULT_PORT
 
 // Hash both sides so the comparison is constant-time regardless of length.
 const tokenDigest = createHash('sha256').update(config.token).digest()
+// platformToolsTokenMatches checks the per-session run-tool bearer (#1392),
+// constant-time like the daemon token: the stated attacker is another
+// process inside the VM.
+function platformToolsTokenMatches(s, presented) {
+  if (!s.platformToolsToken || !presented) return false
+  return timingSafeEqual(
+    createHash('sha256').update(presented).digest(),
+    createHash('sha256').update(s.platformToolsToken).digest(),
+  )
+}
+
 function tokenMatches(presented) {
   if (typeof presented !== 'string' || presented === '') return false
   return timingSafeEqual(createHash('sha256').update(presented).digest(), tokenDigest)
@@ -1318,6 +1330,21 @@ const server = createServer(async (req, res) => {
     const url = new URL(req.url, 'http://localhost')
     const auth = req.headers.authorization || ''
     const token = auth.startsWith('Bearer ') ? auth.slice(7).trim() : ''
+
+    // Platform run tools for the opencode harness (#1392): called by the
+    // opencode child's file tools with the PER-SESSION bearer, not the
+    // daemon token — so this dispatches BEFORE the global token gate (which
+    // would 401 it; caught in review) and does its own constant-time check.
+    // parkTurn blocks the response until the wake.
+    if (req.method === 'POST' && url.pathname.startsWith('/v1/platform-tools/')) {
+      const s = session
+      if (!s || !platformToolsTokenMatches(s, token)) return send(res, 401, { error: 'unauthorized' })
+      const name = url.pathname.split('/').filter(Boolean)[2] || ''
+      const args = await readBody(req)
+      const r = await handlePlatformTool(s, { parkTurn, MAX_SLEEP_SECONDS }, name, args)
+      return send(res, r.status, r.body)
+    }
+
     if (!tokenMatches(token)) return send(res, 401, { error: 'unauthorized' })
 
     if (req.method === 'GET' && url.pathname === '/healthz') {
@@ -1362,9 +1389,12 @@ const server = createServer(async (req, res) => {
         // rotates the session's platform credential in place; the CP's
         // admission-time refresh gates on it (a stale daemon would silently
         // keep the expired token).
+        // 'opencode-gateway' says this build seeds the opencode gateway
+        // config (#1392) — the CP refuses opencode sessions on daemons
+        // without it, exactly as 'pi-gateway' guards pi's catalog (#1193).
         // 'commands' (#1429): harness-driver command discovery/invocation.
         // 'shell' (#1429): immediate operator shell with durable context.
-        caps: ['mcp', 'escalation', 'files', 'file-search', 'message-context', 'park', 'reclaim', 'skillfetch', 'pi-multiprovider', 'pi-gateway', 'background-tasks', 'tool-policy', 'token-refresh', 'commands', 'shell', ...HARNESS_CAPS],
+        caps: ['mcp', 'escalation', 'files', 'file-search', 'message-context', 'park', 'reclaim', 'skillfetch', 'pi-multiprovider', 'pi-gateway', 'opencode-gateway', 'background-tasks', 'tool-policy', 'token-refresh', 'commands', 'shell', ...HARNESS_CAPS],
         active_session: session && !isDone(session) ? session.id : null,
         state: session?.state ?? null,
         // Live background work (#1251): tasks the harness still tracks after
@@ -1422,6 +1452,9 @@ server.on('error', (err) => {
   process.exit(1)
 })
 server.listen(PORT, '0.0.0.0', () => {
+  // The opencode driver builds the platform-tools URL its file tools call
+  // from this; exported here so the port has exactly one owner.
+  process.env.ZWRM_AGENTD_PORT = String(PORT)
   log(`zwrm-agentd ${VERSION} listening on :${PORT}`)
 })
 

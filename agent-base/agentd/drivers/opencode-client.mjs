@@ -133,7 +133,11 @@ export class OpenCodeServer {
           signal: this.sseAbort.signal,
         })
         if (!res.ok || !res.body) throw new OpenCodeHTTPError(res.status, '', '/event')
-        failures = 0
+        // failures resets only once a stream DELIVERS something: a server
+        // that accepts and immediately EOFs would otherwise reset the
+        // counter every lap and reconnect forever without ever reporting
+        // (review) — a wedged session with no error on any surface.
+        let delivered = false
         let buf = ''
         for await (const chunk of res.body) {
           buf += Buffer.from(chunk).toString('utf8')
@@ -149,6 +153,10 @@ export class OpenCodeServer {
               } catch {
                 continue
               }
+              if (!delivered) {
+                delivered = true
+                failures = 0
+              }
               try {
                 this.opts.onEvent?.(ev)
               } catch (err) {
@@ -158,7 +166,16 @@ export class OpenCodeServer {
           }
         }
         // Clean end of stream: the server closed it (shutdown or restart);
-        // fall through to reconnect unless we are closing.
+        // fall through to reconnect unless we are closing. An empty stream
+        // still counts against the failure budget (see `delivered`).
+        if (!delivered && !this.closed) {
+          failures++
+          if (failures >= MAX_SSE_FAILURES) {
+            this.closed = true
+            this.opts.onExit?.(new Error(`opencode event stream closed empty ${failures} times`))
+            return
+          }
+        }
       } catch (err) {
         if (this.closed) return
         failures++
