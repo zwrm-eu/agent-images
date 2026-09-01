@@ -100,6 +100,20 @@ RUN npm install -g @openai/codex@0.145.0 && npm cache clean --force
 # ~/.pi/agent/settings.json is seeded by the VM init, not baked here.
 RUN echo 'export PI_SKIP_VERSION_CHECK=1' > /etc/profile.d/pi-env.sh
 
+# -- OpenCode (PINNED single binary — #1390) ------------------------------------
+# Bun-compiled standalone binary; no npm tree — the platform package's tarball
+# carries the one file. The agentd opencode driver (drivers/opencode.mjs)
+# speaks this binary's HTTP+SSE surface, which is versioned with it, so this
+# pin is the whole lockstep (the codex rule above): bump deliberately,
+# re-probe the surface, and refresh the driver's fixtures. The profile.d
+# entries keep gateway-only VMs (#1024) from stalling on its autoupdate,
+# models.dev fetch, and LSP downloads.
+RUN curl -fsSL https://registry.npmjs.org/opencode-linux-x64/-/opencode-linux-x64-1.18.25.tgz -o /tmp/opencode.tgz \
+    && tar -xzf /tmp/opencode.tgz -C /tmp package/bin/opencode \
+    && install -m 0755 /tmp/package/bin/opencode /usr/local/bin/opencode \
+    && rm -rf /tmp/opencode.tgz /tmp/package
+RUN printf 'export OPENCODE_DISABLE_AUTOUPDATE=1\nexport OPENCODE_DISABLE_MODELS_FETCH=1\nexport OPENCODE_DISABLE_LSP_DOWNLOAD=1\n' > /etc/profile.d/opencode-env.sh
+
 # -- zwrm CLI (from official releases) ----------------------------------------
 # Baseline only: this resolves "latest" when the layer is BUILT and the cached
 # layer then freezes it (#968). For the default agent image the control
