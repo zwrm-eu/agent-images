@@ -170,6 +170,135 @@ test('tool parts render as one tool_use / tool_result pair, foreign sessions are
   }
 })
 
+test('completed todowrite feeds the task list; errors and malformed input do not', async () => {
+  const fake = await startFakeOpenCode()
+  try {
+    const { s, driver, events } = await build(fake)
+    driver.start()
+    driver.queueMessage('go')
+    await until(events, () => fake.state.prompts.length === 1, 'prompt')
+    const sid = s.sdkSessionId
+
+    const todos = [
+      { id: 't1', content: 'write the fix', status: 'completed' },
+      { id: 't2', content: 'run the tests', status: 'in_progress', priority: 'high' },
+      { id: 't3', content: 'open the PR', status: 'made_up_status' },
+    ]
+    fake.emit('message.part.updated', { part: { id: 'p1', sessionID: sid, type: 'tool', tool: 'todowrite', callID: 'c1', state: { status: 'running', input: { todos } } } })
+    fake.emit('message.part.updated', { part: { id: 'p1', sessionID: sid, type: 'tool', tool: 'todowrite', callID: 'c1', state: { status: 'completed', input: { todos }, output: 'ok' } } })
+    // A rejected call never adopted a list.
+    fake.emit('message.part.updated', { part: { id: 'p2', sessionID: sid, type: 'tool', tool: 'todowrite', callID: 'c2', state: { status: 'error', input: { todos: [{ content: 'never', status: 'pending' }] }, error: 'rejected' } } })
+    // Malformed input is not an empty list.
+    fake.emit('message.part.updated', { part: { id: 'p3', sessionID: sid, type: 'tool', tool: 'todowrite', callID: 'c3', state: { status: 'completed', input: { todos: 'not-a-list' }, output: 'ok' } } })
+    fake.emit('session.idle', { sessionID: sid })
+
+    await until(events, (ev) => ofType(ev, 'sdk.result').length === 1, 'result')
+    const updates = ofType(events, 'todo.updated')
+    assert.equal(updates.length, 1)
+    assert.deepEqual(updates[0].payload.todos, [
+      { content: 'write the fix', status: 'completed' },
+      { content: 'run the tests', status: 'in_progress', priority: 'high' },
+      { content: 'open the PR', status: 'pending' },
+    ])
+    // The calls themselves still ride the transcript as tool pairs.
+    assert.equal(ofType(events, 'sdk.user').length, 3)
+    fake.assertNoViolations(assert)
+  } finally {
+    await fake.close()
+  }
+})
+
+test('listCommands normalizes the native command list', async () => {
+  const fake = await startFakeOpenCode()
+  try {
+    const { driver } = await build(fake)
+    driver.start()
+    const commands = await driver.listCommands()
+    assert.deepEqual(commands, [
+      { name: 'greet', description: 'Greets someone warmly', argument_hint: '$ARGUMENTS' },
+      { name: 'noargs', description: 'No arguments', argument_hint: '' },
+    ])
+    // The template never crosses the daemon boundary.
+    assert.equal(commands.some((c) => 'template' in c || 'source' in c), false)
+    await driver.shutdownStop()
+    fake.assertNoViolations(assert)
+  } finally {
+    await fake.close()
+  }
+})
+
+test('invokeCommand runs the native endpoint as a turn and releases exclusivity', async () => {
+  const fake = await startFakeOpenCode()
+  try {
+    const { s, driver, events } = await build(fake)
+    driver.start()
+    // server.mjs reserves command admission before calling the driver.
+    s.controlBusy = 'command'
+    const queued = await driver.invokeCommand({ command: 'greet', arguments: 'Tom', model: '', pendingContext: [] })
+    assert.deepEqual(queued, { command: 'greet', visible: '/greet Tom' })
+    await until(events, () => fake.state.commandInvocations.length === 1, 'the command to land')
+    const body = fake.state.commandInvocations[0]
+    assert.equal(body.command, 'greet')
+    assert.equal(body.arguments, 'Tom')
+    // No per-call override: the session's model rides along, string form.
+    assert.equal(body.model, 'zwrm/qwen-235b')
+    assert.equal(s.state, 'working')
+
+    const sid = s.sdkSessionId
+    fake.emit('message.part.updated', { part: { id: 'p1', sessionID: sid, type: 'text', text: 'hello Tom' } })
+    fake.emit('message.updated', { info: { sessionID: sid, role: 'assistant', cost: 0.001, tokens: { input: 10, output: 2, reasoning: 0, cache: { read: 0, write: 0 } } } })
+    fake.setSessionCost(sid, 0.001)
+    fake.emit('session.idle', { sessionID: sid })
+    await until(events, (ev) => ofType(ev, 'sdk.result').length === 1, 'the command turn result')
+    // The driver owns releasing the server's exclusive admission flag at the
+    // turn boundary, like claude's finishCommandTurn.
+    assert.equal(s.controlBusy, null)
+    assert.equal(s.state, 'idle')
+    fake.assertNoViolations(assert)
+  } finally {
+    await fake.close()
+  }
+})
+
+test('invokeCommand pre-resolves: unknown names 400 cleanly, never reach the server', async () => {
+  const fake = await startFakeOpenCode()
+  try {
+    const { driver } = await build(fake)
+    driver.start()
+    await assert.rejects(
+      () => driver.invokeCommand({ command: 'nosuch', arguments: '', model: '', pendingContext: [] }),
+      (err) => err.status === 400 && /available: greet, noargs/.test(err.message),
+    )
+    assert.equal(fake.state.commandInvocations.length, 0)
+    fake.assertNoViolations(assert)
+  } finally {
+    await fake.close()
+  }
+})
+
+test('invokeCommand carries model overrides and pending shell context in arguments', async () => {
+  const fake = await startFakeOpenCode()
+  try {
+    const { driver, events } = await build(fake)
+    driver.start()
+    const queued = await driver.invokeCommand({
+      command: 'noargs',
+      arguments: 'focus',
+      model: 'big-model',
+      pendingContext: ['<zwrm-operator-shell-context>ls output</zwrm-operator-shell-context>'],
+    })
+    // The visible message shows the invocation, not the injected context.
+    assert.deepEqual(queued, { command: 'noargs', visible: '/noargs focus' })
+    await until(events, () => fake.state.commandInvocations.length === 1, 'the command to land')
+    const body = fake.state.commandInvocations[0]
+    assert.equal(body.model, 'zwrm/big-model')
+    assert.equal(body.arguments, 'focus\n\n<zwrm-operator-shell-context>ls output</zwrm-operator-shell-context>')
+    fake.assertNoViolations(assert)
+  } finally {
+    await fake.close()
+  }
+})
+
 test('Ask mode: the ask flows through the pending map; allow replies once', async () => {
   const fake = await startFakeOpenCode()
   try {
@@ -332,18 +461,44 @@ test('resume: a live handle is reused and its cost becomes the baseline; a dead 
   }
 })
 
-test('connector servers are refused until #1392; the reserved zwrm server is skipped', async () => {
+test('connector asks surface under the canonical mcp__ name; escalated tools gate even on runs (#1392)', async () => {
   const fake = await startFakeOpenCode()
   try {
-    const ctx = newHarness({ spec: { mcp_servers: { github: { url: 'http://x' } } } })
-    await assert.rejects(() => build(fake, ctx), (err) => {
-      assert.equal(err.status, 400)
-      assert.match(err.message, /connector tools are not yet supported/)
-      return true
+    const ctx = newHarness({
+      spec: {
+        permission_mode: 'default', auto_approve: true, escalate_servers: ['github'], interactive: false,
+        mcp_servers: {
+          github: { type: 'http', url: 'http://gw/mcp/github', headers: { Authorization: 'Bearer t' } },
+          zwrm: { type: 'http', url: 'http://gw/mcp/zwrm', headers: { Authorization: 'Bearer t' } },
+        },
+      },
     })
-    const ctx2 = newHarness({ spec: { mcp_servers: { zwrm: { url: 'http://x' } } } })
-    const { driver } = await build(fake, ctx2)
-    await driver.shutdownStop()
+    const { s, driver, events } = await build(fake, ctx)
+    driver.start()
+    driver.queueMessage('go')
+    await until(events, () => fake.state.prompts.length === 1, 'prompt')
+    const sid = s.sdkSessionId
+
+    // A non-escalated platform-server call auto-approves under the run policy.
+    fake.emit('permission.asked', { id: 'per_z', sessionID: sid, permission: 'zwrm_save_memory', metadata: {}, tool: { callID: 'c1' } })
+    await until([], () => fake.state.replies.length === 1, 'auto approval')
+    assert.equal(fake.state.replies[0].response, 'once')
+    assert.equal(ofType(events, 'permission.request').length, 0)
+
+    // An escalated connector call PARKS for a human, under the canonical name.
+    fake.emit('permission.asked', { id: 'per_g', sessionID: sid, permission: 'github_create_issue', metadata: { title: 'x' }, tool: { callID: 'c2' } })
+    await until(events, (ev) => ofType(ev, 'permission.request').length === 1, 'escalated ask')
+    const ask = ofType(events, 'permission.request')[0].payload
+    assert.equal(ask.tool_name, 'mcp__github__create_issue')
+    s.pending.get('per_g').resolve({ behavior: 'allow' })
+    s.pending.delete('per_g')
+    await until([], () => fake.state.replies.length === 2, 'escalated approval')
+
+    // The transcript speaks the canonical name too.
+    fake.emit('message.part.updated', { part: { id: 'p1', sessionID: sid, type: 'tool', tool: 'github_create_issue', callID: 'c2', state: { status: 'running', input: { title: 'x' } } } })
+    await until(events, (ev) => ev.some((e) => e.type === 'sdk.assistant' && e.payload.message.content[0].type === 'tool_use'), 'tool_use')
+    const use = ofType(events, 'sdk.assistant').find((e) => e.payload.message.content[0].type === 'tool_use')
+    assert.equal(use.payload.message.content[0].name, 'mcp__github__create_issue')
     fake.assertNoViolations(assert)
   } finally {
     await fake.close()
@@ -385,6 +540,110 @@ test('end during an active turn finishes after the result; ending sessions auto-
     await until(events, (ev) => ofType(ev, 'session.ended').length === 1, 'session end')
     assert.equal(ofType(events, 'sdk.result').length, 1)
     assert.equal(s.state, 'ended')
+    fake.assertNoViolations(assert)
+  } finally {
+    await fake.close()
+  }
+})
+
+// ---- review-fix regressions -------------------------------------------------
+
+test('a user message part never renders as assistant output or the summary', async () => {
+  const fake = await startFakeOpenCode()
+  try {
+    const { s, driver, events } = await build(fake)
+    driver.start()
+    driver.queueMessage('go')
+    await until(events, () => fake.state.prompts.length === 1, 'prompt')
+    const sid = s.sdkSessionId
+    // The probed order: message.updated names the role, then parts stream.
+    fake.emit('message.updated', { info: { sessionID: sid, id: 'mu', role: 'user' } })
+    fake.emit('message.part.updated', { part: { id: 'pu', messageID: 'mu', sessionID: sid, type: 'text', text: 'go' } })
+    fake.emit('message.updated', { info: { sessionID: sid, id: 'ma', role: 'assistant' } })
+    fake.emit('message.part.updated', { part: { id: 'pa', messageID: 'ma', sessionID: sid, type: 'text', text: 'real answer' } })
+    fake.emit('session.idle', { sessionID: sid })
+    await until(events, (ev) => ofType(ev, 'sdk.result').length === 1, 'result')
+    const texts = ofType(events, 'sdk.assistant').filter((e) => e.payload.message.content[0].type === 'text')
+    assert.equal(texts.length, 1)
+    assert.equal(texts[0].payload.message.content[0].text, 'real answer')
+    assert.equal(ofType(events, 'sdk.result')[0].payload.result, 'real answer')
+    fake.assertNoViolations(assert)
+  } finally {
+    await fake.close()
+  }
+})
+
+test('a follow-up the server ran as a NEW turn re-arms via busy and emits its own result', async () => {
+  const fake = await startFakeOpenCode()
+  try {
+    const { s, driver, events } = await build(fake)
+    driver.start()
+    driver.queueMessage('first')
+    await until(events, () => fake.state.prompts.length === 1, 'prompt')
+    const sid = s.sdkSessionId
+    fake.emit('message.part.updated', { part: { id: 't1', sessionID: sid, type: 'text', text: 'answer one' } })
+    fake.emit('session.idle', { sessionID: sid })
+    await until(events, (ev) => ofType(ev, 'sdk.result').length === 1, 'first result')
+
+    // The server starts working again (the follow-up the driver believed
+    // would fold, or any server-side continuation).
+    fake.emit('session.status', { sessionID: sid, status: { type: 'busy' } })
+    fake.emit('message.part.updated', { part: { id: 't2', sessionID: sid, type: 'text', text: 'answer two' } })
+    fake.emit('session.idle', { sessionID: sid })
+    await until(events, (ev) => ofType(ev, 'sdk.result').length === 2, 'second result')
+    assert.equal(ofType(events, 'sdk.result')[1].payload.result, 'answer two')
+    fake.assertNoViolations(assert)
+  } finally {
+    await fake.close()
+  }
+})
+
+test('busy after an interrupt does not resurrect the cancelled turn', async () => {
+  const fake = await startFakeOpenCode()
+  try {
+    const { s, driver, events } = await build(fake)
+    driver.start()
+    driver.queueMessage('go')
+    await until(events, () => fake.state.prompts.length === 1, 'prompt')
+    const sid = s.sdkSessionId
+    await driver.interrupt()
+    // The aborted turn's tail: the server was still briefly busy.
+    fake.emit('session.status', { sessionID: sid, status: { type: 'busy' } })
+    fake.emit('session.idle', { sessionID: sid })
+    await new Promise((r) => setTimeout(r, 80))
+    assert.equal(ofType(events, 'sdk.result').length, 0)
+    assert.equal(s.state, 'idle')
+    fake.assertNoViolations(assert)
+  } finally {
+    await fake.close()
+  }
+})
+
+test('a prompt racing the chained result emit corrupts neither turn', async () => {
+  const fake = await startFakeOpenCode()
+  try {
+    const { s, driver, events } = await build(fake)
+    driver.start()
+    driver.queueMessage('first')
+    await until(events, () => fake.state.prompts.length === 1, 'prompt')
+    const sid = s.sdkSessionId
+    fake.emit('message.part.updated', { part: { id: 't1', sessionID: sid, type: 'text', text: 'first answer' } })
+    fake.emit('message.updated', { info: { sessionID: sid, id: 'm1', role: 'assistant', cost: 0.001, tokens: { input: 10, output: 1, cache: {} } } })
+    fake.emit('session.idle', { sessionID: sid })
+    // Fire the next message IMMEDIATELY — likely before the idle has even
+    // arrived over SSE, so the driver may take the follow-up branch while
+    // the first turn's chained result emit is still pending (the
+    // review-found window). The real server then reports `busy` for the new
+    // work, which is what re-arms the platform turn.
+    driver.queueMessage('second')
+    await until(events, () => fake.state.prompts.length === 2, 'second prompt')
+    await until(events, (ev) => ofType(ev, 'sdk.result').length === 1, 'first result')
+    fake.emit('session.status', { sessionID: sid, status: { type: 'busy' } })
+    fake.emit('message.part.updated', { part: { id: 't2', sessionID: sid, type: 'text', text: 'second answer' } })
+    fake.emit('session.idle', { sessionID: sid })
+    await until(events, (ev) => ofType(ev, 'sdk.result').length === 2, 'both results')
+    const results = ofType(events, 'sdk.result').map((e) => e.payload.result)
+    assert.deepEqual(results, ['first answer', 'second answer'])
     fake.assertNoViolations(assert)
   } finally {
     await fake.close()
