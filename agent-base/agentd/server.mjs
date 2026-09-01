@@ -39,6 +39,12 @@ import { permissionDecisionPayload } from './event-payloads.mjs'
 import { ChangedFileTracker } from './changed-files.mjs'
 import { prepareMessage } from './message-context.mjs'
 import { searchWorkspaceFiles } from './file-search.mjs'
+import {
+  executeShellCommand,
+  MAX_SHELL_OUTPUT_BYTES,
+  normalizeCommandName,
+  shellContext,
+} from './session-control.mjs'
 
 const DEFAULT_PORT = 9924
 const MAX_BODY_BYTES = 1024 * 1024
@@ -436,6 +442,15 @@ async function startSession(spec) {
     // strings. Keep the visible user message in lockstep and emit it only
     // when the real driver opens the canonical turn after seeding.
     deferredMessages: [],
+    // Shell calls do not start model turns. Their structured, durable
+    // message.context events are also rendered into this queue and appended
+    // to the next real user/command prompt so every harness sees the operator
+    // injection in conversation context.
+    pendingContexts: [],
+    // 'command' spans a synchronous slash-command turn; 'shell' spans the
+    // immediate subprocess. Both exclude message/command/shell admission so
+    // output and turn boundaries cannot interleave ambiguously.
+    controlBusy: null,
     pusher: new EventPusher(spec.callback_url, spec.callback_token, spec.session_id),
     lastResult: null,
     ending: false,
@@ -1043,13 +1058,123 @@ async function handleMessage(req, res, s) {
   } catch (err) {
     throw badRequest(err.message)
   }
-  if (isDone(s) || !s.driver.queueMessage(prepared.prompt)) {
+  if (s.controlBusy) {
+    return send(res, 409, { error: `session is busy with a ${s.controlBusy} request`, state: s.state })
+  }
+  const pendingCount = s.pendingContexts.length
+  const prompt = pendingCount > 0
+    ? `${prepared.prompt}\n\n${s.pendingContexts.slice(0, pendingCount).join('\n\n')}`
+    : prepared.prompt
+  if (isDone(s) || !s.driver.queueMessage(prompt)) {
     return send(res, 409, { error: 'session is not accepting messages', state: s.state })
   }
+  if (pendingCount > 0) s.pendingContexts.splice(0, pendingCount)
   const visibleMessage = { text: prepared.text, attachments: prepared.attachments }
   if (s.state === 'starting') s.deferredMessages.push(visibleMessage)
   else emitUserMessage(s, visibleMessage)
   send(res, 202, { queued: true })
+}
+
+async function handleCommands(res, s) {
+  if (s.harness !== 'claude') {
+    throw badRequest(`commands are not supported by the ${s.harness} harness`)
+  }
+  if (isDone(s)) return send(res, 409, { error: 'session is finished', state: s.state })
+  if (s.state === 'starting') return send(res, 409, { error: 'session is still starting', state: s.state })
+  const commands = await s.driver.listCommands()
+  send(res, 200, { commands })
+}
+
+async function handleCommand(req, res, s) {
+  const body = await readBody(req)
+  if (s.harness !== 'claude') {
+    throw badRequest(`commands are not supported by the ${s.harness} harness`)
+  }
+  let command
+  try {
+    command = normalizeCommandName(body.command)
+  } catch (err) {
+    throw badRequest(err.message)
+  }
+  if (body.arguments != null && typeof body.arguments !== 'string') {
+    throw badRequest('arguments must be a string')
+  }
+  if (body.model != null && typeof body.model !== 'string') {
+    throw badRequest('model must be a string')
+  }
+  if (s.state !== 'idle' || s.controlBusy) {
+    return send(res, 409, { error: 'session must be idle before invoking a command', state: s.state })
+  }
+
+  // Reserve the turn before the first await. Node may serve another request
+  // while supportedCommands/setModel is in flight; without this flag a
+  // message could enter between validation and the command prompt.
+  s.controlBusy = 'command'
+  const pendingCount = s.pendingContexts.length
+  try {
+    const queued = await s.driver.invokeCommand({
+      command,
+      arguments: body.arguments || '',
+      model: body.model?.trim() || '',
+      pendingContext: s.pendingContexts.slice(0, pendingCount),
+    })
+    if (!queued) {
+      s.controlBusy = null
+      return send(res, 409, { error: 'session is not accepting commands', state: s.state })
+    }
+    if (pendingCount > 0) s.pendingContexts.splice(0, pendingCount)
+    emitUserMessage(s, {
+      text: queued.visible,
+      attachments: [],
+      source: 'command',
+      command,
+      arguments: body.arguments || '',
+      ...(body.model?.trim() ? { model: body.model.trim() } : {}),
+    })
+    send(res, 202, { queued: true })
+  } catch (err) {
+    s.controlBusy = null
+    throw err
+  }
+}
+
+async function handleShell(req, res, s) {
+  const body = await readBody(req)
+  if (typeof body.command !== 'string' || body.command.trim() === '') {
+    throw badRequest('missing command')
+  }
+  if (body.command.includes('\0')) throw badRequest('command contains a NUL byte')
+  // Deliberate policy for #1429: never interleave an operator subprocess with
+  // a live model turn (or another control call). Clients retry once idle.
+  if (s.state !== 'idle' || s.controlBusy) {
+    return send(res, 409, { error: 'session must be idle before running a shell command', state: s.state })
+  }
+  // Shell output waits for the next real turn. Bound that deferred prompt so
+  // repeated automation cannot build an unbounded in-memory/model input while
+  // the session stays idle. Existing durable events remain readable; the
+  // caller must send a turn before adding more model context.
+  const pendingBytes = s.pendingContexts.reduce((total, value) => total + Buffer.byteLength(value), 0)
+  if (s.pendingContexts.length >= 8 || pendingBytes >= MAX_SHELL_OUTPUT_BYTES) {
+    return send(res, 409, { error: 'send a session turn before adding more shell context', state: s.state })
+  }
+
+  s.controlBusy = 'shell'
+  try {
+    const result = await executeShellCommand(body.command, {
+      cwd: s.spec.cwd || process.env.HOME || '/home/agent',
+      env: { ...process.env, ...(s.spec.env || {}) },
+    })
+    await syncToDisk()
+    const context = shellContext(result)
+    s.pendingContexts.push(context.prompt)
+    // Explicit null keeps this operator action outside canonical model turns.
+    // It is durable (no ephemeral flag), and the next admitted turn consumes
+    // the marked prompt rendering above.
+    s.pusher.emit('message.context', context.event, { turnId: null })
+    send(res, 200, result)
+  } finally {
+    s.controlBusy = null
+  }
 }
 
 function emitUserMessage(s, message) {
@@ -1236,7 +1361,9 @@ const server = createServer(async (req, res) => {
         // rotates the session's platform credential in place; the CP's
         // admission-time refresh gates on it (a stale daemon would silently
         // keep the expired token).
-        caps: ['mcp', 'escalation', 'files', 'file-search', 'message-context', 'park', 'reclaim', 'skillfetch', 'pi-multiprovider', 'pi-gateway', 'background-tasks', 'tool-policy', 'token-refresh', ...HARNESS_CAPS],
+        // 'commands' (#1429): Claude SDK slash-command discovery/invocation.
+        // 'shell' (#1429): immediate operator shell with durable context.
+        caps: ['mcp', 'escalation', 'files', 'file-search', 'message-context', 'park', 'reclaim', 'skillfetch', 'pi-multiprovider', 'pi-gateway', 'background-tasks', 'tool-policy', 'token-refresh', 'commands', 'shell', ...HARNESS_CAPS],
         active_session: session && !isDone(session) ? session.id : null,
         state: session?.state ?? null,
         // Live background work (#1251): tasks the harness still tracks after
@@ -1267,7 +1394,10 @@ const server = createServer(async (req, res) => {
       if (!s || s.id !== parts[2]) return send(res, 404, { error: 'no such session' })
       const action = parts[3]
       if (req.method === 'GET' && parts.length === 3) return send(res, 200, snapshot(s))
+      if (req.method === 'GET' && action === 'commands' && parts.length === 4) return await handleCommands(res, s)
       if (req.method === 'POST' && action === 'messages' && parts.length === 4) return await handleMessage(req, res, s)
+      if (req.method === 'POST' && action === 'command' && parts.length === 4) return await handleCommand(req, res, s)
+      if (req.method === 'POST' && action === 'shell' && parts.length === 4) return await handleShell(req, res, s)
       if (req.method === 'POST' && action === 'interrupt' && parts.length === 4) return await handleInterrupt(res, s)
       if (req.method === 'POST' && action === 'permissions' && parts.length === 5) return await handlePermission(req, res, s, parts[4])
       if (req.method === 'POST' && action === 'parks' && parts.length === 6 && parts[5] === 'resolve') return await handleParkResolve(req, res, s, parts[4])
