@@ -12,6 +12,7 @@ import { z } from 'zod'
 import { applyTaskMessage, countBackgroundTasks } from './claude-tasks.mjs'
 import { createTodoTracker } from './todos.mjs'
 import { permissionDecisionPayload } from '../event-payloads.mjs'
+import { commandPrompt, normalizeCommandList, resolveCommand } from '../session-control.mjs'
 
 const CLOSED = Symbol('closed')
 
@@ -221,6 +222,14 @@ export function createClaudeDriver(s, spec, h) {
   // idle decision snapshots this counter instead (#913).
   let consumed = 0
   let q = null
+  // supportedCommands() is the initialize-time list; commands_changed is the
+  // authoritative replacement when Claude discovers a skill/repo command
+  // later in the session.
+  let latestCommands = null
+  // A command's optional model is a per-turn override. Capture the current
+  // model via getContextUsage(), restore it at the result/interrupt boundary,
+  // and only then release server.mjs's exclusive command admission flag.
+  let commandTurn = null
 
   // Task-list ledger (#1424): TodoWrite calls become durable todo.updated
   // events once their tool_result confirms the list was actually adopted.
@@ -350,6 +359,41 @@ export function createClaudeDriver(s, spec, h) {
   // the caller, which owns not publishing a half-initialized session.
   q = query({ prompt: input(), options })
 
+  async function listCommands() {
+    if (latestCommands === null) {
+      latestCommands = normalizeCommandList(await q.supportedCommands())
+    }
+    return latestCommands.map((command) => ({
+      ...command,
+      ...(command.aliases ? { aliases: [...command.aliases] } : {}),
+    }))
+  }
+
+  async function finishCommandTurn() {
+    const turn = commandTurn
+    if (!turn) return
+    commandTurn = null
+    try {
+      if (turn.restoreModel) await q.setModel(turn.model)
+    } catch (err) {
+      h.log(`command model restore failed: ${err?.message || err}`)
+    } finally {
+      s.controlBusy = null
+    }
+  }
+
+  function queueMessage(text) {
+    if (inputQueue.closed) return false
+    inputQueue.push({
+      type: 'user',
+      message: { role: 'user', content: [{ type: 'text', text }] },
+      parent_tool_use_id: null,
+      session_id: s.sdkSessionId || '',
+    })
+    h.setState(s, 'working')
+    return true
+  }
+
   async function runLoop() {
     try {
       for await (const msg of q) {
@@ -357,6 +401,9 @@ export function createClaudeDriver(s, spec, h) {
           case 'system':
             if (msg.subtype === 'init' && msg.session_id) {
               s.sdkSessionId = msg.session_id
+            }
+            if (msg.subtype === 'commands_changed') {
+              latestCommands = normalizeCommandList(msg.commands)
             }
             // Background-task ledger (#1251). A settle that drains the ledger
             // while the session is already idle is re-announced: the CP
@@ -433,6 +480,11 @@ export function createClaudeDriver(s, spec, h) {
               // newly consumed prompt is not attributed to the old turn.
               h.rotateTurn(s)
             }
+            // Release command exclusivity only after the idle/rotate boundary
+            // is emitted. A message admitted between sdk.result and idle would
+            // otherwise become steering and make the synchronous caller wait
+            // for an unrelated second result.
+            await finishCommandTurn()
             break
           }
           case 'stream_event':
@@ -454,6 +506,7 @@ export function createClaudeDriver(s, spec, h) {
       s.pusher.emit('session.ended', { sdk_session_id: s.sdkSessionId, last_result: s.lastResult })
     } catch (err) {
       h.log(`session ${s.id} failed: ${err?.stack || err}`)
+      await finishCommandTurn()
       const c = classifyRunError(err)
       // Best-effort even on the error path: the CP may still tear the VM down,
       // and whatever transcript exists is worth keeping resumable. Synced
@@ -474,26 +527,50 @@ export function createClaudeDriver(s, spec, h) {
 
     // queueMessage returns false when the session no longer accepts input
     // (post-/end); the caller renders the 409.
-    queueMessage(text) {
-      if (inputQueue.closed) return false
-      inputQueue.push({
-        type: 'user',
-        message: { role: 'user', content: [{ type: 'text', text }] },
-        parent_tool_use_id: null,
-        session_id: s.sdkSessionId || '',
-      })
-      h.setState(s, 'working')
-      return true
+    queueMessage,
+
+    listCommands,
+
+    async invokeCommand({ command, arguments: argumentsText, model, pendingContext }) {
+      const commands = await listCommands()
+      const resolved = resolveCommand(commands, command)
+      if (!resolved) {
+        const available = commands.map((item) => item.name)
+        const e = new Error(
+          `unknown command '${command}'${available.length ? ` (available: ${available.join(', ')})` : ''}`,
+        )
+        e.status = 400
+        throw e
+      }
+
+      let previousModel
+      let restoreModel = false
+      if (model) {
+        const usage = await q.getContextUsage()
+        previousModel = usage?.model || undefined
+        await q.setModel(model)
+        restoreModel = true
+      }
+      commandTurn = { restoreModel, model: previousModel }
+      const prompt = commandPrompt(command, argumentsText, pendingContext)
+      if (!queueMessage(prompt)) {
+        await finishCommandTurn()
+        return null
+      }
+      return {
+        command: resolved.name,
+        visible: commandPrompt(command, argumentsText),
+      }
     },
 
     async interrupt() {
       // Parks are canceled by handleInterrupt (shared machinery) before the
       // driver is invoked — no park may be pending here.
+      // Snapshot before the awaits: a message consumed during the interrupt
+      // or the sync below is a fresh turn the idle flip must not clobber
+      // (#913).
+      const consumedBefore = consumed
       try {
-        // Snapshot before the awaits: a message consumed during the interrupt
-        // or the sync below is a fresh turn the idle flip must not clobber
-        // (#913).
-        const consumedBefore = consumed
         await q.interrupt()
         if (inputQueue.items.length === 0 && consumed === consumedBefore) {
           // This idle can complete a run CP-side (a result from an earlier
@@ -509,6 +586,8 @@ export function createClaudeDriver(s, spec, h) {
         }
       } catch (err) {
         h.log(`interrupt failed: ${err?.message || err}`)
+      } finally {
+        await finishCommandTurn()
       }
     },
 
@@ -531,6 +610,8 @@ export function createClaudeDriver(s, spec, h) {
         await q?.interrupt()
       } catch {
         // best-effort
+      } finally {
+        await finishCommandTurn()
       }
     },
   }
