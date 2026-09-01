@@ -40,9 +40,13 @@ test('late sdk output keeps the interrupted turn id while a new turn opens', () 
   assert.equal(turns.activeTurnId, 'turn-2')
   assert.equal(turns.implicitEventTurnId('sdk.result'), 'turn-1')
   assert.equal(turns.implicitEventTurnId('session.status'), 'turn-2')
+  // todo.updated derives from the draining turn's tool_result (#1424) and
+  // must stay with it, like the sdk.user it follows.
+  assert.equal(turns.implicitEventTurnId('todo.updated'), 'turn-1')
 
   turns.finishDraining('turn-1')
   assert.equal(turns.implicitEventTurnId('sdk.assistant'), 'turn-2')
+  assert.equal(turns.implicitEventTurnId('todo.updated'), 'turn-2')
 })
 
 test('rotating a continuously working provider closes and opens canonical turns', () => {

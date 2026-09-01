@@ -149,6 +149,18 @@ async function runTurn(turnId) {
     trace('__toolReply', reply)
   }
 
+  if (scenario === 'todo') {
+    // The plan tool: a todoList thread item is not a tool item and must land
+    // as a todo.updated snapshot, not a transcript entry (#1424).
+    notify('item/completed', {
+      threadId: THREAD_ID, turnId,
+      item: {
+        type: 'todoList', id: 'item-todo',
+        items: [{ text: 'read the code', completed: true }, { text: 'write tests', completed: false }],
+      },
+    })
+  }
+
   if (scenario === 'interrupt' || scenario === 'steer-precondition') {
     // Never completes on its own: the turn stays live so the driver must
     // interrupt it, or (steer-precondition) so a second message genuinely

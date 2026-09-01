@@ -10,6 +10,7 @@ import { randomUUID } from 'node:crypto'
 import { query, tool, createSdkMcpServer } from '@anthropic-ai/claude-agent-sdk'
 import { z } from 'zod'
 import { applyTaskMessage, countBackgroundTasks } from './claude-tasks.mjs'
+import { createTodoTracker } from './todos.mjs'
 import { permissionDecisionPayload } from '../event-payloads.mjs'
 
 const CLOSED = Symbol('closed')
@@ -221,6 +222,10 @@ export function createClaudeDriver(s, spec, h) {
   let consumed = 0
   let q = null
 
+  // Task-list ledger (#1424): TodoWrite calls become durable todo.updated
+  // events once their tool_result confirms the list was actually adopted.
+  const todoTracker = createTodoTracker((todos) => s.pusher.emit('todo.updated', { todos }))
+
   const canUseTool = async (toolName, input, opts = {}) => {
     // After /end, the in-flight turn may still reach for another tool; a new
     // pending prompt would wedge the wind-down forever, so deny immediately
@@ -371,9 +376,11 @@ export function createClaudeDriver(s, spec, h) {
             break
           case 'assistant':
             s.pusher.emit('sdk.assistant', msg)
+            todoTracker.onAssistant(msg)
             break
           case 'user':
             s.pusher.emit('sdk.user', msg)
+            todoTracker.onToolResult(msg)
             break
           case 'result': {
             s.lastResult = {
