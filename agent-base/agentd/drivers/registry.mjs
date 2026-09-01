@@ -13,6 +13,7 @@
 import { createClaudeDriver } from './claude.mjs'
 import { createPiDriver, SUPPORTED_PERMISSION_MODES as PI_MODES } from './pi.mjs'
 import { createCodexDriver, SUPPORTED_PERMISSION_MODES as CODEX_MODES } from './codex.mjs'
+import { createOpenCodeDriver, SUPPORTED_PERMISSION_MODES as OPENCODE_MODES } from './opencode.mjs'
 
 // modes: the permission modes the harness can host, owned and exported by the
 // driver module itself so this table cannot disagree with what construction
@@ -22,6 +23,7 @@ export const DRIVERS = {
   claude: { construct: createClaudeDriver, modes: null },
   pi: { construct: createPiDriver, modes: PI_MODES },
   codex: { construct: createCodexDriver, modes: CODEX_MODES },
+  opencode: { construct: createOpenCodeDriver, modes: OPENCODE_MODES },
 }
 
 export const HARNESSES = new Set(Object.keys(DRIVERS))
