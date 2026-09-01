@@ -58,6 +58,7 @@ import {
   connectorFingerprint,
 } from './codex-tools.mjs'
 import { permissionDecisionPayload } from '../event-payloads.mjs'
+import { todosFromCodexItem } from './todos.mjs'
 
 export function isStaleCodexTurnCompletion(doneId, currentTurnId, turnActive) {
   if (!doneId) return false
@@ -558,6 +559,15 @@ export async function createCodexDriver(s, spec, h) {
             s.pusher.emit('sdk.assistant', messagePayload(item, currentModel))
           } else if (item?.type === 'reasoning') {
             s.pusher.emit('sdk.assistant', messagePayload(item, currentModel))
+          } else if (item?.type === 'todoList') {
+            // Codex's plan tool. Not a transcript item — it feeds the
+            // platform task list (#1424) the same way claude's TodoWrite
+            // does, as a wholesale todo.updated snapshot. A shape this
+            // build cannot read is logged, not swallowed: the pin will
+            // move, and a silently dead task list is invisible.
+            const todos = todosFromCodexItem(item)
+            if (todos) s.pusher.emit('todo.updated', { todos })
+            else h.log('codex: todoList item with unrecognized shape dropped')
           } else if (item?.type) {
             // ThreadItem is a growing union (plan, collabAgentToolCall,
             // imageGeneration, contextCompaction, …). Dropping a shape this
@@ -660,10 +670,9 @@ export async function createCodexDriver(s, spec, h) {
           break
 
         default:
-          // codex-internal notifications (plan updates, diffs, account,
-          // fuzzy search, realtime) drive nothing here; forwarding
-          // untranslated shapes would put unreadable payloads in the durable
-          // timeline.
+          // codex-internal notifications (diffs, account, fuzzy search,
+          // realtime) drive nothing here; forwarding untranslated shapes
+          // would put unreadable payloads in the durable timeline.
       }
     } catch (err) {
       h.log(`codex event translation failed (${method}): ${err?.stack || err}`)

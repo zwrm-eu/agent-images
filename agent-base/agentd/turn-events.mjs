@@ -47,7 +47,9 @@ export class TurnEventContext {
   }
 
   implicitEventTurnId(type) {
-    if (type.startsWith('sdk.') && this.drainingTurnId) return this.drainingTurnId
+    // todo.updated derives from a draining turn's sdk.user tool_result and
+    // must stay stamped with it, not with whatever turn opened since (#1424).
+    if ((type.startsWith('sdk.') || type === 'todo.updated') && this.drainingTurnId) return this.drainingTurnId
     return this.activeTurnId
   }
 }

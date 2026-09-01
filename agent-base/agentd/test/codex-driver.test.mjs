@@ -159,6 +159,30 @@ test('a turn produces exactly one sdk.result, synced before it is observable', a
   await ctx.driver.shutdownStop()
 })
 
+test('a todoList thread item becomes a todo.updated snapshot, not a transcript entry', async () => {
+  const ctx = await build(newHarness({ scenario: 'todo' }))
+  ctx.driver.start()
+  assert.equal(ctx.driver.queueMessage('plan it'), true)
+  await until(ctx.events, (e) => ofType(e, 'sdk.result').length > 0, 'sdk.result')
+
+  const updates = ofType(ctx.events, 'todo.updated')
+  assert.equal(updates.length, 1, 'one snapshot per todoList item')
+  assert.deepEqual(updates[0].payload, {
+    todos: [
+      { content: 'read the code', status: 'completed' },
+      { content: 'write tests', status: 'pending' },
+    ],
+  })
+  // The item must not leak into the transcript as a tool_use/tool_result.
+  for (const e of [...ofType(ctx.events, 'sdk.assistant'), ...ofType(ctx.events, 'sdk.user')]) {
+    const blocks = e.payload?.message?.content ?? []
+    assert.ok(!blocks.some((b) => b?.type === 'tool_use' || b?.type === 'tool_result'),
+      'todoList rendered as a transcript tool item')
+  }
+
+  await ctx.driver.shutdownStop()
+})
+
 test('a large prompt is delivered, not misread as a write failure', async () => {
   // stream.write() returns false once the queued bytes exceed the pipe's 64KB
   // high-water mark. That is BACKPRESSURE — the chunk is buffered and flushed
