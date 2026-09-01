@@ -95,6 +95,14 @@ test('the /healthz caps derive their harness entries from the registry', async (
   }
 })
 
+test('command routes dispatch by driver capability, not a harness allowlist', async () => {
+  const src = await readFile(SERVER, 'utf8')
+  assert.match(src, /supportsCommandDriver\(s\.driver\)/,
+    'command routes must ask the active driver whether it implements commands')
+  assert.doesNotMatch(src, /s\.harness\s*!==\s*['"]claude['"]/,
+    'shared command routing must not hard-code the current command-capable harness')
+})
+
 test('claude sessions opt in to runtime Bypass mode changes', async () => {
   // Claude's Agent SDK requires this option when the query is constructed;
   // without it, changing an already-running Ask session to

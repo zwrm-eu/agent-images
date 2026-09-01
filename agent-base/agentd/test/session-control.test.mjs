@@ -8,6 +8,7 @@ import {
   normalizeCommandName,
   resolveCommand,
   shellContext,
+  supportsCommandDriver,
 } from '../session-control.mjs'
 
 test('command names stay structured and prompts keep the slash first', () => {
@@ -16,19 +17,30 @@ test('command names stay structured and prompts keep the slash first', () => {
   assert.equal(commandPrompt('review', 'src/app.ts', ['shell context']), '/review src/app.ts\n\nshell context')
 })
 
-test('SDK command discovery normalizes fields and resolves aliases', () => {
+test('driver command discovery normalizes fields and resolves aliases', () => {
   const commands = normalizeCommandList([
     { name: 'review', description: 'Review code', argumentHint: '<path>', aliases: ['pr'] },
-    { name: '/deploy', description: 'Ship it' },
+    { name: '/deploy', description: 'Ship it', argument_hint: '[environment]' },
     { name: 'bad name' },
     { name: 'review', description: 'duplicate' },
   ])
   assert.deepEqual(commands, [
     { name: 'review', description: 'Review code', argument_hint: '<path>', aliases: ['pr'] },
-    { name: 'deploy', description: 'Ship it', argument_hint: '' },
+    { name: 'deploy', description: 'Ship it', argument_hint: '[environment]' },
   ])
   assert.equal(resolveCommand(commands, '/pr')?.name, 'review')
   assert.equal(resolveCommand(commands, 'missing'), null)
+})
+
+test('command support follows driver capabilities, not a harness name', () => {
+  const futureOpenCodeDriver = {
+    harness: 'opencode',
+    listCommands() {},
+    invokeCommand() {},
+  }
+  assert.equal(supportsCommandDriver(futureOpenCodeDriver), true)
+  assert.equal(supportsCommandDriver({ harness: 'claude', listCommands() {} }), false)
+  assert.equal(supportsCommandDriver({ harness: 'pi' }), false)
 })
 
 test('shell execution combines output and returns non-zero exits as data', async () => {

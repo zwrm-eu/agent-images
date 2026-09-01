@@ -16,10 +16,9 @@ export function normalizeCommandName(value) {
   return name
 }
 
-// The Claude SDK is the authority for what is invocable: its initialize
-// response already merges built-ins, projected platform skills, and the
-// workspace/repository command files. Normalize that SDK shape at the daemon
-// boundary so the control-plane DTO stays stable across SDK releases.
+// A command-capable driver is the authority for what is invocable. Normalize
+// common SDK fields at the daemon boundary so the control-plane DTO stays
+// stable across harness and SDK releases.
 export function normalizeCommandList(value) {
   if (!Array.isArray(value)) return []
   const seen = new Set()
@@ -43,10 +42,13 @@ export function normalizeCommandList(value) {
           }
         }).filter((alias, index, all) => alias !== name && all.indexOf(alias) === index)
       : []
+    const argumentHint = typeof raw.argument_hint === 'string'
+      ? raw.argument_hint
+      : (typeof raw.argumentHint === 'string' ? raw.argumentHint : '')
     out.push({
       name,
       description: typeof raw.description === 'string' ? raw.description : '',
-      argument_hint: typeof raw.argumentHint === 'string' ? raw.argumentHint : '',
+      argument_hint: argumentHint,
       ...(aliases.length > 0 ? { aliases } : {}),
     })
   }
@@ -58,9 +60,18 @@ export function resolveCommand(commands, requested) {
   return commands.find((command) => command.name === name || command.aliases?.includes(name)) || null
 }
 
-// Keep the slash command first in the prompt: Claude Code only treats a
-// leading slash as structured command syntax. Pending operator-shell context
-// follows the invocation so it is visible to the resulting model turn.
+// Command support is a driver capability, not a harness-name allowlist. A
+// future driver (for example OpenCode) opts into the shared routes by exposing
+// the same two methods Claude exposes today.
+export function supportsCommandDriver(driver) {
+  return Boolean(driver &&
+    typeof driver.listCommands === 'function' &&
+    typeof driver.invokeCommand === 'function')
+}
+
+// Keep the slash command first in the prompt for drivers whose command syntax
+// requires a leading invocation. Pending operator-shell context follows it so
+// it is visible to the resulting model turn.
 export function commandPrompt(command, argumentsText = '', pendingContext = []) {
   const name = normalizeCommandName(command)
   const args = typeof argumentsText === 'string' ? argumentsText.trim() : ''

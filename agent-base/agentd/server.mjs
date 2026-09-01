@@ -44,6 +44,7 @@ import {
   MAX_SHELL_OUTPUT_BYTES,
   normalizeCommandName,
   shellContext,
+  supportsCommandDriver,
 } from './session-control.mjs'
 
 const DEFAULT_PORT = 9924
@@ -1076,20 +1077,17 @@ async function handleMessage(req, res, s) {
 }
 
 async function handleCommands(res, s) {
-  if (s.harness !== 'claude') {
-    throw badRequest(`commands are not supported by the ${s.harness} harness`)
-  }
   if (isDone(s)) return send(res, 409, { error: 'session is finished', state: s.state })
   if (s.state === 'starting') return send(res, 409, { error: 'session is still starting', state: s.state })
+  if (!supportsCommandDriver(s.driver)) {
+    throw badRequest(`commands are not supported by the ${s.harness} harness`)
+  }
   const commands = await s.driver.listCommands()
   send(res, 200, { commands })
 }
 
 async function handleCommand(req, res, s) {
   const body = await readBody(req)
-  if (s.harness !== 'claude') {
-    throw badRequest(`commands are not supported by the ${s.harness} harness`)
-  }
   let command
   try {
     command = normalizeCommandName(body.command)
@@ -1104,6 +1102,9 @@ async function handleCommand(req, res, s) {
   }
   if (s.state !== 'idle' || s.controlBusy) {
     return send(res, 409, { error: 'session must be idle before invoking a command', state: s.state })
+  }
+  if (!supportsCommandDriver(s.driver)) {
+    throw badRequest(`commands are not supported by the ${s.harness} harness`)
   }
 
   // Reserve the turn before the first await. Node may serve another request
@@ -1361,7 +1362,7 @@ const server = createServer(async (req, res) => {
         // rotates the session's platform credential in place; the CP's
         // admission-time refresh gates on it (a stale daemon would silently
         // keep the expired token).
-        // 'commands' (#1429): Claude SDK slash-command discovery/invocation.
+        // 'commands' (#1429): harness-driver command discovery/invocation.
         // 'shell' (#1429): immediate operator shell with durable context.
         caps: ['mcp', 'escalation', 'files', 'file-search', 'message-context', 'park', 'reclaim', 'skillfetch', 'pi-multiprovider', 'pi-gateway', 'background-tasks', 'tool-policy', 'token-refresh', 'commands', 'shell', ...HARNESS_CAPS],
         active_session: session && !isDone(session) ? session.id : null,
