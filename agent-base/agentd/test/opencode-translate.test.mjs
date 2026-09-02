@@ -126,10 +126,13 @@ test('session config: platform base + native MCP entries + gate table', () => {
   assert.deepEqual(cfg.mcp.github, { type: 'remote', url: 'http://gw/mcp/github', headers: { Authorization: 'Bearer t' }, enabled: true })
   assert.equal(cfg.mcp.broken, undefined)
   // Config-level so command-invoked turns are covered too (#1429): the
-  // command endpoint has no per-call tools field. task is intentionally NOT
-  // disabled — re-enabled to diagnose the #1388 subagent hang on the real
-  // daemon via the stall watchdog.
+  // command endpoint has no per-call tools field. task stays ENABLED — the
+  // #1388 hang was pinned to a dead-upstream MCP call, not the subagent, and
+  // the mcp_timeout below is the fix.
   assert.deepEqual(cfg.tools, { question: false })
+  // A dead connector upstream must not wedge the session (#1388): every MCP
+  // call is bounded so it fails with a timeout error instead of hanging.
+  assert.equal(cfg.experimental.mcp_timeout, 120000)
   // Every gated native tool asks, and every MCP server's tools ask — that is
   // what routes connector calls through the platform gate.
   for (const [k, v] of Object.entries(GATED_PERMISSIONS)) assert.equal(cfg.permission[k], v)
