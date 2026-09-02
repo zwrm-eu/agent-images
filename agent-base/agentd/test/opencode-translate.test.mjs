@@ -126,8 +126,10 @@ test('session config: platform base + native MCP entries + gate table', () => {
   assert.deepEqual(cfg.mcp.github, { type: 'remote', url: 'http://gw/mcp/github', headers: { Authorization: 'Bearer t' }, enabled: true })
   assert.equal(cfg.mcp.broken, undefined)
   // Config-level so command-invoked turns are covered too (#1429): the
-  // command endpoint has no per-call tools field.
-  assert.deepEqual(cfg.tools, { question: false })
+  // command endpoint has no per-call tools field. task (subagent spawn) is
+  // disabled alongside question — subagents hang the parent turn on this
+  // harness, so offering the tool is a guaranteed session wedge.
+  assert.deepEqual(cfg.tools, { question: false, task: false })
   // Every gated native tool asks, and every MCP server's tools ask — that is
   // what routes connector calls through the platform gate.
   for (const [k, v] of Object.entries(GATED_PERMISSIONS)) assert.equal(cfg.permission[k], v)
