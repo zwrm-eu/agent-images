@@ -53,3 +53,38 @@ test('an ending session refuses to park; unknown tools 404', async () => {
   assert.equal((await handlePlatformTool({ ending: true }, deps([]), 'sleep', { seconds: 5 })).status, 409)
   assert.equal((await handlePlatformTool({ ending: false }, deps([]), 'nope', {})).status, 404)
 })
+
+// Baked run tools import at load time inside opencode's Bun runtime, resolved
+// by walking node_modules up from /etc/opencode/run/tool. Only what the image
+// vendors at /etc/opencode/run/node_modules (the Dockerfile pins
+// @opencode-ai/plugin) is resolvable there — a tool importing anything else
+// throws "Cannot find module" at SessionPrompt.run and the RUN completes empty
+// with no assistant output. The unit suite runs against a fake server and
+// cannot catch that, so pin the allowed import set statically: adding a tool
+// that imports an un-vendored module fails HERE, not only on real hardware.
+test('baked run tools import only the vendored module set (#1392)', async () => {
+  const { readdirSync, readFileSync } = await import('node:fs')
+  const { fileURLToPath } = await import('node:url')
+  const { dirname, join } = await import('node:path')
+  const toolsDir = join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'opencode-tools')
+  // Kept in lockstep with the Dockerfile's `npm install --prefix
+  // /etc/opencode/run`. Extend BOTH together when a tool needs a new import.
+  const VENDORED = new Set(['@opencode-ai/plugin'])
+  const files = readdirSync(toolsDir).filter((f) => f.endsWith('.ts'))
+  assert.ok(files.length > 0, 'no run tools found to check')
+  // Every module-specifier form Bun would resolve at load time: `from "x"`,
+  // side-effect `import "x"`, dynamic `import("x")`, and `require("x")`. A
+  // narrower match would let a future tool smuggle an un-vendored import past
+  // this guard in a form it does not recognize.
+  const specRE = /\bfrom\s*['"]([^'"]+)['"]|\bimport\s*['"]([^'"]+)['"]|\bimport\s*\(\s*['"]([^'"]+)['"]|\brequire\s*\(\s*['"]([^'"]+)['"]/g
+  for (const f of files) {
+    const src = readFileSync(join(toolsDir, f), 'utf8')
+    for (const m of src.matchAll(specRE)) {
+      const spec = m[1] || m[2] || m[3] || m[4]
+      if (spec.startsWith('.') || spec.startsWith('/') || spec.startsWith('node:')) continue
+      // Bare specifier → a package the image must vendor next to the tools.
+      const pkg = spec.startsWith('@') ? spec.split('/').slice(0, 2).join('/') : spec.split('/')[0]
+      assert.ok(VENDORED.has(pkg), `${f} imports un-vendored module '${pkg}'; vendor it in the Dockerfile's /etc/opencode/run install or the RUN turn fails at tool resolve`)
+    }
+  }
+})
