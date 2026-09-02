@@ -31,6 +31,18 @@ import { RUN_TOOL_NAMES } from './opencode-run-tools.mjs'
 // the Go config renderer must emit the same key.
 export const OPENCODE_PROVIDER_ID = 'zwrm'
 
+// Ceiling on an MCP tool call's result (#1388). OpenCode otherwise waits
+// FOREVER for a result: when a connector's upstream MCP SSE stream dies after
+// a tools/call is accepted, the result is never delivered nor errored, and the
+// whole session wedges in `working` (the production hang — a gojiberry
+// connector whose upstream SSE "exceeded 5 retries without progress"). With
+// this set, a dead call terminates as an MCP timeout error the model can react
+// to, and the turn completes. Generous (2m) so a legitimately slow connector
+// tool is not falsely cut off; the park channel (sleep/sleep_until) is a baked
+// FILE tool, not MCP, so it is unaffected, and connector escalation is a
+// permission pause before the call, not an in-flight MCP request.
+export const MCP_TOOL_TIMEOUT_MS = 120_000
+
 // initPayload synthesizes the claude `system/init` message. session_id
 // carries the OpenCode session id — the durable resume handle (sessions live
 // in ~/.local/share/opencode/opencode.db on the workspace volume, so resume
@@ -280,13 +292,14 @@ export function buildSessionConfig({ platform, mcpServers, interactive, instruct
   // also covers command-invoked turns (#1429), whose endpoint has no tools
   // field.
   //
-  // task (subagent spawn) is deliberately LEFT ENABLED: it caused a session
-  // hang (#1388) that could not be reproduced hermetically nor against the
-  // real gateway/connector/model, so it is re-enabled to reproduce the wedge
-  // on the real daemon and let the stall watchdog (opencode.mjs) pinpoint it.
-  // No customers use opencode yet, so the hang risk is confined to the test
-  // org during diagnosis.
+  // task (subagent spawn) is LEFT ENABLED: the #1388 session hang was pinned
+  // (deterministic repro) to a connector MCP call that never returns when its
+  // upstream dies — NOT the subagent, which was only incidental. The real fix
+  // is the MCP timeout below, so task no longer needs disabling.
   cfg.tools = { ...(cfg.tools || {}), question: false }
+  // Bound every MCP call so a dead connector upstream can't wedge the session
+  // (#1388) — see MCP_TOOL_TIMEOUT_MS.
+  cfg.experimental = { ...(cfg.experimental || {}), mcp_timeout: MCP_TOOL_TIMEOUT_MS }
   if (instructionsPath) {
     cfg.instructions = [...(Array.isArray(cfg.instructions) ? cfg.instructions : []), instructionsPath]
   }
