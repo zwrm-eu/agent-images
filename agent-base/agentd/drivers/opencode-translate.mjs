@@ -274,12 +274,17 @@ export function buildSessionConfig({ platform, mcpServers, interactive, instruct
     permission.sleep_until = 'allow'
   }
   cfg.permission = { ...(cfg.permission || {}), ...permission }
-  // The question tool has no answer channel on this platform's surfaces yet;
-  // without this the model can park a turn on a question nobody sees.
-  // Config-level deliberately (probed): unlike a per-prompt tools override,
-  // it also covers command-invoked turns (#1429), whose endpoint has no
-  // tools field.
-  cfg.tools = { ...(cfg.tools || {}), question: false }
+  // Tools disabled harness-wide, config-level (probed: covers command-invoked
+  // turns too, whose endpoint has no per-prompt tools field):
+  //  - question: no answer channel on this platform's surfaces, so the model
+  //    would park a turn on a question nobody can see.
+  //  - task: opencode's subagent spawn. Subagents are not wired on this
+  //    harness — the child runs under its own session id, makes no progress,
+  //    and the PARENT turn hangs in `working` forever (observed live: a model
+  //    called `task {}` and the session wedged with zero gateway calls until
+  //    interrupted). Until subagents are properly supported, offering the tool
+  //    is a guaranteed session hang whenever a model reaches for it.
+  cfg.tools = { ...(cfg.tools || {}), question: false, task: false }
   if (instructionsPath) {
     cfg.instructions = [...(Array.isArray(cfg.instructions) ? cfg.instructions : []), instructionsPath]
   }
