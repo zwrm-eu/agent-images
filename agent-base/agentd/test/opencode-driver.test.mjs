@@ -206,6 +206,65 @@ test('a slow /event subscription does not lose the turn: prompt waits for it (#1
   }
 })
 
+test('a task tool_use that never idles trips the stall watchdog; child-session activity is logged (#1388)', async () => {
+  process.env.ZWRM_OPENCODE_STALL_MS = '150'
+  const fake = await startFakeOpenCode()
+  try {
+    const ctx = newHarness()
+    const logs = []
+    ctx.h.log = (m) => logs.push(String(m))
+    const { s, driver, events } = await build(fake, ctx)
+    driver.start()
+    driver.queueMessage('go')
+    await until(events, () => fake.state.prompts.length === 1, 'the prompt')
+    const sid = s.sdkSessionId
+    // A subagent's child-session event: dropped from the transcript but logged.
+    fake.emit('message.part.updated', { part: { id: 'c1', sessionID: 'ses_child9', type: 'text', text: 'sub work' } })
+    // The parent's task tool_use arms the watchdog; then we deliberately never
+    // send session.idle — simulating the production wedge.
+    fake.emit('message.part.updated', { part: { id: 'p1', sessionID: sid, type: 'tool', tool: 'task', callID: 't1', state: { status: 'running', input: {} } } })
+    await until(events, (ev) => ev.some((x) => x.type === 'sdk.assistant' && x.payload?.message?.content?.[0]?.name === 'task'), 'task tool_use emitted')
+    await new Promise((r) => setTimeout(r, 500))
+    assert.ok(logs.some((m) => /SUBAGENT STALL WATCH/.test(m)), `watchdog did not fire; logs: ${logs.join(' | ')}`)
+    assert.ok(logs.some((m) => /subagent child session ses_child9/.test(m)), 'child-session activity was not logged')
+    const stall = logs.find((m) => /SUBAGENT STALL WATCH/.test(m))
+    assert.match(stall, /childSessions=\[ses_child9\]/)
+    fake.emit('session.idle', { sessionID: sid }) // close the turn to shut down cleanly
+    await driver.shutdownStop()
+    fake.assertNoViolations(assert)
+  } finally {
+    delete process.env.ZWRM_OPENCODE_STALL_MS
+    await fake.close()
+  }
+})
+
+test('a task turn that idles normally does NOT trip the watchdog (#1388)', async () => {
+  process.env.ZWRM_OPENCODE_STALL_MS = '150'
+  const fake = await startFakeOpenCode()
+  try {
+    const ctx = newHarness()
+    const logs = []
+    ctx.h.log = (m) => logs.push(String(m))
+    const { s, driver, events } = await build(fake, ctx)
+    driver.start()
+    driver.queueMessage('go')
+    await until(events, () => fake.state.prompts.length === 1, 'the prompt')
+    const sid = s.sdkSessionId
+    fake.emit('message.part.updated', { part: { id: 'p1', sessionID: sid, type: 'tool', tool: 'task', callID: 't1', state: { status: 'running', input: {} } } })
+    // The subagent completes and the parent idles BEFORE the watch fires.
+    fake.emit('message.part.updated', { part: { id: 'p1', sessionID: sid, type: 'tool', tool: 'task', callID: 't1', state: { status: 'completed', input: {}, output: 'done' } } })
+    fake.emit('session.idle', { sessionID: sid })
+    await until(events, (ev) => ofType(ev, 'sdk.result').length === 1, 'the result')
+    await new Promise((r) => setTimeout(r, 300))
+    assert.equal(logs.some((m) => /SUBAGENT STALL WATCH/.test(m)), false, `watchdog fired on a normal turn; logs: ${logs.join(' | ')}`)
+    await driver.shutdownStop()
+    fake.assertNoViolations(assert)
+  } finally {
+    delete process.env.ZWRM_OPENCODE_STALL_MS
+    await fake.close()
+  }
+})
+
 test('completed todowrite feeds the task list; errors and malformed input do not', async () => {
   const fake = await startFakeOpenCode()
   try {

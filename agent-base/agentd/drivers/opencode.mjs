@@ -52,6 +52,12 @@ import { commandPrompt, normalizeCommandList, resolveCommand } from '../session-
 // /interrupt or SIGTERM shutdown; turn-carrying calls stay unbounded.
 const TEARDOWN_TIMEOUT_MS = 10_000
 
+// How long a turn may stay open after a `task` (subagent) tool_use before the
+// driver logs a diagnostic snapshot (#1388). Diagnostic only — it never aborts
+// or fails the turn; a legitimately long subagent just logs once and is
+// otherwise untouched.
+const STALL_WATCH_MS = 45_000
+
 // The permission modes this harness can host, exported for the registry
 // (#1160 rule: the table cannot disagree with construction).
 export const SUPPORTED_PERMISSION_MODES = new Set(['default', 'bypassPermissions'])
@@ -202,6 +208,31 @@ export async function createOpenCodeDriver(s, spec, h) {
   const openAsks = new Set()
   // The normalized command list (#1429), fetched once — see listCommands.
   let latestCommands = null
+  // Subagent diagnostics (#1388): the `task` tool spawns a child session whose
+  // events the filter below drops. A live chat once wedged in `working` right
+  // after a `task` call and could not be reproduced hermetically, so log the
+  // shape of the next real occurrence rather than guess: which child sessions
+  // produced events, and — if the turn is still open well after a `task`
+  // tool_use — a one-shot snapshot of exactly where it stalled.
+  const seenChildSessions = new Set()
+  let stallWatch = null
+  const clearStallWatch = () => { if (stallWatch) { clearTimeout(stallWatch); stallWatch = null } }
+  const armStallWatch = () => {
+    clearStallWatch()
+    const armedSeq = turnSeq
+    // Read at arm time (env override is for tests).
+    const ms = Number(process.env.ZWRM_OPENCODE_STALL_MS) || STALL_WATCH_MS
+    stallWatch = setTimeout(() => {
+      stallWatch = null
+      if (finished || !turnActive || resultEmittedSeq >= armedSeq) return
+      h.log(`opencode: SUBAGENT STALL WATCH (#1388) — turn ${armedSeq} still working ` +
+        `${ms / 1000}s after a task tool_use; ` +
+        `resultEmittedSeq=${resultEmittedSeq} childSessions=[${[...seenChildSessions].join(',')}] ` +
+        `(no child-session events means the subagent never started; children present but no ` +
+        `parent session.idle means opencode never closed the parent turn)`)
+    }, ms)
+    stallWatch.unref?.()
+  }
 
   // resetTurnState opens a fresh platform turn's bookkeeping. Maps are
   // REPLACED, not cleared: a chained closure from the previous turn may still
@@ -217,6 +248,7 @@ export async function createOpenCodeDriver(s, spec, h) {
     toolEmitted = new Map()
     textParts = new Map()
     msgRoles.clear()
+    clearStallWatch()
   }
 
   const currentModel = () => spec.model || ''
@@ -376,7 +408,17 @@ export async function createOpenCodeDriver(s, spec, h) {
     // Everything the driver reads is session-scoped; foreign sessions (task
     // subagents, other projects) stay out of the transcript.
     const evSession = props.sessionID ?? props.part?.sessionID ?? props.info?.sessionID
-    if (evSession && evSession !== ocSessionId) return
+    if (evSession && evSession !== ocSessionId) {
+      // A foreign session id is a task subagent (or another project). Log the
+      // first event from each child once — proof the subagent actually ran,
+      // which the stall watchdog reads (#1388). Dropped from the transcript
+      // either way.
+      if (!seenChildSessions.has(evSession)) {
+        seenChildSessions.add(evSession)
+        h.log(`opencode: subagent child session ${evSession} first event (${type}) [#1388]`)
+      }
+      return
+    }
     try {
       switch (type) {
         case 'permission.asked':
@@ -449,6 +491,10 @@ export async function createOpenCodeDriver(s, spec, h) {
             if ((status === 'running' || status === 'pending') && !stage) {
               toolEmitted.set(callID, 'use')
               s.pusher.emit('sdk.assistant', toolUsePayload(named, currentModel()))
+              // A `task` call opens a subagent; arm the stall watchdog so a
+              // turn that never closes after it leaves a diagnostic (#1388).
+              // Raw name — task is a native tool, never slug-prefixed.
+              if (part.tool === 'task') armStallWatch()
             } else if ((status === 'completed' || status === 'error') && stage !== 'result') {
               if (!stage) {
                 // Terminal state for a call whose start we never saw (SSE
@@ -521,6 +567,7 @@ export async function createOpenCodeDriver(s, spec, h) {
 
         case 'session.idle': {
           if (!turnActive) break
+          clearStallWatch() // the parent turn closed; no stall (#1388)
           // Flush and snapshot SYNCHRONOUSLY: the chain below awaits, and a
           // new prompt landing in that window replaces the per-turn state
           // (review — reading it late corrupted both turns' results).
