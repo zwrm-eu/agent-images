@@ -744,3 +744,47 @@ test('a prompt racing the chained result emit corrupts neither turn', async () =
     await fake.close()
   }
 })
+
+// External provider models (#1444) need NO driver mapping: an ext/ slug is
+// just another model under the one zwrm provider (the CP seeds it there —
+// build/opencode_config.go), so the driver names it exactly as any catalog
+// model. Pinned because the Go renderer and this driver agree on it only by
+// convention. Two contracts, each in its own session so a live prompt turn
+// never overlaps the command call: the prompt carries the FULL slug as
+// modelID under OPENCODE_PROVIDER_ID, and the command endpoint's string form
+// is the provider, a slash, then the full slug — which the real binary splits
+// on the FIRST slash (probed), so the slug's own slashes survive intact.
+const EXT_MODEL = 'ext/mine/meta-llama/Llama-3.3-70B'
+
+test('ext/ model prompts carry the full slug as modelID under the zwrm provider', async () => {
+  const fake = await startFakeOpenCode()
+  try {
+    const { driver, events } = await build(fake, newHarness({ spec: { model: EXT_MODEL } }))
+    driver.start()
+    assert.equal(ofType(events, 'sdk.system')[0].payload.model, EXT_MODEL)
+    assert.equal(driver.queueMessage('hello'), true)
+    await until(events, () => fake.state.prompts.length === 1, 'the prompt')
+    assert.deepEqual(fake.state.prompts[0].model, { providerID: 'zwrm', modelID: EXT_MODEL })
+    await driver.shutdownStop()
+    fake.assertNoViolations(assert)
+  } finally {
+    await fake.close()
+  }
+})
+
+test('ext/ model commands use the "zwrm/<full slug>" string form', async () => {
+  const fake = await startFakeOpenCode()
+  try {
+    const { driver, events } = await build(fake)
+    driver.start()
+    // invokeCommand returns once the invocation is accepted; the synchronous
+    // POST /command (it blocks for the whole turn) is fired, not awaited.
+    await driver.invokeCommand({ command: 'greet', arguments: 'Tom', model: EXT_MODEL, pendingContext: [] })
+    await until(events, () => fake.state.commandInvocations.length === 1, 'the command to land')
+    assert.equal(fake.state.commandInvocations[0].model, `zwrm/${EXT_MODEL}`)
+    await driver.shutdownStop()
+    fake.assertNoViolations(assert)
+  } finally {
+    await fake.close()
+  }
+})
