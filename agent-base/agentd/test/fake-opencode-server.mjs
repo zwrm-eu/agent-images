@@ -11,7 +11,7 @@
 // {response}, prompt_async 204, session-cumulative cost on GET /session/:id.
 import { createServer } from 'node:http'
 
-export async function startFakeOpenCode({ password = 'test', expectProvider = 'zwrm', commands } = {}) {
+export async function startFakeOpenCode({ password = 'test', expectProvider = 'zwrm', commands, eventDelayMS = 0 } = {}) {
   const state = {
     sessions: new Map(), // id -> {id, cost, tokens}
     prompts: [], // validated prompt bodies, in order
@@ -50,10 +50,15 @@ export async function startFakeOpenCode({ password = 'test', expectProvider = 'z
     const parts = url.pathname.split('/').filter(Boolean)
 
     if (req.method === 'GET' && url.pathname === '/event') {
-      res.writeHead(200, { 'content-type': 'text/event-stream' })
-      res.write('data: {"type":"server.connected","properties":{}}\n\n')
-      sseClients.add(res)
-      req.on('close', () => sseClients.delete(res))
+      const attach = () => {
+        res.writeHead(200, { 'content-type': 'text/event-stream' })
+        res.write('data: {"type":"server.connected","properties":{}}\n\n')
+        if (state.subscribedAt === undefined) state.subscribedAt = Date.now()
+        sseClients.add(res)
+        req.on('close', () => sseClients.delete(res))
+      }
+      if (eventDelayMS > 0) setTimeout(attach, eventDelayMS)
+      else attach()
       return
     }
     if (req.method === 'GET' && url.pathname === '/command') {
@@ -97,6 +102,7 @@ export async function startFakeOpenCode({ password = 'test', expectProvider = 'z
           }
         }
         state.prompts.push(body)
+        if (state.firstPromptAt === undefined) state.firstPromptAt = Date.now()
         res.writeHead(204).end()
         return
       }

@@ -37,6 +37,23 @@ export class OpenCodeServer {
     this.password = randomBytes(16).toString('hex')
     this.closed = false
     this.sseAbort = null
+    // Resolves the first time the /event stream is connected server-side, so
+    // the driver can gate the first prompt on it: opencode's /event has NO
+    // replay, and a completion that finishes before the subscription attaches
+    // loses every message.part.updated — the turn then looks empty (an idle
+    // with no assistant text). Rejects if the stream gives up before ever
+    // connecting. Reconnects after the first do not touch this.
+    this._subscribed = false
+    this.subscribed = new Promise((resolve, reject) => {
+      this._resolveSubscribed = resolve
+      this._rejectSubscribed = reject
+    })
+    // close() and the failure budget can reject `subscribed` during bootstrap
+    // — before the driver's construction gate has awaited it (a start()/create
+    // failure calls close() first). A permanent no-op reaction keeps that from
+    // surfacing as an unhandledRejection; a real awaiter still observes the
+    // rejection through its own reaction.
+    this.subscribed.catch(() => {})
   }
 
   async start() {
@@ -64,7 +81,11 @@ export class OpenCodeServer {
       if (this.closed) return
       this.closed = true
       this.sseAbort?.abort()
-      this.opts.onExit?.(new Error(`opencode serve exited (code ${code}, signal ${signal}): ${stderrTail.trim().slice(-300)}`))
+      const err = new Error(`opencode serve exited (code ${code}, signal ${signal}): ${stderrTail.trim().slice(-300)}`)
+      // A crash during the subscribe window fails the construction gate now
+      // rather than after its 15s timeout; harmless once already subscribed.
+      if (!this._subscribed) this._rejectSubscribed(err)
+      this.opts.onExit?.(err)
     })
 
     this.baseURL = await new Promise((resolve, reject) => {
@@ -133,6 +154,13 @@ export class OpenCodeServer {
           signal: this.sseAbort.signal,
         })
         if (!res.ok || !res.body) throw new OpenCodeHTTPError(res.status, '', '/event')
+        // Subscribed server-side: opencode registers the SSE client while
+        // handling this request, before it responds, so a 200 here means any
+        // event emitted from now on reaches us. Gate the first prompt on this.
+        if (!this._subscribed) {
+          this._subscribed = true
+          this._resolveSubscribed()
+        }
         // failures resets only once a stream DELIVERS something: a server
         // that accepts and immediately EOFs would otherwise reset the
         // counter every lap and reconnect forever without ever reporting
@@ -172,7 +200,9 @@ export class OpenCodeServer {
           failures++
           if (failures >= MAX_SSE_FAILURES) {
             this.closed = true
-            this.opts.onExit?.(new Error(`opencode event stream closed empty ${failures} times`))
+            const e = new Error(`opencode event stream closed empty ${failures} times`)
+            if (!this._subscribed) this._rejectSubscribed(e)
+            this.opts.onExit?.(e)
             return
           }
         }
@@ -182,7 +212,9 @@ export class OpenCodeServer {
         this.opts.log?.(`opencode event stream dropped (${failures}/${MAX_SSE_FAILURES}): ${err?.message || err}`)
         if (failures >= MAX_SSE_FAILURES) {
           this.closed = true
-          this.opts.onExit?.(new Error(`opencode event stream failed ${failures} times: ${err?.message || err}`))
+          const e = new Error(`opencode event stream failed ${failures} times: ${err?.message || err}`)
+          if (!this._subscribed) this._rejectSubscribed(e)
+          this.opts.onExit?.(e)
           return
         }
       }
@@ -193,6 +225,9 @@ export class OpenCodeServer {
   close() {
     if (this.closed && !this.child) return
     this.closed = true
+    // A close before the first subscription must not leave a prompt gated on
+    // `subscribed` forever.
+    if (!this._subscribed) this._rejectSubscribed(new Error('opencode server closed before the event stream connected'))
     this.sseAbort?.abort()
     if (this.child) {
       try {
