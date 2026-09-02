@@ -129,9 +129,21 @@ RUN printf 'export OPENCODE_DISABLE_AUTOUPDATE=1\nexport OPENCODE_DISABLE_MODELS
 # session config's instructions file — reading both would double the prompt)
 # nor the run tools.
 COPY opencode-tools/ /etc/opencode/run/tool/
-RUN mkdir -p /etc/opencode/session \
+# The run tools `import { tool } from "@opencode-ai/plugin"`. OpenCode resolves
+# a custom tool's imports with Bun's node_modules walk from the tool FILE up —
+# /etc/opencode/run/tool → /etc/opencode/run → … — never reaching the model
+# user's ~/.config/opencode where opencode self-installs the package. Vendor it
+# at /etc/opencode/run/node_modules, pinned to the binary's version (the plugin
+# API travels with opencode). Without this a RUN turn throws "Cannot find
+# module '@opencode-ai/plugin'" at tool-resolve time (SessionPrompt.run) and
+# completes empty — no assistant output, the model never reached. Interactive
+# sessions use the tools-free /etc/opencode/session dir and never import it.
+RUN mkdir -p /etc/opencode/session /etc/opencode/run \
+    && npm install --prefix /etc/opencode/run @opencode-ai/plugin@1.18.25 \
+    && npm cache clean --force \
     && chmod 755 /etc/opencode /etc/opencode/run /etc/opencode/run/tool /etc/opencode/session \
-    && chmod 644 /etc/opencode/run/tool/*.ts
+    && chmod 644 /etc/opencode/run/tool/*.ts \
+    && test -d /etc/opencode/run/node_modules/@opencode-ai/plugin
 
 # -- zwrm CLI (from official releases) ----------------------------------------
 # Baseline only: this resolves "latest" when the layer is BUILT and the cached
