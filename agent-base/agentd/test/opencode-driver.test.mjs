@@ -170,6 +170,42 @@ test('tool parts render as one tool_use / tool_result pair, foreign sessions are
   }
 })
 
+test('a slow /event subscription does not lose the turn: prompt waits for it (#1429 race)', async () => {
+  // opencode has no event replay; a prompt sent before the SSE attaches loses
+  // the whole turn (observed on a cold VM as an empty result). The driver must
+  // gate the first prompt on the subscription. Delay the fake's /event so a
+  // fire-and-forget subscribe would lose the race.
+  const fake = await startFakeOpenCode({ eventDelayMS: 400 })
+  try {
+    const ctx = newHarness()
+    ctx.spec.env = { ZWRM_OPENCODE_URL: fake.url, OPENCODE_SERVER_PASSWORD: 'test' }
+    const t0 = Date.now()
+    const driver = await createOpenCodeDriver(ctx.s, ctx.spec, ctx.h)
+    // Construction itself must not resolve before the stream attaches.
+    assert.ok(Date.now() - t0 >= 380, 'createOpenCodeDriver returned before /event connected')
+    ctx.s.driver = driver
+    driver.start()
+    driver.queueMessage('go')
+    await until(ctx.events, () => fake.state.prompts.length === 1, 'the prompt')
+    // The prompt landed only after the subscription — the invariant the fix
+    // guarantees, so no message event can precede our listener.
+    assert.ok(fake.state.firstPromptAt >= fake.state.subscribedAt,
+      `prompt (${fake.state.firstPromptAt}) preceded subscription (${fake.state.subscribedAt})`)
+
+    const sid = ctx.s.sdkSessionId
+    fake.emit('message.part.updated', { part: { id: 'p1', sessionID: sid, type: 'text', text: 'hi there' } })
+    fake.emit('message.updated', { info: { sessionID: sid, role: 'assistant', cost: 0.001, tokens: { input: 5, output: 2, reasoning: 0, cache: { read: 0, write: 0 } } } })
+    fake.setSessionCost(sid, 0.001)
+    fake.emit('session.idle', { sessionID: sid })
+    await until(ctx.events, (ev) => ofType(ev, 'sdk.result').length === 1, 'the result')
+    assert.equal(ofType(ctx.events, 'sdk.result')[0].payload.result, 'hi there')
+    await driver.shutdownStop()
+    fake.assertNoViolations(assert)
+  } finally {
+    await fake.close()
+  }
+})
+
 test('completed todowrite feeds the task list; errors and malformed input do not', async () => {
   const fake = await startFakeOpenCode()
   try {

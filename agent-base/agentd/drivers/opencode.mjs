@@ -616,6 +616,26 @@ export async function createOpenCodeDriver(s, spec, h) {
   }
   s.sdkSessionId = ocSessionId
   server.startEvents()
+  // Gate construction on the /event stream being live: opencode does not
+  // replay, so a prompt sent before the subscription attaches loses the whole
+  // turn's message events (the completion can outrun a fire-and-forget
+  // subscribe on a cold VM — observed as an idle with empty result and no
+  // assistant text). A stream that never connects fails the session loudly
+  // here rather than silently dropping turns. Bounded so a wedged /event
+  // cannot hang session creation forever.
+  try {
+    await Promise.race([
+      server.subscribed,
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error('opencode /event did not connect within 15s')), 15000).unref()),
+    ])
+  } catch (err) {
+    server.close()
+    await cleanupInstr()
+    const e = new Error(`opencode event stream unavailable: ${err?.message || err}`)
+    e.status = 502
+    throw e
+  }
 
   // ---- turn dispatch --------------------------------------------------------
   function sendPrompt(text) {
