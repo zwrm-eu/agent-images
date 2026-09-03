@@ -147,6 +147,9 @@ export async function createOpenCodeDriver(s, spec, h) {
     mcpServers: spec.mcp_servers,
     interactive: !!spec.interactive,
     instructionsPath,
+    // The org's live ext/ catalog (#1446); both absent on a CP that predates it.
+    models: spec.opencode_models,
+    catalogLive: !!spec.opencode_catalog_live,
   }))
 
   // Run tools (#1392): the baked file tools long-poll the daemon's
@@ -312,7 +315,12 @@ export async function createOpenCodeDriver(s, spec, h) {
     await h.syncToDisk()
     s.pusher.emit('sdk.result', resultPayload({
       subtype,
-      resultText: subtype === 'success' ? snap.text : String(snap.error?.message || snap.error?.name || 'turn failed'),
+      // OpenCode's session.error puts the readable text in data.message (probed:
+      // {name:'UnknownError', data:{message:'Model not found: zwrm/ext/…'}}),
+      // so reading only .message/.name rendered the bare word "UnknownError" as
+      // the session preview / run summary — exactly the stale-catalog failure
+      // #1446 is about. data.message first.
+      resultText: subtype === 'success' ? snap.text : String(snap.error?.data?.message || snap.error?.message || snap.error?.name || 'turn failed'),
       costUSD,
       tokens: snap.tokens,
       numTurns: 1,

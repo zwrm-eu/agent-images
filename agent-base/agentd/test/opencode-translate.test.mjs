@@ -157,3 +157,69 @@ test('run-tool wire names never canonicalize, even under a colliding slug', () =
   // Its own genuine tools still canonicalize.
   assert.equal(canonicalOpenCodeToolName('sleep_check_alarm', ['sleep']), 'mcp__sleep__check_alarm')
 })
+
+// Live external-provider models ride the session spec (#1446) and merge into
+// the seeded zwrm provider — adding to the boot seed, never mutating it, and
+// never inventing a provider the seed lacks.
+test('session config merges live ext/ models into the seeded provider without mutating it', () => {
+  const platform = {
+    provider: { zwrm: { npm: 'x', options: { baseURL: 'http://gw', apiKey: '{env:T}' }, models: { 'qwen/qwen3': { name: 'Qwen', tool_call: true } } } },
+    disabled_providers: ['opencode'],
+  }
+  const snapshot = JSON.stringify(platform)
+  const models = { 'ext/mine/foo': { name: 'Foo', limit: { context: 9000, output: 512 }, cost: { input: 0, output: 0 }, tool_call: true } }
+  const cfg = buildSessionConfig({ platform, mcpServers: {}, interactive: true, models })
+  assert.deepEqual(Object.keys(cfg.provider.zwrm.models).sort(), ['ext/mine/foo', 'qwen/qwen3'])
+  assert.deepEqual(cfg.provider.zwrm.models['ext/mine/foo'], models['ext/mine/foo'])
+  // Provider options (baseURL, token) survive the merge: ext/ models ride them.
+  assert.deepEqual(cfg.provider.zwrm.options, platform.provider.zwrm.options)
+  // The shared platform object is untouched.
+  assert.equal(JSON.stringify(platform), snapshot)
+
+  // A stale CP sends no models: the seed passes through unchanged.
+  const same = buildSessionConfig({ platform, mcpServers: {}, interactive: true })
+  assert.deepEqual(Object.keys(same.provider.zwrm.models), ['qwen/qwen3'])
+  // Empty map: identical to absent.
+  assert.deepEqual(Object.keys(buildSessionConfig({ platform, mcpServers: {}, interactive: true, models: {} }).provider.zwrm.models), ['qwen/qwen3'])
+  // No seeded provider to merge into: nothing is invented.
+  const bare = buildSessionConfig({ platform: { disabled_providers: ['opencode'] }, mcpServers: {}, interactive: true, models })
+  assert.equal(bare.provider, undefined)
+  // Non-object models are ignored, never thrown on.
+  assert.deepEqual(Object.keys(buildSessionConfig({ platform, mcpServers: {}, interactive: true, models: ['ext/x/y'] }).provider.zwrm.models), ['qwen/qwen3'])
+  assert.deepEqual(Object.keys(buildSessionConfig({ platform, mcpServers: {}, interactive: true, models: 'ext/x/y' }).provider.zwrm.models), ['qwen/qwen3'])
+  // Every other key of the seeded provider (npm, name, options) survives untouched.
+  const { models: _m, ...restSeeded } = platform.provider.zwrm
+  const { models: _c, ...restMerged } = cfg.provider.zwrm
+  assert.deepEqual(restMerged, restSeeded)
+  // Live wins when the same ext/ key is in the seed and the live set (name/limits refresh).
+  const seededExt = { provider: { zwrm: { npm: 'x', models: { 'ext/mine/foo': { name: 'Stale', tool_call: true } } } } }
+  assert.equal(buildSessionConfig({ platform: seededExt, mcpServers: {}, interactive: true, models }).provider.zwrm.models['ext/mine/foo'].name, 'Foo')
+  // A seeded provider with no models key still merges.
+  assert.deepEqual(Object.keys(buildSessionConfig({ platform: { provider: { zwrm: { npm: 'x' } } }, mcpServers: {}, interactive: true, models }).provider.zwrm.models), ['ext/mine/foo'])
+})
+
+// The live flag makes the spec's catalog AUTHORITATIVE (#1446): seeded ext/
+// entries are replaced, so a provider removed after boot disappears and an
+// org that removed its last provider gets an empty external set — while the
+// platform catalog is untouched. Without the flag the seed is kept (add-only).
+test('session config: a live catalog replaces the seeded ext/ entries; without the flag it only adds', () => {
+  const platform = {
+    provider: { zwrm: { npm: 'x', options: { baseURL: 'http://gw', apiKey: '{env:T}' },
+      models: { 'qwen/qwen3': { name: 'Qwen', tool_call: true }, 'ext/old/gone': { name: 'Gone', tool_call: true } } } },
+  }
+  const snapshot = JSON.stringify(platform)
+  // Live + empty: the stale seeded ext/ entry is dropped, the catalog stays.
+  const cleared = buildSessionConfig({ platform, mcpServers: {}, interactive: true, models: {}, catalogLive: true })
+  assert.deepEqual(Object.keys(cleared.provider.zwrm.models), ['qwen/qwen3'])
+  // Live + models: replaced, not merged with the stale entry.
+  const replaced = buildSessionConfig({ platform, mcpServers: {}, interactive: true, models: { 'ext/new/one': { name: 'One', tool_call: true } }, catalogLive: true })
+  assert.deepEqual(Object.keys(replaced.provider.zwrm.models).sort(), ['ext/new/one', 'qwen/qwen3'])
+  // No flag (listing failed, or an older CP): the seed is kept and models only add.
+  const kept = buildSessionConfig({ platform, mcpServers: {}, interactive: true, models: { 'ext/new/one': { name: 'One', tool_call: true } } })
+  assert.deepEqual(Object.keys(kept.provider.zwrm.models).sort(), ['ext/new/one', 'ext/old/gone', 'qwen/qwen3'])
+  // Live but no seeded provider: still nothing invented.
+  assert.equal(buildSessionConfig({ platform: {}, mcpServers: {}, interactive: true, models: {}, catalogLive: true }).provider, undefined)
+  // The shared platform object is untouched throughout.
+  assert.equal(JSON.stringify(platform), snapshot)
+})
+

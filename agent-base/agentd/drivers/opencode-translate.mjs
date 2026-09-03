@@ -265,8 +265,37 @@ export const GATED_PERMISSIONS = { bash: 'ask', edit: 'ask', webfetch: 'ask', we
 // mcp-bridge picks up BY REFERENCE — but this config is serialized into the
 // child's environment at spawn, so a refresh does not reach a LIVE opencode
 // child; its MCP bearers age until the next session.
-export function buildSessionConfig({ platform, mcpServers, interactive, instructionsPath }) {
+export function buildSessionConfig({ platform, mcpServers, interactive, instructionsPath, models, catalogLive }) {
   const cfg = { ...(platform && typeof platform === 'object' ? platform : {}) }
+
+  // Live external-provider models (#1446). The boot seed is written once per
+  // boot and a snapshot wake never re-runs it, so a provider registered after
+  // the VM booted is unknown to opencode until the next boot — and one
+  // REMOVED after boot lingers. The CP renders the org's CURRENT ext/ catalog
+  // into the spec per session (in the seed's own model-entry shape) and, when
+  // its listing succeeded, marks it live (authoritative, even when empty): the
+  // seeded ext/ entries are then dropped and the live set takes their place.
+  // Without the flag (a listing failure, or a CP predating it) the seed is
+  // kept and any sent models only add — never strip on data the CP could not
+  // read. All on a fresh copy, never mutating the shared platform object; ext/
+  // keys can't collide with catalog slugs (the namespace is reserved). Skipped
+  // when the seed has no provider to merge into: an entry without the
+  // provider's baseURL/token would be unreachable anyway.
+  const live = models && typeof models === 'object' && !Array.isArray(models) ? models : {}
+  if (catalogLive || Object.keys(live).length > 0) {
+    const providers = cfg.provider && typeof cfg.provider === 'object' ? cfg.provider : null
+    const seeded = providers?.[OPENCODE_PROVIDER_ID]
+    if (seeded && typeof seeded === 'object') {
+      const seededModels = seeded.models && typeof seeded.models === 'object' ? seeded.models : {}
+      const base = catalogLive
+        ? Object.fromEntries(Object.entries(seededModels).filter(([slug]) => !slug.startsWith('ext/')))
+        : { ...seededModels }
+      cfg.provider = {
+        ...providers,
+        [OPENCODE_PROVIDER_ID]: { ...seeded, models: { ...base, ...live } },
+      }
+    }
+  }
 
   const mcp = {}
   const permission = { ...GATED_PERMISSIONS }
