@@ -4,14 +4,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { RUN_TOOL_NAMES, handlePlatformTool } from '../drivers/opencode-run-tools.mjs'
-
-const deps = (parks) => ({
-  MAX_SLEEP_SECONDS: 21600,
-  parkTurn: async (s, kind, payload, deadline, resultText) => {
-    parks.push({ kind, payload, deadline })
-    return { content: [{ type: 'text', text: resultText('') }] }
-  },
-})
+import { fakeHelpers as deps } from './fake-park.mjs'
 
 test('the tool names double as the baked filenames', () => {
   assert.deepEqual(RUN_TOOL_NAMES, ['sleep', 'sleep_until'])
