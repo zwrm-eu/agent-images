@@ -13,6 +13,7 @@ import { applyTaskMessage, countBackgroundTasks } from './claude-tasks.mjs'
 import { createTodoTracker } from './todos.mjs'
 import { permissionDecisionPayload } from '../event-payloads.mjs'
 import { commandPrompt, normalizeCommandList, resolveCommand } from '../session-control.mjs'
+import { SLEEP_DESCRIPTION, SLEEP_UNTIL_DESCRIPTION, runSleep, runSleepUntil, mapOutcome } from './run-tools.mjs'
 
 const CLOSED = Symbol('closed')
 
@@ -174,36 +175,29 @@ function buildPlatformServer(s, h) {
     tools: [
       tool(
         'sleep',
-        `Pause this run for a number of seconds (max ${h.MAX_SLEEP_SECONDS} = 6 hours) and resume exactly here — the VM is suspended while sleeping, so waiting costs nothing. Use this for short waits mid-task (a build farm, a rate limit, a colleague's quick reply). For longer or open-ended waits, do NOT sleep: end your final turn with a precise handoff instead — the conversation can be continued later with full context.`,
+        SLEEP_DESCRIPTION(h.MAX_SLEEP_SECONDS),
         { seconds: z.number().int().min(1).max(h.MAX_SLEEP_SECONDS).describe('How long to sleep, in seconds') },
-        async ({ seconds }) => {
-          if (s.ending) return h.textResult('session is ending; not sleeping', true)
-          const deadline = new Date(Date.now() + seconds * 1000).toISOString()
-          return h.parkTurn(s, 'timer', { seconds }, deadline,
-            (msg) => `Woke up: slept ${seconds}s (until ${deadline}).${msg ? ` ${msg}` : ''} Continue the task.`)
-        },
+        ({ seconds }) => claudeOutcome(h, runSleep(s, h, { seconds })),
       ),
       tool(
         'sleep_until',
-        `Pause this run until an ISO-8601 UTC timestamp (at most ${h.MAX_SLEEP_SECONDS} seconds = 6 hours from now) and resume exactly here — the VM is suspended while sleeping. For longer or open-ended waits, end your final turn with a precise handoff instead.`,
+        SLEEP_UNTIL_DESCRIPTION(h.MAX_SLEEP_SECONDS),
         { timestamp: z.iso.datetime({ offset: true }).describe('ISO-8601 timestamp with a timezone, e.g. 2026-07-10T18:00:00Z') },
-        async ({ timestamp }) => {
-          if (s.ending) return h.textResult('session is ending; not sleeping', true)
-          const t = Date.parse(timestamp)
-          if (!Number.isFinite(t)) {
-            return h.textResult('invalid timestamp; use ISO-8601 UTC like 2026-07-10T18:00:00Z', true)
-          }
-          const ms = t - Date.now()
-          if (ms <= 0) return h.textResult('that time has already passed; continuing without sleeping')
-          if (ms > h.MAX_SLEEP_SECONDS * 1000) {
-            return h.textResult(`sleep_until is capped at ${h.MAX_SLEEP_SECONDS} seconds from now; for longer waits, end your final turn with a handoff so the run can be continued later`, true)
-          }
-          const deadline = new Date(t).toISOString()
-          return h.parkTurn(s, 'timer', { timestamp }, deadline,
-            (msg) => `Woke up at the requested time (${deadline}).${msg ? ` ${msg}` : ''} Continue the task.`)
-        },
+        ({ timestamp }) => claudeOutcome(h, runSleepUntil(s, h, { timestamp })),
       ),
     ],
+  })
+}
+
+// claudeOutcome maps a run-tools outcome (#1493) onto the MCP tool result:
+// a rejection is an error result, text is a plain result, and a park
+// resolution is returned as-is. The Zod schema above rejects bad shapes
+// before dispatch; run-tools re-checks so every harness agrees.
+async function claudeOutcome(h, pending) {
+  return mapOutcome(await pending, {
+    error: (o) => h.textResult(o.error, true),
+    text: (text) => h.textResult(text),
+    park: (result) => result,
   })
 }
 

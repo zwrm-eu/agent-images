@@ -1,3 +1,5 @@
+import { SLEEP_DESCRIPTION, SLEEP_UNTIL_DESCRIPTION, sleepInputSchema, sleepUntilInputSchema, runSleep, runSleepUntil, mapOutcome } from './run-tools.mjs'
+
 // Codex dynamic-tool layer (#1090): renders the session's tools as codex
 // `DynamicToolSpec`s and dispatches the `item/tool/call` server requests they
 // produce.
@@ -109,74 +111,40 @@ export function connectorFingerprint(mcpServers) {
 
 // buildCodexRunTools renders the platform run tools (#803) as dynamic tools:
 // the same semantics and model-facing text as the claude driver's in-process
-// `platform` MCP server and pi's native ones. Unattended runs only — an
-// interactive session has a human on the stream.
+// `platform` MCP server and pi's native ones, dispatched through the shared
+// run-tools module (#1493) so validation is identical. Unattended runs only —
+// an interactive session has a human on the stream.
 export function buildCodexRunTools(s, h) {
   return [
     {
       spec: {
         type: 'function',
         name: 'zwrm__platform__sleep',
-        description: `Pause this run for a number of seconds (max ${h.MAX_SLEEP_SECONDS} = 6 hours) and resume exactly here — the VM is suspended while sleeping, so waiting costs nothing. Use this for short waits mid-task (a build farm, a rate limit, a colleague's quick reply). For longer or open-ended waits, do NOT sleep: end your final turn with a precise handoff instead — the conversation can be continued later with full context.`,
-        inputSchema: {
-          type: 'object',
-          properties: {
-            seconds: { type: 'integer', minimum: 1, maximum: h.MAX_SLEEP_SECONDS, description: 'How long to sleep, in seconds' },
-          },
-          required: ['seconds'],
-        },
+        description: SLEEP_DESCRIPTION(h.MAX_SLEEP_SECONDS),
+        inputSchema: sleepInputSchema(h.MAX_SLEEP_SECONDS),
       },
-      async run(args) {
-        if (s.ending) throw new Error('session is ending; not sleeping')
-        const seconds = Number(args?.seconds)
-        if (!Number.isFinite(seconds) || seconds < 1) throw new Error('seconds must be a positive integer')
-        const deadline = new Date(Date.now() + seconds * 1000).toISOString()
-        const r = await h.parkTurn(s, 'timer', { seconds }, deadline,
-          (msg) => `Woke up: slept ${seconds}s (until ${deadline}).${msg ? ` ${msg}` : ''} Continue the task.`)
-        return parkToCodex(r)
-      },
+      run: (args) => codexOutcome(runSleep(s, h, args)),
     },
     {
       spec: {
         type: 'function',
         name: 'zwrm__platform__sleep_until',
-        description: `Pause this run until an ISO-8601 UTC timestamp (at most ${h.MAX_SLEEP_SECONDS} seconds = 6 hours from now) and resume exactly here — the VM is suspended while sleeping. For longer or open-ended waits, end your final turn with a precise handoff instead.`,
-        inputSchema: {
-          type: 'object',
-          properties: {
-            timestamp: { type: 'string', description: 'ISO-8601 timestamp with a timezone, e.g. 2026-07-10T18:00:00Z' },
-          },
-          required: ['timestamp'],
-        },
+        description: SLEEP_UNTIL_DESCRIPTION(h.MAX_SLEEP_SECONDS),
+        inputSchema: sleepUntilInputSchema(),
       },
-      // Semantics match pi-run-tools.mjs and the claude platform server
-      // exactly — argument name, the already-passed case, the cap message, and
-      // the park payload — so the same agent behaviour produces the same park
-      // row and the same model-facing contract on every harness.
-      async run(args) {
-        if (s.ending) throw new Error('session is ending; not sleeping')
-        const timestamp = args?.timestamp
-        const t = Date.parse(timestamp)
-        if (!Number.isFinite(t)) {
-          throw new Error('invalid timestamp; use ISO-8601 UTC like 2026-07-10T18:00:00Z')
-        }
-        const ms = t - Date.now()
-        if (ms <= 0) {
-          return toolCallResponse('that time has already passed; continuing without sleeping')
-        }
-        if (ms > h.MAX_SLEEP_SECONDS * 1000) {
-          throw new Error(`sleep_until is capped at ${h.MAX_SLEEP_SECONDS} seconds from now; for longer waits, end your final turn with a handoff so the run can be continued later`)
-        }
-        const deadline = new Date(t).toISOString()
-        const r = await h.parkTurn(s, 'timer', { timestamp }, deadline,
-          (msg) => `Woke up at the requested time (${deadline}).${msg ? ` ${msg}` : ''} Continue the task.`)
-        return parkToCodex(r)
-      },
+      run: (args) => codexOutcome(runSleepUntil(s, h, args)),
     },
   ]
 }
 
-function parkToCodex(r) {
-  const text = (r?.content || []).map((c) => (c?.type === 'text' ? c.text : '')).filter(Boolean).join('\n')
-  return toolCallResponse(text)
+// codexOutcome maps a run-tools outcome onto codex's envelope: a rejection
+// is thrown (codex reports a failed dynamic tool call), text becomes a
+// successful tool response, and a park result goes through the same MCP
+// result converter every other tool uses.
+async function codexOutcome(pending) {
+  return mapOutcome(await pending, {
+    error: (o) => { throw new Error(o.error) },
+    text: (text) => toolCallResponse(text),
+    park: (result) => mcpResultToCodex(result),
+  })
 }

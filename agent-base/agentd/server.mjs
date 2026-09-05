@@ -32,6 +32,7 @@ import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { DRIVERS, HARNESSES, HARNESS_CAPS, unsupportedPermissionMode } from './drivers/registry.mjs'
 import { handlePlatformTool } from './drivers/opencode-run-tools.mjs'
+import { parkDeadlineError } from './drivers/run-tools.mjs'
 import { TOOL_POLICIES } from './drivers/tool-policy.mjs'
 import { countBackgroundTasks } from './drivers/claude-tasks.mjs'
 import { seedState, waitSeedClear, SEED_WAIT_MAX_MS, SEED_FAILED_MESSAGE } from './seedgate.mjs'
@@ -397,6 +398,10 @@ function resumeIfUnblocked(s) {
 // result the blocked call returns on wake.
 
 function parkTurn(s, kind, payload, deadline, resultText) {
+  // The run tools validate before parking; this is the mechanism's own
+  // guard (#1493) so no other caller can park past the cap or in the past.
+  const bad = parkDeadlineError(deadline, MAX_SLEEP_SECONDS)
+  if (bad) throw new Error(bad)
   const parkId = randomUUID()
   s.pusher.emit('park.request', {
     park_id: parkId,
