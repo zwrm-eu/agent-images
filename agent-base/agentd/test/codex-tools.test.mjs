@@ -15,7 +15,7 @@ import {
 } from '../drivers/codex-tools.mjs'
 
 test('bridged tools avoid the reserved mcp__ prefix on the wire', () => {
-  // Verified against the pinned 0.145.0: declaring a dynamic tool named
+  // Verified against the pinned 0.153.4: declaring a dynamic tool named
   // mcp__github__create_issue is rejected with "dynamic tool name is
   // reserved", and so is a namespace of that shape. Codex keeps mcp__ for its
   // own MCP client, so the platform's canonical name cannot go on this wire.

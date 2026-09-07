@@ -266,10 +266,17 @@ export function classifyCodexError(err) {
     (typeof err?.code === 'string' ? err.code : '') ||
     codexErrorCode(err?.data)
 
+  if (/model.{0,80}(not found|does not exist|not available|access)|do not have access.{0,80}model/i.test(raw)) {
+    return {
+      cause: 'error',
+      message: 'The selected OpenAI model is unavailable to this account — check model access or choose another Codex model.',
+      detail: raw,
+    }
+  }
   if (code === 'unauthorized' || /401|unauthorized|invalid.*api.*key|authentication/i.test(raw)) {
     return {
       cause: 'auth',
-      message: 'OpenAI API authentication failed — the model key was rejected. Check the agent\'s OPENAI_API_KEY secret.',
+      message: 'OpenAI authentication failed — check the agent\'s OPENAI_API_KEY or OPENAI_CODEX_AUTH secret.',
       detail: raw,
     }
   }
@@ -307,15 +314,16 @@ export function classifyCodexError(err) {
 // mapEffort passes a platform effort level through to codex.
 //
 // It does NOT narrow per model, and must not try to: which levels a model
-// accepts is catalog knowledge (gpt-5.6-* take `max`, gpt-5.5 and gpt-5.2 stop
-// at `xhigh`), and the catalog lives in the control plane, which resolves the
-// model and clamps the effort to it before either ever reaches this daemon
+// accepts is catalog knowledge (Astra and gpt-5.6-* take `max`; gpt-5.5,
+// gpt-5.4-mini and gpt-5.3-codex-spark stop at `xhigh`), and the catalog lives
+// in the control plane, which resolves the model and clamps the effort to it
+// before either ever reaches this daemon
 // (state.ClampCodexEffort, #1089). A second, model-blind clamp here could only
 // disagree with the one that was persisted.
 //
 // The set below is therefore a sanity filter, not a policy: an unrecognized
 // level is dropped rather than forwarded, because the app-server validates
-// NOTHING locally — probed against the pinned 0.145.0, a turn/start carrying
+// NOTHING locally — probed against the pinned 0.153.4, a turn/start carrying
 // the literal string 'bogus-effort' is accepted and opens a turn. Dropping
 // falls back to the model's own default, which is the safe end of that trade.
 const CODEX_EFFORTS = new Set(['low', 'medium', 'high', 'xhigh', 'max'])
@@ -356,7 +364,7 @@ export function sandboxConfigFor(mode) {
 //
 // The shape is version-sensitive (0.111 carried a `readOnlyAccess` field that
 // 0.145 dropped), so it tracks the pinned @openai/codex in the Dockerfile;
-// re-verify it when moving that pin.
+// re-verified against 0.153.4, and must be re-verified on the next pin move.
 export function sandboxPolicyFor(mode, cwd) {
   if (mode === 'bypassPermissions') return { type: 'dangerFullAccess' }
   return {

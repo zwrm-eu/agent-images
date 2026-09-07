@@ -165,7 +165,7 @@ export async function createCodexDriver(s, spec, h) {
     // harness is broken" and sends them hunting in the wrong place.
     //
     // The checks mirror what codex itself enforces when it reads the file,
-    // measured against the pinned 0.145.0 with `codex login status`:
+    // measured against the pinned 0.153.4 with `codex login status`:
     //   - `tokens` must be an object; a bare token string is rejected with
     //     "invalid type: string, expected struct TokenData";
     //   - `id_token` is MANDATORY ("missing field `id_token`") and is parsed

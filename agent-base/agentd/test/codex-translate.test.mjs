@@ -188,6 +188,7 @@ test('classifyCodexError keys off the typed error before string matching', () =>
   const auth = classifyCodexError(Object.assign(new Error('nope'), { data: 'unauthorized' }))
   assert.equal(auth.cause, 'auth')
   assert.match(auth.message, /OPENAI_API_KEY/)
+  assert.match(auth.message, /OPENAI_CODEX_AUTH/)
 
   const limited = classifyCodexError(Object.assign(new Error('nope'), { data: 'usageLimitExceeded' }))
   assert.equal(limited.cause, 'rate_limited')
@@ -203,14 +204,17 @@ test('classifyCodexError keys off the typed error before string matching', () =>
 test('classifyCodexError still falls back to string matching', () => {
   assert.equal(classifyCodexError(new Error('HTTP 429 rate limit')).cause, 'rate_limited')
   assert.equal(classifyCodexError(new Error('401 Unauthorized')).cause, 'auth')
+  const unavailable = classifyCodexError(new Error('The model gpt-6-astra does not exist or you do not have access to it'))
+  assert.equal(unavailable.cause, 'error')
+  assert.match(unavailable.message, /model is unavailable to this account/)
   assert.equal(classifyCodexError(new Error('something else')).cause, 'error')
 })
 
 test('effort passes through the platform ladder without a model-blind clamp', () => {
-  // 'max' is a REAL codex level on the gpt-5.6 family. Degrading it here (as
-  // this driver did before the catalog existed) would downgrade every 5.6
-  // session that asked for it, and would contradict the effort the control
-  // plane already persisted on the run. Narrowing is the CP's job, because
+  // 'max' is a REAL codex level on Astra and the gpt-5.6 family. Degrading it
+  // here (as this driver did before the catalog existed) would downgrade every
+  // Astra/5.6 session that asked for it, and would contradict the effort the
+  // control plane already persisted on the run. Narrowing is the CP's job, because
   // only the CP knows which model was resolved.
   for (const e of ['low', 'medium', 'high', 'xhigh', 'max']) {
     assert.equal(mapEffort(e), e)
@@ -219,7 +223,7 @@ test('effort passes through the platform ladder without a model-blind clamp', ()
   // nothing locally, so a typo would otherwise reach the API unchecked.
   assert.equal(mapEffort(''), undefined)
   assert.equal(mapEffort('nonsense'), undefined)
-  // 'minimal' was a codex level once; no model in the pinned 0.145 lineup
+  // 'minimal' was a codex level once; no model in the pinned 0.153 lineup
   // offers it, so sending it would silently fall back to the model default.
   assert.equal(mapEffort('minimal'), undefined)
   // 'ultra' exists in codex but is not on the platform ladder, so the daemon
