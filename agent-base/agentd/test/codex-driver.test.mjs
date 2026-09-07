@@ -759,14 +759,14 @@ test('the model and effort the CP resolved reach codex verbatim', async () => {
   // effort to what THAT model supports (state.ClampCodexEffort, #1089). The
   // driver must forward both untouched: a second clamp here would be
   // model-blind and could only disagree with the value already persisted on
-  // the run — and 'max' is a real level on the gpt-5.6 family.
-  const ctx = await build(newHarness({ spec: { effort: 'max', model: 'gpt-5.6-sol' } }))
+  // the run — and 'max' is a real level on Astra.
+  const ctx = await build(newHarness({ spec: { effort: 'max', model: 'gpt-6-astra' } }))
   ctx.driver.start()
   ctx.driver.queueMessage('go')
   await until(ctx.events, () => sentCalls(ctx.tracePath, 'turn/start').length > 0, 'turn/start')
   const p = sentCalls(ctx.tracePath, 'turn/start')[0]
   assert.equal(p.effort, 'max')
-  assert.equal(p.model, 'gpt-5.6-sol')
+  assert.equal(p.model, 'gpt-6-astra')
   await ctx.driver.shutdownStop()
 })
 

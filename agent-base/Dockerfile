@@ -89,7 +89,7 @@ RUN (apt-get update || true) && apt-get install -y --no-install-recommends bubbl
 # The driver adds no npm dependency of its own: this binary IS the SDK, so this
 # pin is the whole lockstep. Bump it deliberately, and re-run
 # `codex app-server generate-json-schema` to refresh the driver's fixture.
-RUN npm install -g @openai/codex@0.145.0 && npm cache clean --force
+RUN npm install -g @openai/codex@0.153.4 && npm cache clean --force
 
 # -- Pi coding agent (PINNED via agentd — #1062/#1063/#1347) --------------------
 # pi ships ONLY inside agentd's node_modules (agentd/package.json pins it);

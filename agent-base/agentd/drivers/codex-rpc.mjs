@@ -2,7 +2,7 @@
 //
 // The app-server speaks NEWLINE-DELIMITED JSON over stdio — one JSON object
 // per line, verified by handshake against codex-cli 0.111.0 AND the pinned
-// 0.145.0. It is NOT the Content-Length framing LSP uses, and its responses
+// 0.153.4. It is NOT the Content-Length framing LSP uses, and its responses
 // omit the `jsonrpc` field entirely, so nothing here may require it.
 //
 // Three message shapes share the stream, disambiguated by which fields are
