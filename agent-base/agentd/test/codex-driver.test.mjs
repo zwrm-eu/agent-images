@@ -525,9 +525,20 @@ test('an unattended run refuses the AskUserQuestion twin instead of fabricating 
 })
 
 test('an interactive Codex user-input request carries its question kind and ID-keyed answer', async () => {
+  await questionRoundTrip('default')
+})
+
+test('bypassPermissions does not auto-answer a Codex question: it still parks on the platform (#1555)', async () => {
+  // Before #1555 the gate short-circuited on bypass and the handler then
+  // threw for want of answers — every question failed in the dashboard's
+  // Bypass mode.
+  await questionRoundTrip('bypassPermissions')
+})
+
+async function questionRoundTrip(permissionMode) {
   const ctx = await build(newHarness({
     scenario: 'user-input',
-    spec: { interactive: true, permission_mode: 'default' },
+    spec: { interactive: true, permission_mode: permissionMode },
   }))
   ctx.driver.start()
   ctx.driver.queueMessage('go')
@@ -548,7 +559,7 @@ test('an interactive Codex user-input request carries its question kind and ID-k
   await until(ctx.events, () => sentCalls(ctx.tracePath, '__userInputReply').length > 0, 'user-input reply')
   assert.deepEqual(sentCalls(ctx.tracePath, '__userInputReply')[0], { answers: { q1: 'production' } })
   await ctx.driver.shutdownStop()
-})
+}
 
 test('a failed turn still emits a result — it is the run-completion gate', async () => {
   for (const scenario of ['turn-failed', 'error-notification']) {

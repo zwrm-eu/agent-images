@@ -361,9 +361,13 @@ export async function createCodexDriver(s, spec, h) {
     // pending prompt would wedge the wind-down forever, so deny immediately
     // (no permission.request — nobody is left to answer it).
     if (s.ending) return { allow: false, message: 'session ended' }
-    if (mode === 'bypassPermissions') return { allow: true }
-    if (spec.auto_approve && !h.isEscalatedTool(toolName, spec.escalate_servers)) {
-      return { allow: true }
+    // A question (#1555) is not a tool approval: bypass and run auto-approve
+    // must not answer it — an allow without answers is a refusal below.
+    if (kind !== 'question') {
+      if (mode === 'bypassPermissions') return { allow: true }
+      if (spec.auto_approve && !h.isEscalatedTool(toolName, spec.escalate_servers)) {
+        return { allow: true }
+      }
     }
     const requestId = randomUUID()
     s.pusher.emit('permission.request', {

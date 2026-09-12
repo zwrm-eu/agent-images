@@ -10,6 +10,8 @@ import {
   initPayload,
   isReservedMCPServer,
   partialPayload,
+  questionAnswersFor,
+  questionInputFor,
   resultPayload,
   textPayload,
   toolResultPayload,
@@ -129,7 +131,9 @@ test('session config: platform base + native MCP entries + gate table', () => {
   // command endpoint has no per-call tools field. task stays ENABLED — the
   // #1388 hang was pinned to a dead-upstream MCP call, not the subagent, and
   // the mcp_timeout below is the fix.
-  assert.deepEqual(cfg.tools, { question: false })
+  // Interactive sessions get the question tool (#1555): a human is on the
+  // stream, and the driver round-trips question.asked through the platform.
+  assert.deepEqual(cfg.tools, { question: true })
   // A dead connector upstream must not wedge the session (#1388): every MCP
   // call is bounded so it fails with a timeout error instead of hanging.
   assert.equal(cfg.experimental.mcp_timeout, 120000)
@@ -145,6 +149,8 @@ test('session config: platform base + native MCP entries + gate table', () => {
 test('session config for runs allows the platform run tools', () => {
   const cfg = buildSessionConfig({ platform: null, mcpServers: {}, interactive: false })
   assert.equal(cfg.permission.sleep, 'allow')
+  // Runs have nobody to answer a question: the tool stays off (#1555).
+  assert.equal(cfg.tools.question, false)
   assert.equal(cfg.permission.sleep_until, 'allow')
   assert.equal(cfg.mcp, undefined)
   assert.equal(cfg.instructions, undefined)
@@ -223,3 +229,42 @@ test('session config: a live catalog replaces the seeded ext/ entries; without t
   assert.equal(JSON.stringify(platform), snapshot)
 })
 
+
+test('questionInputFor assigns positional ids and the platform question shape (#1555)', () => {
+  const input = questionInputFor({
+    id: 'que_1',
+    questions: [
+      { question: 'A?', header: 'H', options: [{ label: 'x', description: 'dx' }, { label: 'y', description: '' }] },
+      { question: 'B?', header: '', multiple: true, custom: false, options: [] },
+      { question: 'C?', header: 'H3', options: [{ nope: true }, 'str', { label: '' }, { label: 'z' }] },
+    ],
+  })
+  assert.deepEqual(input, {
+    questions: [
+      { id: 'q1', question: 'A?', header: 'H', options: [{ label: 'x', description: 'dx' }, { label: 'y', description: '' }], multiSelect: false },
+      { id: 'q2', question: 'B?', header: '', options: [], multiSelect: true },
+      { id: 'q3', question: 'C?', header: 'H3', options: [{ label: 'z' }], multiSelect: false },
+    ],
+  })
+  assert.deepEqual(questionInputFor({}), { questions: [] })
+})
+
+test('questionAnswersFor maps id- or text-keyed answers onto ordered label arrays (#1555)', () => {
+  const opt = (...labels) => labels.map((label) => ({ label, description: '' }))
+  const qs = questionInputFor({ questions: [
+    { question: 'A?', header: '', options: opt('x', 'y') },
+    { question: 'B?', header: '', options: opt('y', 'z'), multiple: true },
+    { question: 'C?', header: '', options: opt('a, b', 'c') },
+  ] }).questions
+  assert.deepEqual(questionAnswersFor(qs, { q1: 'x', 'B?': ['y', 'z'], q3: 'free text' }), [['x'], ['y', 'z'], ['free text']])
+  // The dashboard joins a multi-select with ", ": unjoin only when every
+  // piece is an option label; a label that itself contains ", " stays whole.
+  assert.deepEqual(questionAnswersFor(qs, { q2: 'y, z', q3: 'a, b' }), [[], ['y', 'z'], ['a, b']])
+  assert.deepEqual(questionAnswersFor(qs, { q2: 'y, something else' }), [[], ['y, something else'], []])
+  // Unanswered → [] (OpenCode renders "Unanswered"); empty strings drop.
+  assert.deepEqual(questionAnswersFor(qs, { q1: '', q3: ['', 'c', 7] }), [[], [], ['c']])
+  // No answers object at all is not an answer: the caller rejects.
+  assert.equal(questionAnswersFor(qs, undefined), null)
+  assert.equal(questionAnswersFor(qs, 'x'), null)
+  assert.equal(questionAnswersFor(qs, ['x']), null)
+})

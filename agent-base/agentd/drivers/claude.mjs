@@ -250,6 +250,10 @@ export function createClaudeDriver(s, spec, h) {
       tool_name: toolName,
       input,
       tool_use_id: opts.toolUseID,
+      // kind: question is the harness-neutral discriminator (#1555): codex
+      // (request_user_input) and opencode (question) carry it too, so API
+      // clients need not string-match harness tool names.
+      ...(toolName === 'AskUserQuestion' ? { kind: 'question' } : {}),
       ...(typeof opts.decisionReason === 'string' ? { decision_reason: opts.decisionReason } : {}),
     })
     // Parked on a human decision: for the control plane the session is now

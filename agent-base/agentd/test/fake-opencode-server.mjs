@@ -8,7 +8,11 @@
 //
 // Wire shapes mirror the probed 1.18.25 binary: `permission.asked` events
 // (not the docs' permission.updated), POST /session/:id/permissions/:pid
-// {response}, prompt_async 204, session-cumulative cost on GET /session/:id.
+// {response}, prompt_async 204, session-cumulative cost on GET /session/:id,
+// and the question service (#1555): `question.asked` events answered by POST
+// /question/:qid/reply {answers: string[][]} or POST /question/:qid/reject
+// (packages/opencode/src/server/routes/instance/httpapi/groups/question.ts
+// at the pinned tag).
 import { createServer } from 'node:http'
 
 export async function startFakeOpenCode({ password = 'test', expectProvider = 'zwrm', commands, eventDelayMS = 0 } = {}) {
@@ -19,6 +23,8 @@ export async function startFakeOpenCode({ password = 'test', expectProvider = 'z
     replies: [], // {permissionID, response}
     aborts: 0,
     pendingAsks: new Set(), // permission ids the fake has asked and not seen replied
+    pendingQuestions: new Set(), // question ids the fake has asked and not seen answered
+    questionReplies: [], // {questionID, answers} | {questionID, rejected: true}
     violations: [],
     nextSession: 1,
     // GET /command serves the probed raw shape: name/description/hints
@@ -168,6 +174,43 @@ export async function startFakeOpenCode({ password = 'test', expectProvider = 'z
         return
       }
     }
+    if (req.method === 'POST' && parts[0] === 'question' && parts.length === 3) {
+      const questionID = parts[1]
+      if (!state.pendingQuestions.has(questionID)) {
+        res.writeHead(404, { 'content-type': 'application/json' }).end(JSON.stringify({ name: 'QuestionNotFoundError', data: { requestID: questionID } }))
+        return
+      }
+      if (parts[2] === 'reject') {
+        state.pendingQuestions.delete(questionID)
+        state.questionReplies.push({ questionID, rejected: true })
+        res.writeHead(200, { 'content-type': 'application/json' }).end('true')
+        return
+      }
+      if (parts[2] === 'reply') {
+        let body
+        try {
+          body = JSON.parse(await readBody(req))
+        } catch {
+          violate('question reply body is not JSON')
+          res.writeHead(400).end()
+          return
+        }
+        // The schema: answers is an array with one string array per
+        // question, in question order. Anything else is a 400 on the real
+        // server (Effect schema decode), so it is a violation here.
+        const ok = Array.isArray(body?.answers) &&
+          body.answers.every((a) => Array.isArray(a) && a.every((x) => typeof x === 'string'))
+        if (!ok) {
+          violate(`question reply answers malformed: ${JSON.stringify(body)}`)
+          res.writeHead(400).end()
+          return
+        }
+        state.pendingQuestions.delete(questionID)
+        state.questionReplies.push({ questionID, answers: body.answers })
+        res.writeHead(200, { 'content-type': 'application/json' }).end('true')
+        return
+      }
+    }
     violate(`unexpected request ${req.method} ${url.pathname}`)
     res.writeHead(404).end()
   })
@@ -181,6 +224,7 @@ export async function startFakeOpenCode({ password = 'test', expectProvider = 'z
     // emit pushes one SSE event to every connected client.
     emit(type, properties) {
       if (type === 'permission.asked' && properties?.id) state.pendingAsks.add(properties.id)
+      if (type === 'question.asked' && properties?.id) state.pendingQuestions.add(properties.id)
       const line = `data: ${JSON.stringify({ type, properties })}\n\n`
       for (const c of sseClients) c.write(line)
     },
