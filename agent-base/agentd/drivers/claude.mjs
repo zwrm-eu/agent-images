@@ -11,6 +11,7 @@ import { query, tool, createSdkMcpServer } from '@anthropic-ai/claude-agent-sdk'
 import { z } from 'zod'
 import { applyTaskMessage, countBackgroundTasks } from './claude-tasks.mjs'
 import { createTodoTracker } from './todos.mjs'
+import { claudeQuestionDecision, claudeQuestionInput } from './questions.mjs'
 import { permissionDecisionPayload } from '../event-payloads.mjs'
 import { commandPrompt, normalizeCommandList, resolveCommand } from '../session-control.mjs'
 import { SLEEP_DESCRIPTION, SLEEP_UNTIL_DESCRIPTION, runSleep, runSleepUntil, mapOutcome } from './run-tools.mjs'
@@ -245,15 +246,18 @@ export function createClaudeDriver(s, spec, h) {
       return { behavior: 'allow' }
     }
     const requestId = randomUUID()
+    // A question rides the permission channel in the one platform shape
+    // (#1559): positional ids on the way out, answers keyed by them on the
+    // way back and re-keyed by question text for the SDK. kind: question is
+    // the harness-neutral discriminator (#1555).
+    const isQuestion = toolName === 'AskUserQuestion'
+    const platformInput = isQuestion ? claudeQuestionInput(input) : input
     s.pusher.emit('permission.request', {
       request_id: requestId,
       tool_name: toolName,
-      input,
+      input: platformInput,
       tool_use_id: opts.toolUseID,
-      // kind: question is the harness-neutral discriminator (#1555): codex
-      // (request_user_input) and opencode (question) carry it too, so API
-      // clients need not string-match harness tool names.
-      ...(toolName === 'AskUserQuestion' ? { kind: 'question' } : {}),
+      ...(isQuestion ? { kind: 'question' } : {}),
       ...(typeof opts.decisionReason === 'string' ? { decision_reason: opts.decisionReason } : {}),
     })
     // Parked on a human decision: for the control plane the session is now
@@ -263,8 +267,8 @@ export function createClaudeDriver(s, spec, h) {
     // Resolved by POST /permissions/{request_id}; the SDK keeps the tool call
     // paused for as long as this promise stays pending (a browser approval can
     // take minutes). The abort signal fires on interrupt/session teardown.
-    return new Promise((resolve) => {
-      s.pending.set(requestId, { resolve, toolName, input, ts: Date.now() })
+    const decision = await new Promise((resolve) => {
+      s.pending.set(requestId, { resolve, toolName, input: platformInput, ...(isQuestion ? { kind: 'question' } : {}), ts: Date.now() })
       opts.signal?.addEventListener(
         'abort',
         () => {
@@ -277,6 +281,7 @@ export function createClaudeDriver(s, spec, h) {
         { once: true },
       )
     })
+    return isQuestion ? claudeQuestionDecision(input, platformInput, decision) : decision
   }
 
   // One claude installation per workspace (#1347): drive the volume's native

@@ -828,11 +828,12 @@ test('a question surfaces as a kind:question permission request; id-keyed answer
     assert.equal(s.state, 'blocked')
     assert.equal(s.pending.get('que_1').toolName, 'question')
 
-    // The dashboard answers by id, joining a multi-select into one string;
-    // an API client may send an array. Both reach OpenCode as label arrays.
+    // Answers keyed by id: one string for a single-select, an array of
+    // labels for a multi-select (#1559). Both reach OpenCode as label arrays.
     const pending = s.pending.get('que_1')
     s.pending.delete('que_1')
-    pending.resolve({ behavior: 'allow', updatedInput: { ...pending.input, answers: { q1: 'production', q2: 'lint, tests' } } })
+    assert.equal(pending.kind, 'question')
+    pending.resolve({ behavior: 'allow', updatedInput: { ...pending.input, answers: { q1: 'production', q2: ['lint', 'tests'] } } })
     await until([], () => fake.state.questionReplies.length === 1, 'the reply')
     assert.deepEqual(fake.state.questionReplies[0], { questionID: 'que_1', answers: [['production'], ['lint', 'tests']] })
     fake.assertNoViolations(assert)

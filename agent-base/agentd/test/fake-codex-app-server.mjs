@@ -120,10 +120,19 @@ async function runTurn(turnId) {
   if (scenario === 'user-input') {
     // The AskUserQuestion twin. An unattended run must refuse it, and the
     // refusal arrives as a JSON-RPC error, which we surface as a marker.
+    // The protocol's RequestUserInputQuestion shape (codex-rs/protocol/src/
+    // request_user_input.rs): id, header, question, isOther, isSecret,
+    // options?. The reply must be RequestUserInputResponse — {answers: {[id]:
+    // {answers: string[]}}} — which serde would reject in any other form, so
+    // the fake marks anything else malformed rather than echo the driver.
     const reply = await ask('item/tool/requestUserInput', {
-      threadId: THREAD_ID, turnId, itemId: 'item-q', questions: [{ id: 'q1', question: 'which?' }],
+      threadId: THREAD_ID, turnId, itemId: 'item-q',
+      questions: [{ id: 'q1', header: 'Env', question: 'which?', isOther: true, isSecret: false,
+        options: [{ label: 'staging', description: 's' }, { label: 'production', description: 'p' }] }],
     })
-    trace('__userInputReply', reply)
+    const wellFormed = !reply?.__error && reply?.answers && typeof reply.answers === 'object' &&
+      Object.values(reply.answers).every((a) => a && Array.isArray(a.answers) && a.answers.every((x) => typeof x === 'string'))
+    trace('__userInputReply', reply?.__error || wellFormed ? reply : { __malformed: reply })
     notify('item/completed', {
       threadId: THREAD_ID, turnId,
       item: { type: 'agentMessage', id: 'msg-q', text: reply?.__error ? 'refused' : 'answered', phase: null },

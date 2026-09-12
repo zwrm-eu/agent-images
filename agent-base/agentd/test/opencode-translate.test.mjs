@@ -10,8 +10,6 @@ import {
   initPayload,
   isReservedMCPServer,
   partialPayload,
-  questionAnswersFor,
-  questionInputFor,
   resultPayload,
   textPayload,
   toolResultPayload,
@@ -230,41 +228,3 @@ test('session config: a live catalog replaces the seeded ext/ entries; without t
 })
 
 
-test('questionInputFor assigns positional ids and the platform question shape (#1555)', () => {
-  const input = questionInputFor({
-    id: 'que_1',
-    questions: [
-      { question: 'A?', header: 'H', options: [{ label: 'x', description: 'dx' }, { label: 'y', description: '' }] },
-      { question: 'B?', header: '', multiple: true, custom: false, options: [] },
-      { question: 'C?', header: 'H3', options: [{ nope: true }, 'str', { label: '' }, { label: 'z' }] },
-    ],
-  })
-  assert.deepEqual(input, {
-    questions: [
-      { id: 'q1', question: 'A?', header: 'H', options: [{ label: 'x', description: 'dx' }, { label: 'y', description: '' }], multiSelect: false },
-      { id: 'q2', question: 'B?', header: '', options: [], multiSelect: true },
-      { id: 'q3', question: 'C?', header: 'H3', options: [{ label: 'z' }], multiSelect: false },
-    ],
-  })
-  assert.deepEqual(questionInputFor({}), { questions: [] })
-})
-
-test('questionAnswersFor maps id- or text-keyed answers onto ordered label arrays (#1555)', () => {
-  const opt = (...labels) => labels.map((label) => ({ label, description: '' }))
-  const qs = questionInputFor({ questions: [
-    { question: 'A?', header: '', options: opt('x', 'y') },
-    { question: 'B?', header: '', options: opt('y', 'z'), multiple: true },
-    { question: 'C?', header: '', options: opt('a, b', 'c') },
-  ] }).questions
-  assert.deepEqual(questionAnswersFor(qs, { q1: 'x', 'B?': ['y', 'z'], q3: 'free text' }), [['x'], ['y', 'z'], ['free text']])
-  // The dashboard joins a multi-select with ", ": unjoin only when every
-  // piece is an option label; a label that itself contains ", " stays whole.
-  assert.deepEqual(questionAnswersFor(qs, { q2: 'y, z', q3: 'a, b' }), [[], ['y', 'z'], ['a, b']])
-  assert.deepEqual(questionAnswersFor(qs, { q2: 'y, something else' }), [[], ['y, something else'], []])
-  // Unanswered → [] (OpenCode renders "Unanswered"); empty strings drop.
-  assert.deepEqual(questionAnswersFor(qs, { q1: '', q3: ['', 'c', 7] }), [[], [], ['c']])
-  // No answers object at all is not an answer: the caller rejects.
-  assert.equal(questionAnswersFor(qs, undefined), null)
-  assert.equal(questionAnswersFor(qs, 'x'), null)
-  assert.equal(questionAnswersFor(qs, ['x']), null)
-})

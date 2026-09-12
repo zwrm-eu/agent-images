@@ -39,8 +39,6 @@ import {
   gateInputFor,
   initPayload,
   partialPayload,
-  questionAnswersFor,
-  questionInputFor,
   reasoningPayload,
   resultPayload,
   textPayload,
@@ -48,6 +46,7 @@ import {
   toolUsePayload,
 } from './opencode-translate.mjs'
 import { normalizeTodos } from './todos.mjs'
+import { opencodeQuestionInput, opencodeQuestionReply } from './questions.mjs'
 import { commandPrompt, normalizeCommandList, resolveCommand } from '../session-control.mjs'
 
 // Bounded teardown (the codex rule): a wedged server must not hang
@@ -378,7 +377,7 @@ export async function createOpenCodeDriver(s, spec, h) {
     openSet?.add(requestId)
     try {
       return await new Promise((resolve) => {
-        s.pending.set(requestId, { resolve, toolName, input, ts: Date.now() })
+        s.pending.set(requestId, { resolve, toolName, input, ...(kind ? { kind } : {}), ts: Date.now() })
       })
     } finally {
       openSet?.delete(requestId)
@@ -446,7 +445,7 @@ export async function createOpenCodeDriver(s, spec, h) {
       h.log(`opencode: rejecting question ${questionId} (${s.ending ? 'session ending' : 'unattended session'})`)
       return rejectQuestion(questionId)
     }
-    const input = questionInputFor(req)
+    const input = opencodeQuestionInput(req)
     const decision = await awaitDecision({
       requestId: questionId,
       toolName: 'question',
@@ -454,7 +453,7 @@ export async function createOpenCodeDriver(s, spec, h) {
       toolUseId: req.tool?.callID ?? '',
       kind: 'question',
     })
-    const answers = decision.behavior === 'allow' ? questionAnswersFor(input.questions, decision.updatedInput?.answers) : null
+    const answers = decision.behavior === 'allow' ? opencodeQuestionReply(input, decision.updatedInput?.answers) : null
     // Approving without answers is not an answer: reject, so the model sees
     // a dismissed question rather than fabricated certainty (the codex rule).
     if (!answers) return rejectQuestion(questionId)

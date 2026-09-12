@@ -184,57 +184,6 @@ export function gateInputFor(ask) {
   }
 }
 
-// questionInputFor renders a `question.asked` request as the platform's
-// permission.request `input` (#1555): {questions: [{id, question, header,
-// options: [{label, description}], multiSelect}]} — the shape the dashboard's
-// question card and the codex twin already speak. OpenCode questions carry
-// no id, so one is assigned by position (q1, q2, …); answers come back keyed
-// by it (see questionAnswersFor). OpenCode's `custom` flag is not forwarded:
-// no platform consumer honours it (the dashboard always offers free text).
-export function questionInputFor(req) {
-  const questions = Array.isArray(req?.questions) ? req.questions : []
-  return {
-    questions: questions.map((q, i) => ({
-      id: `q${i + 1}`,
-      question: typeof q?.question === 'string' ? q.question : '',
-      header: typeof q?.header === 'string' ? q.header : '',
-      options: (Array.isArray(q?.options) ? q.options : [])
-        // An empty label would make the dashboard card demote the whole
-        // request to a plain approval (whose Allow carries no answers).
-        .filter((o) => o && typeof o === 'object' && typeof o.label === 'string' && o.label !== '')
-        .map((o) => ({ label: o.label, ...(typeof o.description === 'string' ? { description: o.description } : {}) })),
-      multiSelect: q?.multiple === true,
-    })),
-  }
-}
-
-// questionAnswersFor maps the platform answer object (updated_input.answers)
-// back onto OpenCode's reply shape: one string array per question, in
-// question order. The platform contract keys answers by question id; the
-// question text is accepted too, so a client written against claude (whose
-// AskUserQuestion answers are keyed by text) works unchanged. A value is a
-// string array, or a string: the dashboard joins a multi-select into one
-// ", "-separated string (claude's answer contract), so a string that is not
-// itself an option label but splits into option labels is unjoined back into
-// them; anything else is one free-text answer. A question nobody answered
-// maps to [] — OpenCode renders that as "Unanswered", which is honest.
-// Returns null when `answers` is not an object at all: an approval that
-// carries no answers is not an answer, and the caller rejects the question
-// rather than fabricate one.
-export function questionAnswersFor(questions, answers) {
-  if (!answers || typeof answers !== 'object' || Array.isArray(answers)) return null
-  return (Array.isArray(questions) ? questions : []).map((q) => {
-    const raw = answers[q?.id] ?? answers[q?.question]
-    if (Array.isArray(raw)) return raw.filter((a) => typeof a === 'string' && a !== '')
-    if (typeof raw !== 'string' || raw === '') return []
-    const labels = new Set((q?.options || []).map((o) => o?.label))
-    if (labels.has(raw)) return [raw]
-    const parts = raw.split(', ')
-    if (parts.length > 1 && parts.every((p) => labels.has(p))) return parts
-    return [raw]
-  })
-}
-
 // classifyOpenCodeError mirrors claude's classifyRunError. OpenCode surfaces
 // errors as {name, data} objects on session.error / message info.error, plus
 // process- and HTTP-shaped failures from the client.

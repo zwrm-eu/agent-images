@@ -547,7 +547,11 @@ async function questionRoundTrip(permissionMode) {
   const req = ofType(ctx.events, 'permission.request')[0].payload
   assert.equal(req.tool_name, 'request_user_input')
   assert.equal(req.kind, 'question')
-  assert.equal(req.input.questions[0].id, 'q1')
+  // The platform shape (#1559): codex's id, no isOther/isSecret leakage.
+  assert.deepEqual(req.input.questions[0], {
+    id: 'q1', question: 'which?', header: 'Env', multiSelect: false,
+    options: [{ label: 'staging', description: 's' }, { label: 'production', description: 'p' }],
+  })
 
   const pending = ctx.s.pending.get(req.request_id)
   ctx.s.pending.delete(req.request_id)
@@ -556,8 +560,9 @@ async function questionRoundTrip(permissionMode) {
     updatedInput: { ...pending.input, answers: { q1: 'production' } },
   })
 
+  // Codex's RequestUserInputResponse, not the platform's flat map.
   await until(ctx.events, () => sentCalls(ctx.tracePath, '__userInputReply').length > 0, 'user-input reply')
-  assert.deepEqual(sentCalls(ctx.tracePath, '__userInputReply')[0], { answers: { q1: 'production' } })
+  assert.deepEqual(sentCalls(ctx.tracePath, '__userInputReply')[0], { answers: { q1: { answers: ['production'] } } })
   await ctx.driver.shutdownStop()
 }
 

@@ -47,6 +47,7 @@ import {
   toolUsePayload,
   usagePayload,
 } from './codex-translate.mjs'
+import { codexQuestionInput, codexQuestionReply } from './questions.mjs'
 // Pure naming/dispatch helpers — no MCP SDK import, so they load unconditionally.
 import {
   buildCodexRunTools,
@@ -389,7 +390,7 @@ export async function createCodexDriver(s, spec, h) {
     let decision
     try {
       decision = await new Promise((resolve) => {
-        s.pending.set(requestId, { resolve, toolName, input, ts: Date.now() })
+        s.pending.set(requestId, { resolve, toolName, input, ...(kind ? { kind } : {}), ts: Date.now() })
       })
     } finally {
       if (codexRequestId !== undefined) gateByCodexRequest.delete(codexRequestId)
@@ -450,20 +451,17 @@ export async function createCodexDriver(s, spec, h) {
         if (!spec.interactive) {
           throw new Error('this session is unattended; ask no questions and proceed with your best judgement')
         }
-        const d = await gate(
-          'request_user_input',
-          { questions: params?.questions ?? [] },
-          params?.itemId,
-          codexRequestId,
-          'question',
-        )
-        const answers = d.allow ? d.updatedInput?.answers : null
-        if (!answers || typeof answers !== 'object') {
+        // The platform shape on the way out (#1559), codex's
+        // RequestUserInputResponse on the way back.
+        const input = codexQuestionInput(params?.questions)
+        const d = await gate('request_user_input', input, params?.itemId, codexRequestId, 'question')
+        const reply = d.allow ? codexQuestionReply(input, d.updatedInput?.answers) : null
+        if (!reply) {
           // Approving without supplying answers is not an answer. Refusing is
           // honest; fabricating would not be.
           throw new Error(d.message || 'no answers were supplied')
         }
-        return { answers }
+        return reply
       }
       case 'item/tool/call': {
         // A dynamic tool call: this daemon executes it, which is what keeps
