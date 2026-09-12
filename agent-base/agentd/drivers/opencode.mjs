@@ -39,6 +39,8 @@ import {
   gateInputFor,
   initPayload,
   partialPayload,
+  questionAnswersFor,
+  questionInputFor,
   reasoningPayload,
   resultPayload,
   textPayload,
@@ -359,21 +361,50 @@ export async function createOpenCodeDriver(s, spec, h) {
   }
 
   // ---- permission gate ------------------------------------------------------
+  // awaitDecision parks one request on the shared pending map (the codex
+  // gate() shape): emit permission.request, mark the session blocked, and
+  // resolve with the platform decision from POST /permissions/{request_id}
+  // — or the deny that interrupt/end/shutdown resolve every entry with.
+  // openSet tracks the id while parked so interrupt() can reject it upstream.
+  async function awaitDecision({ requestId, toolName, input, toolUseId, kind, openSet }) {
+    s.pusher.emit('permission.request', {
+      request_id: requestId,
+      tool_name: toolName,
+      input,
+      tool_use_id: toolUseId,
+      ...(kind ? { kind } : {}),
+    })
+    h.setState(s, 'blocked')
+    openSet?.add(requestId)
+    try {
+      return await new Promise((resolve) => {
+        s.pending.set(requestId, { resolve, toolName, input, ts: Date.now() })
+      })
+    } finally {
+      openSet?.delete(requestId)
+    }
+  }
+
+  // bestEffortPost is the reply shape for anything OpenCode holds a tool
+  // paused on: a reply that no longer lands (turn aborted, server gone) is
+  // not a session failure; the turn's own terminal path reports the truth.
+  const bestEffortPost = async (path, body, what) => {
+    try {
+      await server.request('POST', path, body, { timeoutMS: TEARDOWN_TIMEOUT_MS })
+    } catch (err) {
+      h.log(`opencode: ${what} failed: ${err?.message || err}`)
+    }
+  }
+  const rejectQuestion = (questionId) =>
+    bestEffortPost(`/question/${encodeURIComponent(questionId)}/reject`, undefined, 'question reject')
+
   // One ask at a time is OpenCode's own behavior (the tool pauses); the
   // pending map still supports several, matching the other drivers.
   async function onAsk(ask) {
     const askId = ask?.id
     if (!askId) return
-    const reply = async (response) => {
-      try {
-        await server.request('POST', `/session/${ocSessionId}/permissions/${encodeURIComponent(askId)}`,
-          { response }, { timeoutMS: TEARDOWN_TIMEOUT_MS })
-      } catch (err) {
-        // A reply that no longer lands (turn aborted, server gone) is not a
-        // session failure; the turn's own terminal path reports the truth.
-        h.log(`opencode: permission reply failed: ${err?.message || err}`)
-      }
-    }
+    const reply = (response) =>
+      bestEffortPost(`/session/${ocSessionId}/permissions/${encodeURIComponent(askId)}`, { response }, 'permission reply')
     // After /end nothing may block on a human (server semantics: pending
     // asks were already denied); auto-deny new ones.
     if (s.ending) return reply('reject')
@@ -386,27 +417,48 @@ export async function createOpenCodeDriver(s, spec, h) {
     if (spec.auto_approve && !h.isEscalatedTool(canonical, spec.escalate_servers)) {
       return reply('once')
     }
-    s.pusher.emit('permission.request', {
-      request_id: askId,
-      tool_name: canonical,
+    const decision = await awaitDecision({
+      requestId: askId,
+      toolName: canonical,
       input: gateInputFor(ask),
-      tool_use_id: ask.tool?.callID ?? '',
+      toolUseId: ask.tool?.callID ?? '',
+      openSet: openAsks,
     })
-    h.setState(s, 'blocked')
-    openAsks.add(askId)
-    let decision
-    try {
-      decision = await new Promise((resolve) => {
-        s.pending.set(askId, { resolve, toolName: ask.permission ?? '', input: gateInputFor(ask), ts: Date.now() })
-      })
-    } finally {
-      openAsks.delete(askId)
-    }
     // 'once', never 'always': an always-grant would persist in OpenCode's
     // store past this session and bypass the platform gate next time.
     // updatedInput cannot be applied — the reply body carries no input — so a
     // reviewer's edit is deliberately not honoured here (unlike claude/pi).
     await reply(decision.behavior === 'allow' ? 'once' : 'reject')
+  }
+
+  // ---- questions (#1555) ----------------------------------------------------
+  // The question tool is not a permission (wire shape: the translate header),
+  // so the permission MODE does not apply — bypassPermissions must not
+  // auto-answer — and neither does the run policy: sessions with nobody to
+  // answer have the tool off at config level, so a question reaching one is
+  // a model-side surprise, rejected rather than answered with nothing. The
+  // upstream reject on interrupt/end rides the deny those paths resolve the
+  // pending entry with; no second reject is sent.
+  async function onQuestion(req) {
+    const questionId = req?.id
+    if (!questionId) return
+    if (s.ending || !spec.interactive) {
+      h.log(`opencode: rejecting question ${questionId} (${s.ending ? 'session ending' : 'unattended session'})`)
+      return rejectQuestion(questionId)
+    }
+    const input = questionInputFor(req)
+    const decision = await awaitDecision({
+      requestId: questionId,
+      toolName: 'question',
+      input,
+      toolUseId: req.tool?.callID ?? '',
+      kind: 'question',
+    })
+    const answers = decision.behavior === 'allow' ? questionAnswersFor(input.questions, decision.updatedInput?.answers) : null
+    // Approving without answers is not an answer: reject, so the model sees
+    // a dismissed question rather than fabricated certainty (the codex rule).
+    if (!answers) return rejectQuestion(questionId)
+    await bestEffortPost(`/question/${encodeURIComponent(questionId)}/reply`, { answers }, 'question reply')
   }
 
   // ---- event translation ----------------------------------------------------
@@ -425,12 +477,24 @@ export async function createOpenCodeDriver(s, spec, h) {
         seenChildSessions.add(evSession)
         h.log(`opencode: subagent child session ${evSession} first event (${type}) [#1388]`)
       }
+      // A child's question (#1555) has no route to the human — the parent's
+      // task call is what the human sees — and the tool is enabled at config
+      // level for the whole server, so it must be dismissed rather than left
+      // blocking the child (and, behind it, the parent) forever.
+      if (type === 'question.asked' && props?.id) {
+        h.log(`opencode: rejecting question ${props.id} from subagent session ${evSession}`)
+        void rejectQuestion(props.id)
+      }
       return
     }
     try {
       switch (type) {
         case 'permission.asked':
           void onAsk(props)
+          break
+
+        case 'question.asked':
+          void onQuestion(props)
           break
 
         case 'message.part.delta': {

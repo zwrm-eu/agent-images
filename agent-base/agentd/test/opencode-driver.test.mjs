@@ -788,3 +788,152 @@ test('ext/ model commands use the "zwrm/<full slug>" string form', async () => {
     await fake.close()
   }
 })
+
+// ---- questions (#1555) -------------------------------------------------------
+// OpenCode's question tool rides the platform permission channel with kind
+// 'question'; the answer goes back over the native /question/:id/reply route.
+
+const QUESTION = {
+  id: 'que_1',
+  questions: [
+    { question: 'Deploy where?', header: 'Target', options: [{ label: 'staging', description: 'safe' }, { label: 'production', description: 'live' }] },
+    { question: 'Which checks?', header: 'Checks', multiple: true, options: [{ label: 'lint', description: '' }, { label: 'tests', description: '' }], custom: false },
+  ],
+  tool: { messageID: 'm1', callID: 'c_q' },
+}
+
+test('a question surfaces as a kind:question permission request; id-keyed answers reply in order (#1555)', async () => {
+  const fake = await startFakeOpenCode()
+  try {
+    // bypassPermissions on purpose: a question is not a tool approval, so
+    // the mode must not auto-answer it.
+    const { s, driver, events } = await build(fake, newHarness({ spec: { interactive: true, permission_mode: 'bypassPermissions' } }))
+    driver.start()
+    driver.queueMessage('go')
+    await until(events, () => fake.state.prompts.length === 1, 'prompt')
+    const sid = s.sdkSessionId
+
+    fake.emit('question.asked', { ...QUESTION, sessionID: sid })
+    await until(events, (ev) => ofType(ev, 'permission.request').length === 1, 'the platform question')
+    const ask = ofType(events, 'permission.request')[0].payload
+    assert.equal(ask.request_id, 'que_1')
+    assert.equal(ask.tool_name, 'question')
+    assert.equal(ask.kind, 'question')
+    assert.equal(ask.tool_use_id, 'c_q')
+    assert.deepEqual(ask.input.questions.map((q) => q.id), ['q1', 'q2'])
+    assert.equal(ask.input.questions[0].multiSelect, false)
+    assert.equal(ask.input.questions[1].multiSelect, true)
+    assert.equal(ask.input.questions[1].custom, undefined)
+    assert.deepEqual(ask.input.questions[0].options[1], { label: 'production', description: 'live' })
+    assert.equal(s.state, 'blocked')
+    assert.equal(s.pending.get('que_1').toolName, 'question')
+
+    // The dashboard answers by id, joining a multi-select into one string;
+    // an API client may send an array. Both reach OpenCode as label arrays.
+    const pending = s.pending.get('que_1')
+    s.pending.delete('que_1')
+    pending.resolve({ behavior: 'allow', updatedInput: { ...pending.input, answers: { q1: 'production', q2: 'lint, tests' } } })
+    await until([], () => fake.state.questionReplies.length === 1, 'the reply')
+    assert.deepEqual(fake.state.questionReplies[0], { questionID: 'que_1', answers: [['production'], ['lint', 'tests']] })
+    fake.assertNoViolations(assert)
+  } finally {
+    await fake.close()
+  }
+})
+
+test('a declined or answer-less decision rejects the question upstream instead of fabricating (#1555)', async () => {
+  const fake = await startFakeOpenCode()
+  try {
+    const { s, driver, events } = await build(fake, newHarness({ spec: { interactive: true, permission_mode: 'default' } }))
+    driver.start()
+    driver.queueMessage('go')
+    await until(events, () => fake.state.prompts.length === 1, 'prompt')
+    const sid = s.sdkSessionId
+
+    fake.emit('question.asked', { ...QUESTION, id: 'que_d', sessionID: sid })
+    await until(events, (ev) => ofType(ev, 'permission.request').length === 1, 'question')
+    const d = s.pending.get('que_d')
+    s.pending.delete('que_d')
+    d.resolve({ behavior: 'deny', message: 'no' })
+    await until([], () => fake.state.questionReplies.length === 1, 'reject')
+    assert.deepEqual(fake.state.questionReplies[0], { questionID: 'que_d', rejected: true })
+
+    // allow without answers: an approval is not an answer.
+    fake.emit('question.asked', { ...QUESTION, id: 'que_e', sessionID: sid })
+    await until(events, (ev) => ofType(ev, 'permission.request').length === 2, 'second question')
+    const e = s.pending.get('que_e')
+    s.pending.delete('que_e')
+    e.resolve({ behavior: 'allow', updatedInput: e.input })
+    await until([], () => fake.state.questionReplies.length === 2, 'second reject')
+    assert.deepEqual(fake.state.questionReplies[1], { questionID: 'que_e', rejected: true })
+    fake.assertNoViolations(assert)
+  } finally {
+    await fake.close()
+  }
+})
+
+test('sessions with nobody to answer (runs, subagents) reject questions with no platform event (#1555)', async () => {
+  for (const spec of [
+    { interactive: false, auto_approve: true, permission_mode: 'default' },
+    { interactive: false, permission_mode: 'bypassPermissions' },
+  ]) {
+    const fake = await startFakeOpenCode()
+    try {
+      // The config gate (opencode-translate tests) is the real mechanism;
+      // the runtime reject is the backstop for a question that arrives anyway.
+      const { s, driver, events } = await build(fake, newHarness({ spec }))
+      driver.start()
+      driver.queueMessage('go')
+      await until(events, () => fake.state.prompts.length === 1, 'prompt')
+      fake.emit('question.asked', { ...QUESTION, id: 'que_run', sessionID: s.sdkSessionId })
+      await until([], () => fake.state.questionReplies.length === 1, 'reject')
+      assert.deepEqual(fake.state.questionReplies[0], { questionID: 'que_run', rejected: true })
+      assert.equal(ofType(events, 'permission.request').length, 0)
+      await driver.shutdownStop()
+      fake.assertNoViolations(assert)
+    } finally {
+      await fake.close()
+    }
+  }
+
+  // A task subagent's question arrives under a FOREIGN session id, which the
+  // event filter drops: it must still be dismissed or the child (and the
+  // parent's task call behind it) blocks forever.
+  const fake = await startFakeOpenCode()
+  try {
+    const { s, driver, events } = await build(fake, newHarness({ spec: { interactive: true, permission_mode: 'default' } }))
+    driver.start()
+    driver.queueMessage('go')
+    await until(events, () => fake.state.prompts.length === 1, 'prompt')
+    fake.emit('question.asked', { ...QUESTION, id: 'que_child', sessionID: 'ses_child_9' })
+    await until([], () => fake.state.questionReplies.length === 1, 'child reject')
+    assert.deepEqual(fake.state.questionReplies[0], { questionID: 'que_child', rejected: true })
+    assert.equal(ofType(events, 'permission.request').length, 0)
+    assert.equal(s.state, 'working')
+    fake.assertNoViolations(assert)
+  } finally {
+    await fake.close()
+  }
+})
+
+test('interrupt rejects an open question exactly once, via the cancelled pending entry (#1555)', async () => {
+  const fake = await startFakeOpenCode()
+  try {
+    const { s, driver, events } = await build(fake, newHarness({ spec: { interactive: true, permission_mode: 'default' } }))
+    driver.start()
+    driver.queueMessage('go')
+    await until(events, () => fake.state.prompts.length === 1, 'prompt')
+    fake.emit('question.asked', { ...QUESTION, id: 'que_i', sessionID: s.sdkSessionId })
+    await until(events, (ev) => ofType(ev, 'permission.request').length === 1, 'question')
+    await driver.interrupt()
+    await until([], () => fake.state.questionReplies.length >= 1, 'interrupt reject')
+    // Settle: a second reject would land within this window and 404.
+    await new Promise((r) => setTimeout(r, 50))
+    assert.deepEqual(fake.state.questionReplies, [{ questionID: 'que_i', rejected: true }])
+    assert.equal(s.pending.size, 0)
+    assert.equal(fake.state.aborts, 1)
+    fake.assertNoViolations(assert)
+  } finally {
+    await fake.close()
+  }
+})
