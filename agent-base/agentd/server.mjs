@@ -32,6 +32,7 @@ import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { DRIVERS, HARNESSES, HARNESS_CAPS, unsupportedPermissionMode } from './drivers/registry.mjs'
 import { handlePlatformTool } from './drivers/opencode-run-tools.mjs'
+import { answeredQuestions } from './drivers/questions.mjs'
 import { parkDeadlineError } from './drivers/run-tools.mjs'
 import { TOOL_POLICIES } from './drivers/tool-policy.mjs'
 import { countBackgroundTasks } from './drivers/claude-tasks.mjs'
@@ -1225,6 +1226,13 @@ async function handlePermission(req, res, s, requestId) {
   }
   const p = s.pending.get(requestId)
   if (!p) return send(res, 404, { error: 'no pending permission request' })
+  // A question (#1559) is answered, not merely allowed: an approval whose
+  // answers resolve to nothing is refused here, before the decision is
+  // recorded, so the timeline never shows "allowed" for a question the
+  // harness would have to refuse (every driver still guards for itself).
+  if (body.behavior === 'allow' && p.kind === 'question' && !answeredQuestions(p.input, body.updated_input?.answers)) {
+    throw badRequest('a question needs answers: updated_input.answers keyed by question id (a string, or an array of labels for multiSelect)')
+  }
   s.pending.delete(requestId)
   s.pusher.emit('permission.decision', permissionDecisionPayload(requestId, body))
   p.resolve(

@@ -127,3 +127,25 @@ test('the gateway-token refresh endpoint covers every credential sink (#1363)', 
   assert.match(src, /s\.spec\.env = \{ \.\.\.\(s\.spec\.env \|\| \{\}\), ZWRM_GATEWAY_TOKEN: token \}/)
   assert.match(src, /s\.spec\.mcp_servers/)
 })
+
+test('an approval that answers no question is refused before the decision is recorded (#1559)', async () => {
+  // Source-text pin (handlePermission needs a booted daemon to exercise; the
+  // predicate itself is unit-tested in questions.test.mjs): the guard must
+  // run on `p.kind === 'question'` BEFORE the pending entry is deleted and
+  // the permission.decision event emitted, or the timeline would show
+  // "allowed" for a question every driver then refuses.
+  const src = await readFile(SERVER, 'utf8')
+  const handler = src.slice(src.indexOf('async function handlePermission('), src.indexOf('async function handleParkResolve('))
+  const guard = handler.indexOf("body.behavior === 'allow' && p.kind === 'question' && !answeredQuestions(p.input, body.updated_input?.answers)")
+  const del = handler.indexOf('s.pending.delete(requestId)')
+  const emit = handler.indexOf("s.pusher.emit('permission.decision'")
+  assert.ok(guard > 0, 'handlePermission must gate question approvals on answeredQuestions')
+  assert.ok(guard < del && guard < emit, 'the guard must precede the delete and the decision event')
+  // Every driver stamps kind on its question entries, or the guard is inert:
+  // the pending.set call must spread a kind alongside resolve/toolName/input.
+  for (const driver of ['claude', 'codex', 'opencode']) {
+    const dsrc = await readFile(join(dirname(SERVER), 'drivers', `${driver}.mjs`), 'utf8')
+    assert.match(dsrc, /s\.pending\.set\(\w+, \{ resolve, toolName, input[^\n]*\.\.\.\((?:isQuestion|kind) \? \{ kind/,
+      `${driver} must stamp kind on its pending entries`)
+  }
+})
