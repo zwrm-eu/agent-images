@@ -904,6 +904,15 @@ export async function createOpenCodeDriver(s, spec, h) {
       mode = newMode
     },
 
+    // Persistent model switch (#1552): every prompt_async names spec.model
+    // and the thread lives server-side keyed by ocSessionId, so a spec
+    // mutation is the whole switch. opencode has no effort concept plumbed;
+    // the value is kept on the spec for the record and otherwise unused.
+    async setModel({ model, effort }) {
+      if (model) spec.model = model
+      if (effort) spec.effort = effort
+    },
+
     beginEnd() {
       closed = true
       if (!turnActive) chain(finish)

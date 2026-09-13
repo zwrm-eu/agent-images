@@ -48,6 +48,7 @@ import {
   normalizeCommandName,
   shellContext,
   supportsCommandDriver,
+  supportsModelSwitchDriver,
 } from './session-control.mjs'
 
 const DEFAULT_PORT = 9924
@@ -1254,6 +1255,50 @@ async function handleParkResolve(req, res, s, parkId) {
   send(res, 200, { resolved: true })
 }
 
+// Model switch (#1552, the 'model-switch' cap): re-point the session at
+// another model and/or effort for every later turn. Between turns only —
+// claude's setModel is a turn-boundary operation and codex/opencode read the
+// spec when they open a turn, so applying mid-turn would land at an
+// unpredictable point of the conversation. The spec is mutated in place (the
+// drivers close over the same object, like the gateway-token refresh) and the
+// switch is recorded durably so the timeline shows where the model moved.
+async function handleModel(req, res, s) {
+  const body = await readBody(req)
+  if (body.model != null && typeof body.model !== 'string') throw badRequest('model must be a string')
+  if (body.effort != null && typeof body.effort !== 'string') throw badRequest('effort must be a string')
+  const model = (body.model ?? '').trim()
+  const effort = (body.effort ?? '').trim()
+  if (!model && !effort) throw badRequest('missing model or effort')
+  if (isDone(s)) return send(res, 409, { error: 'session is finished', state: s.state })
+  if (s.state !== 'idle' || s.controlBusy) {
+    return send(res, 409, { error: 'session must be idle before switching the model', state: s.state })
+  }
+  if (!supportsModelSwitchDriver(s.driver)) {
+    throw badRequest(`model switching is not supported by the ${s.harness} harness`)
+  }
+  const previous = { model: s.spec.model || '', effort: s.spec.effort || '' }
+  const next = { model: model || previous.model, effort: effort || previous.effort }
+  // Reserve the session across the driver's await: a message entering while
+  // claude's setModel is in flight would open a turn on an undefined model.
+  // The driver gets only what the caller changed (empty = keep) and owns the
+  // spec mutation — it is what reads spec.model on the next turn — so a
+  // driver that accepts the call has applied it.
+  s.controlBusy = 'model'
+  try {
+    await s.driver.setModel({ model, effort })
+  } finally {
+    s.controlBusy = null
+  }
+  log(`session ${s.id}: model ${previous.model || '(default)'} -> ${next.model || '(default)'}, effort ${previous.effort || '(default)'} -> ${next.effort || '(default)'}`)
+  s.pusher.emit('session.model_changed', {
+    model: next.model,
+    effort: next.effort,
+    previous_model: previous.model,
+    previous_effort: previous.effort,
+  })
+  send(res, 200, next)
+}
+
 async function handleMode(req, res, s) {
   const body = await readBody(req)
   if (!PERMISSION_MODES.has(body.mode)) throw badRequest(`invalid mode ${body.mode}`)
@@ -1402,12 +1447,16 @@ const server = createServer(async (req, res) => {
         // rotates the session's platform credential in place; the CP's
         // admission-time refresh gates on it (a stale daemon would silently
         // keep the expired token).
+        // 'model-switch' (#1552): POST /v1/sessions/{id}/model re-points a
+        // live session at another model/effort between turns and records
+        // session.model_changed; the CP refuses the switch on a daemon
+        // without it rather than persisting a model the VM never applied.
         // 'opencode-gateway' says this build seeds the opencode gateway
         // config (#1392) — the CP refuses opencode sessions on daemons
         // without it, exactly as 'pi-gateway' guards pi's catalog (#1193).
         // 'commands' (#1429): harness-driver command discovery/invocation.
         // 'shell' (#1429): immediate operator shell with durable context.
-        caps: ['mcp', 'escalation', 'files', 'file-search', 'message-context', 'park', 'reclaim', 'skillfetch', 'pi-multiprovider', 'pi-gateway', 'opencode-gateway', 'background-tasks', 'tool-policy', 'token-refresh', 'commands', 'shell', ...HARNESS_CAPS],
+        caps: ['mcp', 'escalation', 'files', 'file-search', 'message-context', 'park', 'reclaim', 'skillfetch', 'pi-multiprovider', 'pi-gateway', 'opencode-gateway', 'background-tasks', 'tool-policy', 'token-refresh', 'commands', 'shell', 'model-switch', ...HARNESS_CAPS],
         active_session: session && !isDone(session) ? session.id : null,
         state: session?.state ?? null,
         // Live background work (#1251): tasks the harness still tracks after
@@ -1446,6 +1495,7 @@ const server = createServer(async (req, res) => {
       if (req.method === 'POST' && action === 'permissions' && parts.length === 5) return await handlePermission(req, res, s, parts[4])
       if (req.method === 'POST' && action === 'parks' && parts.length === 6 && parts[5] === 'resolve') return await handleParkResolve(req, res, s, parts[4])
       if (req.method === 'POST' && action === 'mode' && parts.length === 4) return await handleMode(req, res, s)
+      if (req.method === 'POST' && action === 'model' && parts.length === 4) return await handleModel(req, res, s)
       if (req.method === 'POST' && action === 'gateway-token' && parts.length === 4) return await handleGatewayToken(req, res, s)
       if (req.method === 'POST' && action === 'end' && parts.length === 4) return handleEnd(res, s)
     }

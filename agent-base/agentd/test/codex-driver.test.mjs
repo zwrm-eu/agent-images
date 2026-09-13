@@ -183,6 +183,31 @@ test('a todoList thread item becomes a todo.updated snapshot, not a transcript e
   await ctx.driver.shutdownStop()
 })
 
+test('setModel re-points the NEXT turn/start and leaves the thread alone (#1552)', async () => {
+  const ctx = await build(newHarness({ scenario: 'simple', spec: { model: 'gpt-5.5', effort: 'medium' } }))
+  ctx.driver.start()
+  assert.equal(ctx.driver.queueMessage('first'), true)
+  await until(ctx.events, (e) => ofType(e, 'sdk.result').length === 1, 'first result')
+
+  await ctx.driver.setModel({ model: 'gpt-5.6', effort: 'xhigh' })
+  assert.equal(ctx.spec.model, 'gpt-5.6', 'the driver owns the spec mutation')
+  assert.equal(ctx.spec.effort, 'xhigh')
+  assert.equal(ctx.driver.queueMessage('second'), true)
+  await until(ctx.events, (e) => ofType(e, 'sdk.result').length === 2, 'second result')
+
+  const turns = sentCalls(ctx.tracePath, 'turn/start')
+  assert.equal(turns.length, 2)
+  assert.equal(turns[0].model, 'gpt-5.5')
+  assert.equal(turns[0].effort, 'medium')
+  assert.equal(turns[1].model, 'gpt-5.6', 'the switch rides the next turn/start')
+  assert.equal(turns[1].effort, 'xhigh')
+  assert.equal(sentCalls(ctx.tracePath, 'thread/start').length, 1, 'the thread is not restarted')
+  // Assistant text after the switch is attributed to the new model.
+  const texts = ofType(ctx.events, 'sdk.assistant')
+  assert.equal(texts[texts.length - 1].payload.message.model, 'gpt-5.6')
+  await ctx.driver.shutdownStop()
+})
+
 test('a large prompt is delivered, not misread as a write failure', async () => {
   // stream.write() returns false once the queued bytes exceed the pipe's 64KB
   // high-water mark. That is BACKPRESSURE — the chunk is buffered and flushed

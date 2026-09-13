@@ -9,6 +9,7 @@ import {
   resolveCommand,
   shellContext,
   supportsCommandDriver,
+  supportsModelSwitchDriver,
 } from '../session-control.mjs'
 
 test('command names stay structured and prompts keep the slash first', () => {
@@ -41,6 +42,12 @@ test('command support follows driver capabilities, not a harness name', () => {
   assert.equal(supportsCommandDriver(futureOpenCodeDriver), true)
   assert.equal(supportsCommandDriver({ harness: 'claude', listCommands() {} }), false)
   assert.equal(supportsCommandDriver({ harness: 'pi' }), false)
+})
+
+test('model switching follows driver capabilities too (#1552)', () => {
+  assert.equal(supportsModelSwitchDriver({ harness: 'codex', setModel() {} }), true)
+  assert.equal(supportsModelSwitchDriver({ harness: 'pi' }), false, 'pi binds its model at session start')
+  assert.equal(supportsModelSwitchDriver(null), false)
 })
 
 test('shell execution combines output and returns non-zero exits as data', async () => {

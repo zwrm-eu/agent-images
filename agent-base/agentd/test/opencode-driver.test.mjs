@@ -138,6 +138,30 @@ test('a successful turn emits text, exactly one result with cumulative cost, and
   }
 })
 
+test('setModel re-points the NEXT prompt_async on the same server-side session (#1552)', async () => {
+  const fake = await startFakeOpenCode()
+  try {
+    const { s, driver, events, spec } = await build(fake)
+    driver.start()
+    driver.queueMessage('first')
+    await until(events, () => fake.state.prompts.length === 1, 'first prompt')
+    const sid = s.sdkSessionId
+    fake.emit('session.idle', { sessionID: sid })
+    await until(events, () => s.state === 'idle', 'idle')
+
+    await driver.setModel({ model: 'big-model' })
+    assert.equal(spec.model, 'big-model', 'the driver owns the spec mutation')
+    driver.queueMessage('second')
+    await until(events, () => fake.state.prompts.length === 2, 'second prompt')
+    assert.deepEqual(fake.state.prompts[0].model, { providerID: 'zwrm', modelID: 'qwen-235b' })
+    assert.deepEqual(fake.state.prompts[1].model, { providerID: 'zwrm', modelID: 'big-model' })
+    assert.equal(s.sdkSessionId, sid, 'the opencode session is reused, not recreated')
+    fake.assertNoViolations(assert)
+  } finally {
+    await fake.close()
+  }
+})
+
 test('tool parts render as one tool_use / tool_result pair, foreign sessions are ignored', async () => {
   const fake = await startFakeOpenCode()
   try {

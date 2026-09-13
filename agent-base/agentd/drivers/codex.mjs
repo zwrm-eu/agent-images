@@ -1043,6 +1043,20 @@ export async function createCodexDriver(s, spec, h) {
       mode = newMode
     },
 
+    // Persistent model switch (#1552): model and effort ride every turn/start
+    // from the spec, so the switch is a spec mutation that lands on the next
+    // turn. A message delivered by turn/steer carries neither; the daemon
+    // only calls this between turns, so the next message opens a turn/start.
+    // Effort is clamped per model control-plane side (ClampCodexEffort); the
+    // app-server validates nothing locally.
+    async setModel({ model, effort }) {
+      if (model) {
+        spec.model = model
+        currentModel = model
+      }
+      if (effort) spec.effort = effort
+    },
+
     beginEnd() {
       closed = true
       if (!turnActive) chain(finish)

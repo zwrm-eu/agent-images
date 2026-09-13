@@ -69,6 +69,14 @@ export function supportsCommandDriver(driver) {
     typeof driver.invokeCommand === 'function')
 }
 
+// Model switching (#1552) is likewise a driver capability: a driver that can
+// re-point a live session at another model between turns exposes setModel.
+// pi does not — its model is bound at createAgentSession — so the shared
+// route 400s for it instead of silently keeping the old model.
+export function supportsModelSwitchDriver(driver) {
+  return Boolean(driver && typeof driver.setModel === 'function')
+}
+
 // Keep the slash command first in the prompt for drivers whose command syntax
 // requires a leading invocation. Pending operator-shell context follows it so
 // it is visible to the resulting model turn.

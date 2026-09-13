@@ -128,6 +128,24 @@ test('the gateway-token refresh endpoint covers every credential sink (#1363)', 
   assert.match(src, /s\.spec\.mcp_servers/)
 })
 
+test('the model-switch endpoint ships with its cap and applies only between turns (#1552)', async () => {
+  // Source-text pin (handleModel needs a booted daemon to exercise; the
+  // per-driver setModel is covered by the codex/opencode driver tests): the
+  // CP gates the switch on the 'model-switch' cap, so the cap and the route
+  // must ship together; the handler must dispatch by driver capability (pi
+  // has no setModel) and refuse while a turn is live, since claude's
+  // setModel is a turn-boundary call and codex/opencode read the spec when
+  // they OPEN a turn.
+  const src = await readFile(SERVER, 'utf8')
+  const capsLine = src.split('\n').find((l) => l.trimStart().startsWith('caps:'))
+  assert.ok(capsLine.includes("'model-switch'"), 'the model-switch cap must be advertised')
+  assert.match(src, /action === 'model' && parts\.length === 4/, 'the model route must be dispatched')
+  const handler = src.slice(src.indexOf('async function handleModel('), src.indexOf('async function handleMode('))
+  assert.match(handler, /supportsModelSwitchDriver\(s\.driver\)/, 'the switch must ask the driver, not a harness allowlist')
+  assert.match(handler, /s\.state !== 'idle' \|\| s\.controlBusy/, 'the switch must refuse while a turn or control call is live')
+  assert.match(handler, /s\.pusher\.emit\('session\.model_changed'/, 'the switch must be recorded durably')
+})
+
 test('an approval that answers no question is refused before the decision is recorded (#1559)', async () => {
   // Source-text pin (handlePermission needs a booted daemon to exercise; the
   // predicate itself is unit-tested in questions.test.mjs): the guard must
