@@ -27,6 +27,17 @@ import { SUPPORTED_PERMISSION_MODES as CODEX_MODES } from '../drivers/codex.mjs'
 const SERVER = join(dirname(fileURLToPath(import.meta.url)), '..', 'server.mjs')
 const CLAUDE_DRIVER = join(dirname(fileURLToPath(import.meta.url)), '..', 'drivers', 'claude.mjs')
 
+// handlerBody returns the source of one top-level `async function <name>(`
+// in server.mjs, up to the next top-level function, for the source-text pins
+// below (the handlers need a booted daemon to exercise). Fails loudly on an
+// unknown name rather than slicing to end-of-file.
+function handlerBody(src, name) {
+  const start = src.indexOf(`\nasync function ${name}(`)
+  assert.notEqual(start, -1, `server.mjs has no async function ${name}`)
+  const next = src.slice(start + 1).search(/\n(async )?function \w+\(/)
+  return next === -1 ? src.slice(start) : src.slice(start, start + 1 + next)
+}
+
 test('the registry hosts the harnesses this build is known for', () => {
   // Sanity anchor: deriving everything from DRIVERS is only safe if DRIVERS
   // itself still names the harnesses the platform routes.
@@ -140,10 +151,37 @@ test('the model-switch endpoint ships with its cap and applies only between turn
   const capsLine = src.split('\n').find((l) => l.trimStart().startsWith('caps:'))
   assert.ok(capsLine.includes("'model-switch'"), 'the model-switch cap must be advertised')
   assert.match(src, /action === 'model' && parts\.length === 4/, 'the model route must be dispatched')
-  const handler = src.slice(src.indexOf('async function handleModel('), src.indexOf('async function handleMode('))
+  const handler = handlerBody(src, 'handleModel')
   assert.match(handler, /supportsModelSwitchDriver\(s\.driver\)/, 'the switch must ask the driver, not a harness allowlist')
-  assert.match(handler, /s\.state !== 'idle' \|\| s\.controlBusy/, 'the switch must refuse while a turn or control call is live')
   assert.match(handler, /s\.pusher\.emit\('session\.model_changed'/, 'the switch must be recorded durably')
+})
+
+test('control routes share one between-turns gate and reservation; mode stays outside it (#1565)', async () => {
+  // Source-text pin: the gate used to be three hand-rolled copies with three
+  // error strings, and the reservation three hand-rolled set/clear pairs. A
+  // route that gates itself by hand again is how the copies drifted.
+  const src = await readFile(SERVER, 'utf8')
+  for (const [name, verb] of [
+    ['handleCommand', 'invoking a command'],
+    ['handleShell', 'running a shell command'],
+    ['handleModel', 'switching the model'],
+  ]) {
+    const handler = handlerBody(src, name)
+    assert.match(handler, new RegExp(`requireIdle\\(s, '${verb}'\\)`), `${name} must gate through requireIdle`)
+    assert.match(handler, /withControl\(s, '/, `${name} must reserve through withControl`)
+    assert.doesNotMatch(handler, /s\.controlBusy/, `${name} must not touch the reservation by hand`)
+    assert.doesNotMatch(handler, /s\.state !== 'idle'|isDone\(s\)/, `${name} must not re-implement the idle or finished check`)
+  }
+  // The command turn's reservation outlives the request (the driver releases
+  // it at the turn's end); dropping the hold would admit steering messages
+  // into a command turn.
+  assert.match(handlerBody(src, 'handleCommand'), /\{ hold: true \}/, 'handleCommand must hold the reservation for the turn')
+  // Messages refuse on a control call but may steer a live turn.
+  const message = handlerBody(src, 'handleMessage')
+  assert.match(message, /requireNotBusy\(s\)/, 'handleMessage must gate through requireNotBusy')
+  assert.doesNotMatch(message, /requireIdle|s\.controlBusy/, 'handleMessage must not gate on idle or by hand')
+  // The deliberate exception, reasoned on handleMode itself.
+  assert.doesNotMatch(handlerBody(src, 'handleMode'), /requireIdle|requireNotBusy|withControl|controlBusy/, 'handleMode must stay outside the gate')
 })
 
 test('an approval that answers no question is refused before the decision is recorded (#1559)', async () => {
@@ -153,7 +191,7 @@ test('an approval that answers no question is refused before the decision is rec
   // the permission.decision event emitted, or the timeline would show
   // "allowed" for a question every driver then refuses.
   const src = await readFile(SERVER, 'utf8')
-  const handler = src.slice(src.indexOf('async function handlePermission('), src.indexOf('async function handleParkResolve('))
+  const handler = handlerBody(src, 'handlePermission')
   const guard = handler.indexOf("body.behavior === 'allow' && p.kind === 'question' && !answeredQuestions(p.input, body.updated_input?.answers)")
   const del = handler.indexOf('s.pending.delete(requestId)')
   const emit = handler.indexOf("s.pusher.emit('permission.decision'")

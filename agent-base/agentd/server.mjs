@@ -46,9 +46,12 @@ import {
   executeShellCommand,
   MAX_SHELL_OUTPUT_BYTES,
   normalizeCommandName,
+  requireIdle,
+  requireNotBusy,
   shellContext,
   supportsCommandDriver,
   supportsModelSwitchDriver,
+  withControl,
 } from './session-control.mjs'
 
 const DEFAULT_PORT = 9924
@@ -1078,9 +1081,7 @@ async function handleMessage(req, res, s) {
   } catch (err) {
     throw badRequest(err.message)
   }
-  if (s.controlBusy) {
-    return send(res, 409, { error: `session is busy with a ${s.controlBusy} request`, state: s.state })
-  }
+  requireNotBusy(s)
   const pendingCount = s.pendingContexts.length
   const prompt = pendingCount > 0
     ? `${prepared.prompt}\n\n${s.pendingContexts.slice(0, pendingCount).join('\n\n')}`
@@ -1119,43 +1120,35 @@ async function handleCommand(req, res, s) {
   if (body.model != null && typeof body.model !== 'string') {
     throw badRequest('model must be a string')
   }
-  if (s.state !== 'idle' || s.controlBusy) {
-    return send(res, 409, { error: 'session must be idle before invoking a command', state: s.state })
-  }
+  const model = body.model?.trim() || ''
+  requireIdle(s, 'invoking a command')
   if (!supportsCommandDriver(s.driver)) {
     throw badRequest(`commands are not supported by the ${s.harness} harness`)
   }
 
-  // Reserve the turn before the first await. Node may serve another request
-  // while supportedCommands/setModel is in flight; without this flag a
-  // message could enter between validation and the command prompt.
-  s.controlBusy = 'command'
+  // The reservation outlives this request: a command is a whole turn, and
+  // the driver releases it when that turn ends (hold). A driver that does
+  // not take the prompt returns null, which withControl releases.
   const pendingCount = s.pendingContexts.length
-  try {
-    const queued = await s.driver.invokeCommand({
-      command,
-      arguments: body.arguments || '',
-      model: body.model?.trim() || '',
-      pendingContext: s.pendingContexts.slice(0, pendingCount),
-    })
-    if (!queued) {
-      s.controlBusy = null
-      return send(res, 409, { error: 'session is not accepting commands', state: s.state })
-    }
-    if (pendingCount > 0) s.pendingContexts.splice(0, pendingCount)
-    emitUserMessage(s, {
-      text: queued.visible,
-      attachments: [],
-      source: 'command',
-      command,
-      arguments: body.arguments || '',
-      ...(body.model?.trim() ? { model: body.model.trim() } : {}),
-    })
-    send(res, 202, { queued: true })
-  } catch (err) {
-    s.controlBusy = null
-    throw err
+  const queued = await withControl(s, 'command', () => s.driver.invokeCommand({
+    command,
+    arguments: body.arguments || '',
+    model,
+    pendingContext: s.pendingContexts.slice(0, pendingCount),
+  }), { hold: true })
+  if (!queued) {
+    return send(res, 409, { error: 'session is not accepting commands', state: s.state })
   }
+  if (pendingCount > 0) s.pendingContexts.splice(0, pendingCount)
+  emitUserMessage(s, {
+    text: queued.visible,
+    attachments: [],
+    source: 'command',
+    command,
+    arguments: body.arguments || '',
+    ...(model ? { model } : {}),
+  })
+  send(res, 202, { queued: true })
 }
 
 async function handleShell(req, res, s) {
@@ -1166,9 +1159,7 @@ async function handleShell(req, res, s) {
   if (body.command.includes('\0')) throw badRequest('command contains a NUL byte')
   // Deliberate policy for #1429: never interleave an operator subprocess with
   // a live model turn (or another control call). Clients retry once idle.
-  if (s.state !== 'idle' || s.controlBusy) {
-    return send(res, 409, { error: 'session must be idle before running a shell command', state: s.state })
-  }
+  requireIdle(s, 'running a shell command')
   // Shell output waits for the next real turn. Bound that deferred prompt so
   // repeated automation cannot build an unbounded in-memory/model input while
   // the session stays idle. Existing durable events remain readable; the
@@ -1178,23 +1169,21 @@ async function handleShell(req, res, s) {
     return send(res, 409, { error: 'send a session turn before adding more shell context', state: s.state })
   }
 
-  s.controlBusy = 'shell'
-  try {
-    const result = await executeShellCommand(body.command, {
-      cwd: s.spec.cwd || process.env.HOME || '/home/agent',
-      env: { ...process.env, ...(s.spec.env || {}) },
-    })
-    await syncToDisk()
-    const context = shellContext(result)
-    s.pendingContexts.push(context.prompt)
-    // Explicit null keeps this operator action outside canonical model turns.
-    // It is durable (no ephemeral flag), and the next admitted turn consumes
-    // the marked prompt rendering above.
-    s.pusher.emit('message.context', context.event, { turnId: null })
-    send(res, 200, result)
-  } finally {
-    s.controlBusy = null
-  }
+  // Reserved for the subprocess only. The context is queued synchronously
+  // on release, so the next admitted turn — even one that enters during the
+  // disk sync below — carries it; the sync still precedes the 200.
+  const result = await withControl(s, 'shell', () => executeShellCommand(body.command, {
+    cwd: s.spec.cwd || process.env.HOME || '/home/agent',
+    env: { ...process.env, ...(s.spec.env || {}) },
+  }))
+  const context = shellContext(result)
+  s.pendingContexts.push(context.prompt)
+  // Explicit null keeps this operator action outside canonical model turns.
+  // It is durable (no ephemeral flag), and the next admitted turn consumes
+  // the marked prompt rendering above.
+  s.pusher.emit('message.context', context.event, { turnId: null })
+  await syncToDisk()
+  send(res, 200, result)
 }
 
 function emitUserMessage(s, message) {
@@ -1269,26 +1258,18 @@ async function handleModel(req, res, s) {
   const model = (body.model ?? '').trim()
   const effort = (body.effort ?? '').trim()
   if (!model && !effort) throw badRequest('missing model or effort')
-  if (isDone(s)) return send(res, 409, { error: 'session is finished', state: s.state })
-  if (s.state !== 'idle' || s.controlBusy) {
-    return send(res, 409, { error: 'session must be idle before switching the model', state: s.state })
-  }
+  requireIdle(s, 'switching the model')
   if (!supportsModelSwitchDriver(s.driver)) {
     throw badRequest(`model switching is not supported by the ${s.harness} harness`)
   }
   const previous = { model: s.spec.model || '', effort: s.spec.effort || '' }
   const next = { model: model || previous.model, effort: effort || previous.effort }
-  // Reserve the session across the driver's await: a message entering while
-  // claude's setModel is in flight would open a turn on an undefined model.
-  // The driver gets only what the caller changed (empty = keep) and owns the
+  // Reserved across the driver's await: a message entering while claude's
+  // setModel is in flight would open a turn on an undefined model. The
+  // driver gets only what the caller changed (empty = keep) and owns the
   // spec mutation — it is what reads spec.model on the next turn — so a
   // driver that accepts the call has applied it.
-  s.controlBusy = 'model'
-  try {
-    await s.driver.setModel({ model, effort })
-  } finally {
-    s.controlBusy = null
-  }
+  await withControl(s, 'model', () => s.driver.setModel({ model, effort }))
   log(`session ${s.id}: model ${previous.model || '(default)'} -> ${next.model || '(default)'}, effort ${previous.effort || '(default)'} -> ${next.effort || '(default)'}`)
   s.pusher.emit('session.model_changed', {
     model: next.model,
@@ -1299,6 +1280,11 @@ async function handleModel(req, res, s) {
   send(res, 200, next)
 }
 
+// Deliberately outside the between-turns gate (requireIdle/withControl): a
+// mode change is how a user unblocks a turn waiting on a permission — and a
+// command turn holds the control reservation until it ends, so gating here
+// would lock Ask/Bypass for the length of every /command. Every driver's
+// setPermissionMode covers the in-flight turn. The dispatch test pins this.
 async function handleMode(req, res, s) {
   const body = await readBody(req)
   if (!PERMISSION_MODES.has(body.mode)) throw badRequest(`invalid mode ${body.mode}`)
@@ -1501,7 +1487,7 @@ const server = createServer(async (req, res) => {
     }
     send(res, 404, { error: 'not found' })
   } catch (err) {
-    if (err?.status) return send(res, err.status, { error: err.message })
+    if (err?.status) return send(res, err.status, { error: err.message, ...(err.fields || {}) })
     log('request failed:', err?.stack || err)
     if (!res.headersSent) send(res, 500, { error: 'internal error' })
   }
