@@ -549,8 +549,12 @@ export function createClaudeDriver(s, spec, h) {
       let previousModel
       let restoreModel = false
       if (model) {
+        // The restore target is the session's durable model first (#1552:
+        // spec.model follows a persistent switch); the SDK's live model is
+        // the fallback for a session on the CLI default, where an undefined
+        // restore correctly resets to that default.
         const usage = await q.getContextUsage()
-        previousModel = usage?.model || undefined
+        previousModel = spec.model || usage?.model || undefined
         await q.setModel(model)
         restoreModel = true
       }
@@ -596,6 +600,26 @@ export function createClaudeDriver(s, spec, h) {
 
     async setPermissionMode(mode) {
       await q.setPermissionMode(mode)
+    },
+
+    // Persistent model switch (#1552): the SDK query runs in streaming-input
+    // mode, so setModel is legal at any turn boundary and leaves the
+    // transcript intact — the same call /command uses for its override,
+    // minus the restore. Effort is refused: it rides extraArgs at query()
+    // construction and the SDK has no setter, so honouring it would mean a
+    // new query resuming the same session (the CP refuses it first; this is
+    // the VM-side guarantee). Empty = keep. The daemon calls this only while
+    // idle and outside a command turn, so no restore is pending to undo.
+    async setModel({ model, effort }) {
+      if (effort) {
+        const e = new Error("the claude harness fixes the reasoning effort for the session's lifetime")
+        e.status = 400
+        throw e
+      }
+      if (model) {
+        await q.setModel(model)
+        spec.model = model
+      }
     },
 
     // Graceful end: the current turn finishes (an abrupt stop is what
