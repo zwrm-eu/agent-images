@@ -280,8 +280,15 @@ export async function createOpenCodeDriver(s, spec, h) {
   // boundary — result, failure, or interrupt — mirroring claude's
   // finishCommandTurn. No model restore is needed here: opencode's model
   // override is per-call, never session state.
+  // Only a command turn THIS driver opened (#1565), like claude's
+  // commandTurn: releaseControl runs on every abort, so without the flag an
+  // /interrupt during the operator shell re-opened message admission under
+  // the subprocess, and one landing while invokeCommand was still listing
+  // commands released the reservation the turn about to open relied on.
+  let commandTurnHeld = false
   function releaseControl() {
-    if (s.controlBusy) s.controlBusy = null
+    if (commandTurnHeld && s.controlBusy === 'command') s.controlBusy = null
+    commandTurnHeld = false
   }
 
   async function emitResult(subtype, snap) {
@@ -837,6 +844,7 @@ export async function createOpenCodeDriver(s, spec, h) {
         throw e
       }
       if (closed || finished) return null
+      commandTurnHeld = true
       h.setState(s, 'working')
       const myGen = abortGen
       lastPromptGen = myGen

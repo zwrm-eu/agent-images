@@ -6,10 +6,13 @@ import {
   executeShellCommand,
   normalizeCommandList,
   normalizeCommandName,
+  requireIdle,
+  requireNotBusy,
   resolveCommand,
   shellContext,
   supportsCommandDriver,
   supportsModelSwitchDriver,
+  withControl,
 } from '../session-control.mjs'
 
 test('command names stay structured and prompts keep the slash first', () => {
@@ -42,6 +45,54 @@ test('command support follows driver capabilities, not a harness name', () => {
   assert.equal(supportsCommandDriver(futureOpenCodeDriver), true)
   assert.equal(supportsCommandDriver({ harness: 'claude', listCommands() {} }), false)
   assert.equal(supportsCommandDriver({ harness: 'pi' }), false)
+})
+
+test('the gates throw 409s carrying the state: finished, busy, or not idle by verb (#1565)', () => {
+  const is409 = (message, state) => (err) => err.status === 409 && err.message === message && err.fields.state === state
+  assert.doesNotThrow(() => requireIdle({ state: 'idle', controlBusy: null }, 'switching the model'))
+  assert.throws(() => requireIdle({ state: 'working', controlBusy: null }, 'invoking a command'),
+    is409('session must be idle before invoking a command', 'working'))
+  assert.throws(() => requireIdle({ state: 'idle', controlBusy: 'shell' }, 'switching the model'),
+    is409('session must be idle before switching the model', 'idle'))
+  // A finished session is named as such: "must be idle" would send a
+  // retry-until-idle client into a loop that never ends.
+  assert.throws(() => requireIdle({ state: 'ended', controlBusy: null }, 'invoking a command'), is409('session is finished', 'ended'))
+  // Messages may steer a live turn; only a control call refuses them.
+  assert.doesNotThrow(() => requireNotBusy({ state: 'working', controlBusy: null }))
+  assert.throws(() => requireNotBusy({ state: 'idle', controlBusy: 'model' }), is409('session is busy with a model request', 'idle'))
+})
+
+test('withControl reserves before the first await and releases unless a held call took the turn (#1565)', async () => {
+  const s = { state: 'idle', controlBusy: null }
+  const pending = withControl(s, 'shell', async () => {
+    await new Promise((r) => setTimeout(r, 1))
+    return 'done'
+  })
+  assert.equal(s.controlBusy, 'shell', 'taken synchronously, before the caller\'s first await')
+  assert.equal(await pending, 'done')
+  assert.equal(s.controlBusy, null)
+
+  // Releases only its own reservation: one another route took meanwhile
+  // (a held command turn admitted after an interrupt) is not clobbered.
+  const taken = withControl(s, 'shell', async () => {
+    await new Promise((r) => setTimeout(r, 1))
+    s.controlBusy = 'command'
+  })
+  await taken
+  assert.equal(s.controlBusy, 'command', 'a reservation taken by another route survives our release')
+  s.controlBusy = null
+
+  await assert.rejects(withControl(s, 'model', async () => { throw new Error('driver refused') }), /driver refused/)
+  assert.equal(s.controlBusy, null, 'a throwing driver releases the reservation')
+
+  // The command turn keeps its reservation until the driver ends the turn.
+  assert.deepEqual(await withControl(s, 'command', async () => ({ queued: true }), { hold: true }), { queued: true })
+  assert.equal(s.controlBusy, 'command', 'a held success keeps the reservation for the driver to release')
+  s.controlBusy = null
+  assert.equal(await withControl(s, 'command', async () => null, { hold: true }), null)
+  assert.equal(s.controlBusy, null, 'a driver that did not take the turn holds nothing')
+  await assert.rejects(withControl(s, 'command', async () => { throw new Error('no such command') }, { hold: true }), /no such command/)
+  assert.equal(s.controlBusy, null, 'a failed command releases even with hold')
 })
 
 test('model switching follows driver capabilities too (#1552)', () => {

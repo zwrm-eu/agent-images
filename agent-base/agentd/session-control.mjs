@@ -69,6 +69,57 @@ export function supportsCommandDriver(driver) {
     typeof driver.invokeCommand === 'function')
 }
 
+// The control-call reservation (#1429, #1565). `s.controlBusy` names the
+// control call that holds the session: a command turn (held until the
+// driver ends the turn), the operator shell, or a model switch. Messages
+// refuse on it (requireNotBusy) but may steer a live turn; commands, the
+// shell, and the model switch refuse on it AND on a live turn (requireIdle).
+// Mode changes stay outside both on purpose — see handleMode in server.mjs.
+// `fields` (not `body`: the opencode client's HTTP error already uses that
+// name for the raw upstream text) is spread into the rendered 409.
+function conflict(message, s) {
+  const e = new Error(message)
+  e.status = 409
+  e.fields = { state: s.state }
+  return e
+}
+
+// requireNotBusy throws a 409 while a control call holds the session.
+export function requireNotBusy(s) {
+  if (s.controlBusy) throw conflict(`session is busy with a ${s.controlBusy} request`, s)
+}
+
+// requireIdle is the between-turns gate: a finished session is named as
+// such (a client retrying until idle would otherwise wait forever), a live
+// turn or control call is refused with the verb, which names the route so
+// clients keep their strings.
+export function requireIdle(s, verb) {
+  if (s.state === 'ended' || s.state === 'error') throw conflict('session is finished', s)
+  if (s.state !== 'idle' || s.controlBusy) throw conflict(`session must be idle before ${verb}`, s)
+}
+
+// Runs fn with the session reserved as `kind`. The reservation is taken
+// synchronously, before fn's first await: Node may serve another request
+// while a driver call is in flight, and every gate above refuses on it, so
+// nothing can enter between the gate and the driver. Released when fn
+// settles — only if still ours, so a reservation another route took in the
+// meantime is never clobbered — except a `hold` call whose fn resolved to
+// a truthy value: the command turn, whose driver releases it when the turn
+// ends (claude finishCommandTurn, opencode releaseControl). A falsy result
+// means the driver did not take the turn, so nothing holds it.
+export async function withControl(s, kind, fn, { hold = false } = {}) {
+  s.controlBusy = kind
+  const release = () => { if (s.controlBusy === kind) s.controlBusy = null }
+  try {
+    const out = await fn()
+    if (!hold || !out) release()
+    return out
+  } catch (err) {
+    release()
+    throw err
+  }
+}
+
 // Model switching (#1552) is likewise a driver capability: a driver that can
 // re-point a live session at another model between turns exposes setModel.
 // pi does not — its model is bound at createAgentSession — so the shared
