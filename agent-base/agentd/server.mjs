@@ -41,6 +41,7 @@ import { TurnEventContext } from './turn-events.mjs'
 import { permissionDecisionPayload } from './event-payloads.mjs'
 import { ChangedFileTracker } from './changed-files.mjs'
 import { prepareMessage } from './message-context.mjs'
+import { MessageReceipts } from './message-receipts.mjs'
 import { searchWorkspaceFiles } from './file-search.mjs'
 import {
   executeShellCommand,
@@ -78,6 +79,8 @@ const PERMISSION_MODES = new Set(['default', 'acceptEdits', 'plan', 'bypassPermi
 // Longer waits belong to ending the turn with a handoff + a follow-up run
 // (see the tool descriptions and the run preamble).
 const MAX_SLEEP_SECONDS = 6 * 3600
+
+let messageReceipts = null
 
 const VERSION = (() => {
   try {
@@ -345,6 +348,15 @@ function setState(s, state, extra = {}) {
   // one ID. A same-state working call with no active ID is a new turn racing
   // an interrupt; it must still open a boundary.
   if (state === 'working' && !s.pusher.turns.activeTurnId) s.pusher.beginTurn(s.harness)
+  if (state === 'idle' && s.pusher.turns.activeTurnId && !s.pusher.isTurnDraining() && s.lastResult) {
+    // Only a drained model result proves the queued inputs were handled.
+    // Receipt failure leaves recovery conservative; never claim completion.
+    try {
+      for (const id of messageReceipts?.complete(s.id) || []) {
+        s.pusher.emit('message.completed', { message_id: id })
+      }
+    } catch (err) { log(`message receipt completion failed: ${err.message}`) }
+  }
   if (state === 'idle' && s.pusher.turns.activeTurnId) s.pusher.completeTurn('completed')
   if (s.state === state) return
   s.state = state
@@ -1081,19 +1093,33 @@ async function handleMessage(req, res, s) {
   } catch (err) {
     throw badRequest(err.message)
   }
+  if (body.message_id !== undefined && await seedState() !== 'clear') return send(res, 503, { error: 'home_seeding' })
   requireNotBusy(s)
   const pendingCount = s.pendingContexts.length
   const prompt = pendingCount > 0
     ? `${prepared.prompt}\n\n${s.pendingContexts.slice(0, pendingCount).join('\n\n')}`
     : prepared.prompt
-  if (isDone(s) || !s.driver.queueMessage(prompt)) {
+  if (isDone(s)) return send(res, 409, { error: 'session is not accepting messages', state: s.state })
+  let receipt = null
+  if (body.message_id !== undefined) {
+    // Receipts live on the persistent home volume. During initial seeding
+    // leave ownership with the CP, which retries the same delivery ID.
+    messageReceipts ||= new MessageReceipts(pathResolve(process.env.HOME, '.zwrm', 'message-receipts'))
+    receipt = messageReceipts.accept(body.message_id, s.id,
+      { text: prepared.text, attachments: prepared.attachments }, () => s.driver.queueMessage(prompt))
+    if (receipt.duplicate) {
+      if (receipt.status === 'completed') s.pusher.emit('message.completed', { message_id: body.message_id })
+      return send(res, 202, receipt)
+    }
+  } else if (!s.driver.queueMessage(prompt)) {
     return send(res, 409, { error: 'session is not accepting messages', state: s.state })
   }
   if (pendingCount > 0) s.pendingContexts.splice(0, pendingCount)
-  const visibleMessage = { text: prepared.text, attachments: prepared.attachments }
+  const visibleMessage = { text: prepared.text, attachments: prepared.attachments,
+    ...(body.message_id ? { message_id: body.message_id } : {}) }
   if (s.state === 'starting') s.deferredMessages.push(visibleMessage)
   else emitUserMessage(s, visibleMessage)
-  send(res, 202, { queued: true })
+  send(res, 202, receipt || { queued: true })
 }
 
 async function handleCommands(res, s) {
@@ -1442,7 +1468,7 @@ const server = createServer(async (req, res) => {
         // without it, exactly as 'pi-gateway' guards pi's catalog (#1193).
         // 'commands' (#1429): harness-driver command discovery/invocation.
         // 'shell' (#1429): immediate operator shell with durable context.
-        caps: ['mcp', 'escalation', 'files', 'file-search', 'message-context', 'park', 'reclaim', 'skillfetch', 'pi-multiprovider', 'pi-gateway', 'opencode-gateway', 'background-tasks', 'tool-policy', 'token-refresh', 'commands', 'shell', 'model-switch', ...HARNESS_CAPS],
+        caps: ['mcp', 'escalation', 'files', 'file-search', 'message-context', 'message-receipts', 'park', 'reclaim', 'skillfetch', 'pi-multiprovider', 'pi-gateway', 'opencode-gateway', 'background-tasks', 'tool-policy', 'token-refresh', 'commands', 'shell', 'model-switch', ...HARNESS_CAPS],
         active_session: session && !isDone(session) ? session.id : null,
         state: session?.state ?? null,
         // Live background work (#1251): tasks the harness still tracks after
