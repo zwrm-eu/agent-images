@@ -13,8 +13,20 @@ import { applyTaskMessage, countBackgroundTasks } from './claude-tasks.mjs'
 import { createTodoTracker } from './todos.mjs'
 import { claudeQuestionDecision, claudeQuestionInput } from './questions.mjs'
 import { permissionDecisionPayload } from '../event-payloads.mjs'
-import { commandPrompt, normalizeCommandList, resolveCommand } from '../session-control.mjs'
+import { commandPrompt, normalizeCommandList, resolveCommand, pendingWithTimeout } from '../session-control.mjs'
 import { SLEEP_DESCRIPTION, SLEEP_UNTIL_DESCRIPTION, runSleep, runSleepUntil, mapOutcome } from './run-tools.mjs'
+
+// A compaction is one model call over the whole context (#1553); generous
+// so a long transcript on a slow model completes, bounded so a CLI that
+// never answers does not hold the session's reservation forever.
+const COMPACT_TIMEOUT_MS = 5 * 60_000
+// The CLI reports a compaction's end as a status message right after its
+// boundary; a boundary with no status behind it still counts after this.
+const COMPACT_STATUS_GRACE_MS = 2_000
+// How long a finished manual compaction waits for the CLI's result for the
+// local command, so it is consumed here rather than landing on the timeline
+// as a turn of its own (whether the CLI sends one is not promised).
+const COMPACT_RESULT_GRACE_MS = 5_000
 
 const CLOSED = Symbol('closed')
 
@@ -225,6 +237,16 @@ export function createClaudeDriver(s, spec, h) {
   // model via getContextUsage(), restore it at the result/interrupt boundary,
   // and only then release server.mjs's exclusive command admission flag.
   let commandTurn = null
+  // A manual compaction in flight (#1553): the CLI marks it with a
+  // compact_boundary (the counts) and a status message (success or the
+  // error), and may answer the local command with a result, which is
+  // consumed here rather than treated as a turn.
+  let pendingCompact = null
+  let compactInstructions = ''
+  let compactCounts = null
+  let compactGrace = null
+  let awaitingCompactResult = false
+  let compactResultSlot = null
 
   // Task-list ledger (#1424): TodoWrite calls become durable todo.updated
   // events once their tool_result confirms the list was actually adopted.
@@ -349,6 +371,15 @@ export function createClaudeDriver(s, spec, h) {
       const item = await inputQueue.next()
       if (item === CLOSED) return
       consumed++
+      // A control item (#1553: the compact command) is not a turn: the
+      // session stays idle, held by the daemon's reservation instead.
+      if (item.__control) {
+        const { __control, ...plain } = item
+        yield plain
+        continue
+      }
+      // A real prompt after a compaction owns every later result.
+      awaitingCompactResult = false
       // Consuming an input item means a turn is starting (or steering is
       // flowing into a running one — setState no-ops then). This is the
       // working-side half of the status derivation (#913): it heals the
@@ -385,6 +416,74 @@ export function createClaudeDriver(s, spec, h) {
     }
   }
 
+  function compactedPayload(msg) {
+    const meta = msg.compact_metadata || {}
+    return {
+      ...(Number.isFinite(meta.pre_tokens) ? { pre_tokens: meta.pre_tokens } : {}),
+      ...(Number.isFinite(meta.post_tokens) ? { post_tokens: meta.post_tokens } : {}),
+    }
+  }
+
+  // The CLI marks every compaction with a compact_boundary system message,
+  // manual and automatic alike, and closes a manual one with a status
+  // message (compact_result success/failed). A manual one someone asked for
+  // is recorded when it succeeds, outside any turn, with the instructions
+  // it ran with; any other boundary is the harness compacting on its own and
+  // is recorded as such, so the timeline is honest about where context moved.
+  function onCompactBoundary(msg) {
+    const trigger = msg.compact_metadata?.trigger === 'manual' ? 'manual' : 'auto'
+    if (pendingCompact && trigger === 'manual') {
+      compactCounts = compactedPayload(msg)
+      // The status message normally follows at once; a CLI that sends none
+      // still compacted.
+      clearTimeout(compactGrace)
+      compactGrace = setTimeout(() => finishCompact('success'), COMPACT_STATUS_GRACE_MS)
+      compactGrace.unref?.()
+      return
+    }
+    s.pusher.emit('context.compacted', { trigger, ...compactedPayload(msg) })
+  }
+
+  function onCompactStatus(msg) {
+    if (!pendingCompact || !msg.compact_result) return
+    finishCompact(msg.compact_result, msg.compact_error)
+  }
+
+  function finishCompact(result, error) {
+    clearTimeout(compactGrace)
+    compactGrace = null
+    const waiting = pendingCompact
+    if (!waiting) return
+    pendingCompact = null
+    if (result !== 'success') {
+      const e = new Error(`the harness did not compact${error ? `: ${String(error).slice(0, 300)}` : ''}`)
+      e.status = 409
+      waiting.reject(e)
+      return
+    }
+    const payload = {
+      trigger: 'manual',
+      ...(compactInstructions ? { instructions: compactInstructions } : {}),
+      ...(compactCounts || {}),
+    }
+    compactCounts = null
+    // Explicit null: a compaction is not a turn (the daemon syncs before
+    // answering).
+    s.pusher.emit('context.compacted', payload, { turnId: null })
+    waiting.resolve(payload)
+  }
+
+  function rejectPendingCompact(message, status = 502) {
+    if (!pendingCompact) return
+    clearTimeout(compactGrace)
+    compactGrace = null
+    const waiting = pendingCompact
+    pendingCompact = null
+    const e = new Error(message)
+    e.status = status
+    waiting.reject(e)
+  }
+
   function queueMessage(text) {
     if (inputQueue.closed) return false
     inputQueue.push({
@@ -408,6 +507,8 @@ export function createClaudeDriver(s, spec, h) {
             if (msg.subtype === 'commands_changed') {
               latestCommands = normalizeCommandList(msg.commands)
             }
+            if (msg.subtype === 'compact_boundary') onCompactBoundary(msg)
+            if (msg.subtype === 'status') onCompactStatus(msg)
             // Background-task ledger (#1251). A settle that drains the ledger
             // while the session is already idle is re-announced: the CP
             // deferred run completion on the earlier idle status (it carried a
@@ -433,6 +534,19 @@ export function createClaudeDriver(s, spec, h) {
             todoTracker.onToolResult(msg)
             break
           case 'result': {
+            // The CLI's answer to the compact command (#1553): not a turn.
+            // Before any boundary it means nothing was compacted; after one
+            // it is consumed so it never lands on the timeline as a turn.
+            if (awaitingCompactResult) {
+              awaitingCompactResult = false
+              if (pendingCompact) {
+                const text = typeof msg.result === 'string' && msg.result.trim() ? msg.result.trim().slice(0, 300) : ''
+                rejectPendingCompact(text ? `the harness did not compact: ${text}` : 'the harness did not compact', 409)
+              }
+              compactResultSlot?.resolve(msg)
+              await h.syncToDisk()
+              break
+            }
             s.lastResult = {
               subtype: msg.subtype,
               duration_ms: msg.duration_ms,
@@ -503,12 +617,14 @@ export function createClaudeDriver(s, spec, h) {
       // moment the state is terminal it may drain and exit — the state set and
       // the terminal emit must stay adjacent so isDone always implies the
       // terminal event is queued.
+      rejectPendingCompact('session ended', 409)
       await h.syncToDisk()
       s.state = 'ended'
       s.backgroundTasks.clear() // the SDK process is winding down; its tasks die with it
       s.pusher.emit('session.ended', { sdk_session_id: s.sdkSessionId, last_result: s.lastResult })
     } catch (err) {
       h.log(`session ${s.id} failed: ${err?.stack || err}`)
+      rejectPendingCompact('session failed', 502)
       await finishCommandTurn()
       const c = classifyRunError(err)
       // Best-effort even on the error path: the CP may still tear the VM down,
@@ -571,6 +687,7 @@ export function createClaudeDriver(s, spec, h) {
     },
 
     async interrupt() {
+      rejectPendingCompact('compaction interrupted', 409)
       // Parks are canceled by handleInterrupt (shared machinery) before the
       // driver is invoked — no park may be pending here.
       // Snapshot before the awaits: a message consumed during the interrupt
@@ -622,16 +739,57 @@ export function createClaudeDriver(s, spec, h) {
       }
     },
 
+    // Manual compaction (#1553): the CLI's own /compact, queued as a user
+    // message (the SDK has no compact control verb), completes with a
+    // compact_boundary. Whether a result follows the local command in
+    // stream-json mode is not something the SDK types promise, so the state
+    // is settled here either way: a result flips idle on its own; without
+    // one, idle is restored after a short grace unless new input arrived.
+    async compact({ instructions } = {}) {
+      // The daemon's reservation keeps a second call out; this is the
+      // driver's own invariant, not a route.
+      if (pendingCompact) throw Object.assign(new Error('a compaction is already in flight'), { status: 409 })
+      const slot = pendingWithTimeout(COMPACT_TIMEOUT_MS, 'compaction timed out')
+      pendingCompact = slot
+      compactInstructions = instructions || ''
+      compactCounts = null
+      if (inputQueue.closed) {
+        rejectPendingCompact('session is not accepting input', 409)
+      } else {
+        // A control item: consumed without the working flip a prompt gets.
+        awaitingCompactResult = true
+        inputQueue.push({
+          __control: true,
+          type: 'user',
+          message: { role: 'user', content: [{ type: 'text', text: `/compact${instructions ? ` ${instructions}` : ''}` }] },
+          parent_tool_use_id: null,
+          session_id: s.sdkSessionId || '',
+        })
+      }
+      const payload = await slot.promise
+      if (awaitingCompactResult) {
+        const resultSlot = pendingWithTimeout(COMPACT_RESULT_GRACE_MS, 'no result')
+        resultSlot.promise.catch(() => {})
+        compactResultSlot = resultSlot
+        await resultSlot.promise.catch(() => {})
+        compactResultSlot = null
+        awaitingCompactResult = false
+      }
+      return payload
+    },
+
     // Graceful end: the current turn finishes (an abrupt stop is what
     // /interrupt is for). The caller has already set s.ending and canceled
     // pending permissions/parks.
     beginEnd() {
+      rejectPendingCompact('session ended', 409)
       inputQueue.close()
     },
 
     // Daemon shutdown: stop input, abort the in-flight turn. The caller
     // handles pending cancellation and waits for the terminal emit.
     async shutdownStop() {
+      rejectPendingCompact('daemon shutting down', 409)
       inputQueue.close()
       try {
         await q?.interrupt()

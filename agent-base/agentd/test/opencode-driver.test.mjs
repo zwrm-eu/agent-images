@@ -162,6 +162,37 @@ test('setModel re-points the NEXT prompt_async on the same server-side session (
   }
 })
 
+test('compact summarizes on the server-side session with the session model; the event is consumed, not recorded twice (#1553)', async () => {
+  const fake = await startFakeOpenCode()
+  try {
+    const { s, driver, events } = await build(fake)
+    driver.start()
+    driver.queueMessage('first')
+    await until(events, () => fake.state.prompts.length === 1, 'first prompt')
+    const sid = s.sdkSessionId
+    fake.emit('session.idle', { sessionID: sid })
+    await until(events, () => s.state === 'idle', 'idle')
+
+    const outcome = await driver.compact({ instructions: 'recorded, not sent' })
+    assert.deepEqual(outcome, { trigger: 'manual', instructions: 'recorded, not sent' }, 'opencode reports no token counts')
+    assert.equal(fake.state.summaries.length, 1)
+    assert.deepEqual(fake.state.summaries[0], { providerID: 'zwrm', modelID: 'qwen-235b' })
+    const recorded = ofType(events, 'context.compacted')
+    assert.equal(recorded.length, 1, 'recorded once: the server event is consumed, not recorded twice')
+    assert.deepEqual(recorded[0].payload, outcome)
+    assert.equal(s.state, 'idle', 'a compaction is not a turn')
+
+    // The server compacting on its own is recorded by the driver.
+    fake.emit('session.compacted', { sessionID: sid })
+    await until(events, () => ofType(events, 'context.compacted').length === 2, 'auto compaction')
+    assert.deepEqual(ofType(events, 'context.compacted')[1].payload, { trigger: 'auto' })
+    assert.equal(s.sdkSessionId, sid, 'the opencode session is reused')
+    fake.assertNoViolations(assert)
+  } finally {
+    await fake.close()
+  }
+})
+
 test('tool parts render as one tool_use / tool_result pair, foreign sessions are ignored', async () => {
   const fake = await startFakeOpenCode()
   try {

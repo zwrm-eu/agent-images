@@ -43,6 +43,7 @@ const KNOWN = {
   'turn/steer': new Set(['additionalContext', 'clientUserMessageId', 'expectedTurnId', 'input',
     'responsesapiClientMetadata', 'threadId']),
   'turn/interrupt': new Set(['threadId', 'turnId']),
+  'thread/compact/start': new Set(['threadId']),
 }
 const ENUMS = {
   approvalPolicy: new Set(['untrusted', 'on-failure', 'on-request', 'never']),
@@ -97,6 +98,16 @@ function ask(method, params) {
 
 async function runTurn(turnId) {
   notify('turn/started', { threadId: THREAD_ID, turn: { id: turnId, items: [], status: 'inProgress', error: null } })
+
+  if (scenario === 'auto-compaction') {
+    // The app-server compacted on its own mid-turn (#1553): no request
+    // preceded it, so the driver must record it itself, once.
+    notify('item/completed', {
+      threadId: THREAD_ID, turnId,
+      item: { type: 'contextCompaction', id: 'compact-auto' },
+    })
+    notify('thread/compacted', { threadId: THREAD_ID })
+  }
 
   if (scenario === 'approval' || scenario === 'approval-denied') {
     const reply = await ask('item/commandExecution/requestApproval', {
@@ -350,6 +361,21 @@ rl.on('line', async (line) => {
         return
       }
       send({ id: msg.id, result: {} })
+      return
+    }
+    case 'thread/compact/start': {
+      // Manual compaction (#1553). The real app-server reports it through the
+      // thread/compacted notification and a contextCompaction item; both are
+      // sent here so the driver's dedupe is exercised.
+      trace('thread/compact/start', msg.params)
+      send({ id: msg.id, result: {} })
+      await sleep(5)
+      // codex-cli 0.153.4's item is id-only (no token counts).
+      notify('item/completed', {
+        threadId: THREAD_ID, turnId: null,
+        item: { type: 'contextCompaction', id: 'compact-1' },
+      })
+      notify('thread/compacted', { threadId: THREAD_ID })
       return
     }
     case 'turn/interrupt': {
