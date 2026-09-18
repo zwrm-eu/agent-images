@@ -156,6 +156,27 @@ test('the model-switch endpoint ships with its cap and applies only between turn
   assert.match(handler, /s\.pusher\.emit\('session\.model_changed'/, 'the switch must be recorded durably')
 })
 
+test('the compact endpoint ships with its cap, runs as a held control call, and records context.compacted outside any turn (#1553)', async () => {
+  // Source-text pin (handleCompact needs a booted daemon to exercise; the
+  // per-driver compact is covered by the codex/opencode driver tests): the
+  // CP gates on the 'compact' cap, so cap and route ship together; the
+  // handler dispatches by driver capability, refuses while a turn is live,
+  // and records the event with an explicit null turn like the shell — a
+  // compaction is not a turn and must never open one.
+  const src = await readFile(SERVER, 'utf8')
+  const capsLine = src.split('\n').find((l) => l.trimStart().startsWith('caps:'))
+  assert.ok(capsLine.includes("'compact'"), 'the compact cap must be advertised')
+  assert.match(src, /action === 'compact' && parts\.length === 4/, 'the compact route must be dispatched')
+  const handler = handlerBody(src, 'handleCompact')
+  assert.match(handler, /supportsCompactDriver\(s\.driver\)/, 'compaction must ask the driver, not a harness allowlist')
+  assert.doesNotMatch(handler, /beginTurn|emitUserMessage|pusher\.emit\(/, 'a compaction must not open a turn; the driver writes the record')
+  // Every driver records its manual compaction outside any turn.
+  for (const name of ['claude', 'codex', 'opencode', 'pi']) {
+    const driver = await readFile(new URL(`../drivers/${name}.mjs`, import.meta.url), 'utf8')
+    assert.match(driver, /s\.pusher\.emit\('context\.compacted', payload, \{ turnId: null \}\)/, `${name} must record its manual compaction with an explicit null turn`)
+  }
+})
+
 test('control routes share one between-turns gate and reservation; mode stays outside it (#1565)', async () => {
   // Source-text pin: the gate used to be three hand-rolled copies with three
   // error strings, and the reservation three hand-rolled set/clear pairs. A
@@ -165,6 +186,7 @@ test('control routes share one between-turns gate and reservation; mode stays ou
     ['handleCommand', 'invoking a command'],
     ['handleShell', 'running a shell command'],
     ['handleModel', 'switching the model'],
+    ['handleCompact', 'compacting the context'],
   ]) {
     const handler = handlerBody(src, name)
     assert.match(handler, new RegExp(`requireIdle\\(s, '${verb}'\\)`), `${name} must gate through requireIdle`)

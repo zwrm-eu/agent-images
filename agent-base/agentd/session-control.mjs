@@ -128,6 +128,52 @@ export function supportsModelSwitchDriver(driver) {
   return Boolean(driver && typeof driver.setModel === 'function')
 }
 
+// A settle-once slot with a deadline, for driver calls that complete on a
+// later harness signal (a compaction resolved by its boundary, #1553). One
+// promise, one timer: resolve/reject settle it and clear the timer, the
+// timer rejects with the given status, and a settled slot ignores late
+// signals rather than settling twice.
+export function pendingWithTimeout(timeoutMS, timeoutMessage, timeoutStatus = 504) {
+  let settled = false
+  let resolveFn
+  let rejectFn
+  const promise = new Promise((resolve, reject) => { resolveFn = resolve; rejectFn = reject })
+  const timer = setTimeout(() => {
+    const e = new Error(timeoutMessage)
+    e.status = timeoutStatus
+    slot.reject(e)
+  }, timeoutMS)
+  timer.unref?.()
+  const slot = {
+    promise,
+    get settled() { return settled },
+    resolve(value) {
+      if (settled) return false
+      settled = true
+      clearTimeout(timer)
+      resolveFn(value)
+      return true
+    },
+    reject(err) {
+      if (settled) return false
+      settled = true
+      clearTimeout(timer)
+      rejectFn(err)
+      return true
+    },
+  }
+  return slot
+}
+
+// Context compaction (#1553) is a driver capability too: a driver that can
+// ask its harness to summarize the conversation so far exposes compact and
+// resolves with what the harness reports (pre/post token counts where it
+// knows them). Every shipped harness has one; the check keeps the route
+// honest for a driver that does not.
+export function supportsCompactDriver(driver) {
+  return Boolean(driver && typeof driver.compact === 'function')
+}
+
 // Keep the slash command first in the prompt for drivers whose command syntax
 // requires a leading invocation. Pending operator-shell context follows it so
 // it is visible to the resulting model turn.

@@ -52,6 +52,7 @@ import {
   shellContext,
   supportsCommandDriver,
   supportsModelSwitchDriver,
+  supportsCompactDriver,
   withControl,
 } from './session-control.mjs'
 
@@ -1306,6 +1307,31 @@ async function handleModel(req, res, s) {
   send(res, 200, next)
 }
 
+// Context compaction (#1553, the 'compact' cap): have the harness summarize
+// the conversation so far into a shorter context, between turns only. It is
+// a held control reservation, not a turn: no turn.started, messages 409
+// while it runs. The driver is the one writer of the record: it emits
+// context.compacted from its harness's own signal, outside any turn, with
+// the trigger it knows (manual here, 'auto' for the harness's own
+// compactions) and the counts where the harness measures them, and resolves
+// with that payload; this route syncs it to disk and answers with it.
+const MAX_COMPACT_INSTRUCTIONS = 4096
+async function handleCompact(req, res, s) {
+  const body = await readBody(req)
+  if (body.instructions != null && typeof body.instructions !== 'string') throw badRequest('instructions must be a string')
+  const instructions = (body.instructions ?? '').trim()
+  if (instructions.length > MAX_COMPACT_INSTRUCTIONS) throw badRequest(`instructions are too long (max ${MAX_COMPACT_INSTRUCTIONS} characters)`)
+  requireIdle(s, 'compacting the context')
+  if (!supportsCompactDriver(s.driver)) {
+    throw badRequest(`context compaction is not supported by the ${s.harness} harness`)
+  }
+  const payload = await withControl(s, 'compact', () => s.driver.compact({ instructions }))
+  log(`session ${s.id}: context compacted (${payload.pre_tokens ?? '?'} -> ${payload.post_tokens ?? '?'} tokens)`)
+  // Durable before the 200, like the shell context.
+  await syncToDisk()
+  send(res, 200, payload)
+}
+
 // Deliberately outside the between-turns gate (requireIdle/withControl): a
 // mode change is how a user unblocks a turn waiting on a permission — and a
 // command turn holds the control reservation until it ends, so gating here
@@ -1468,7 +1494,10 @@ const server = createServer(async (req, res) => {
         // without it, exactly as 'pi-gateway' guards pi's catalog (#1193).
         // 'commands' (#1429): harness-driver command discovery/invocation.
         // 'shell' (#1429): immediate operator shell with durable context.
-        caps: ['mcp', 'escalation', 'files', 'file-search', 'message-context', 'message-receipts', 'park', 'reclaim', 'skillfetch', 'pi-multiprovider', 'pi-gateway', 'opencode-gateway', 'background-tasks', 'tool-policy', 'token-refresh', 'commands', 'shell', 'model-switch', ...HARNESS_CAPS],
+        // 'compact' (#1553): POST /v1/sessions/{id}/compact summarizes the
+        // conversation between turns and records context.compacted; the
+        // CP refuses the call on a daemon without it.
+        caps: ['mcp', 'escalation', 'files', 'file-search', 'message-context', 'message-receipts', 'park', 'reclaim', 'skillfetch', 'pi-multiprovider', 'pi-gateway', 'opencode-gateway', 'background-tasks', 'tool-policy', 'token-refresh', 'commands', 'shell', 'model-switch', 'compact', ...HARNESS_CAPS],
         active_session: session && !isDone(session) ? session.id : null,
         state: session?.state ?? null,
         // Live background work (#1251): tasks the harness still tracks after
@@ -1508,6 +1537,7 @@ const server = createServer(async (req, res) => {
       if (req.method === 'POST' && action === 'parks' && parts.length === 6 && parts[5] === 'resolve') return await handleParkResolve(req, res, s, parts[4])
       if (req.method === 'POST' && action === 'mode' && parts.length === 4) return await handleMode(req, res, s)
       if (req.method === 'POST' && action === 'model' && parts.length === 4) return await handleModel(req, res, s)
+      if (req.method === 'POST' && action === 'compact' && parts.length === 4) return await handleCompact(req, res, s)
       if (req.method === 'POST' && action === 'gateway-token' && parts.length === 4) return await handleGatewayToken(req, res, s)
       if (req.method === 'POST' && action === 'end' && parts.length === 4) return handleEnd(res, s)
     }

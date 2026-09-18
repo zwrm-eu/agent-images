@@ -370,6 +370,15 @@ export async function createPiDriver(s, spec, h) {
     s.pusher.emit('session.error', { message: c.message, cause: c.cause, detail: c.detail })
   }
 
+  // Manual compaction in flight (#1553).
+  let compacting = false
+  function compactionTokens(result) {
+    return {
+      ...(Number.isFinite(result?.tokensBefore) ? { pre_tokens: result.tokensBefore } : {}),
+      ...(Number.isFinite(result?.estimatedTokensAfter) ? { post_tokens: result.estimatedTokensAfter } : {}),
+    }
+  }
+
   const unsubscribe = session.subscribe((ev) => {
     try {
       switch (ev.type) {
@@ -421,9 +430,23 @@ export async function createPiDriver(s, spec, h) {
             h.setState(s, 'idle')
           })
           break
+        case 'compaction_end': {
+          // pi's automatic (context-window) and overflow compactions
+          // (#1553); a manual one is the compact() call's own result and is
+          // recorded by the daemon.
+          // The driver's own compact() is the only source of a manual one
+          // (the platform reserves /compact on every text route).
+          if (compacting) break
+          if (ev.aborted || ev.errorMessage) {
+            h.log(`pi compaction (${ev.reason}) did not complete: ${ev.errorMessage || 'aborted'}`)
+            break
+          }
+          s.pusher.emit('context.compacted', { trigger: 'auto', ...compactionTokens(ev.result) })
+          break
+        }
         default:
-          // pi-internal events (queue_update, entry_appended, compaction)
-          // drive nothing here; forwarding untranslated shapes would put
+          // pi-internal events (queue_update, entry_appended, …) drive
+          // nothing here; forwarding untranslated shapes would put
           // unreadable payloads in the durable timeline.
       }
     } catch (err) {
@@ -465,6 +488,31 @@ export async function createPiDriver(s, spec, h) {
       // Mirrors claude's init ordering: session.started is emitted by the
       // caller first, then the init event that carries the resume handle.
       s.pusher.emit('sdk.system', initPayload(s.sdkSessionId, resolved.model.id))
+    },
+
+    // Manual compaction (#1553): pi's own compact(), which takes custom
+    // instructions and reports the token counts it measured.
+    async compact({ instructions } = {}) {
+      if (compacting) throw Object.assign(new Error('a compaction is already in flight'), { status: 409 })
+      compacting = true
+      try {
+        const result = await session.compact(instructions || undefined)
+        const payload = { trigger: 'manual', ...(instructions ? { instructions } : {}), ...compactionTokens(result) }
+        // Explicit null: a compaction is not a turn (the daemon syncs
+        // before answering).
+        s.pusher.emit('context.compacted', payload, { turnId: null })
+        return payload
+      } catch (err) {
+        const message = String(err?.message || err)
+        // pi refuses an empty or already-compacted context the way the
+        // claude CLI does: nothing happened, the caller's 409, not ours.
+        const nothing = /nothing to compact|already compacted/i.test(message)
+        const e = new Error(nothing ? `the harness did not compact: ${message}` : `pi compaction failed: ${message}`)
+        e.status = nothing ? 409 : 502
+        throw e
+      } finally {
+        compacting = false
+      }
     },
 
     queueMessage(text) {

@@ -47,10 +47,13 @@ import {
 } from './opencode-translate.mjs'
 import { normalizeTodos } from './todos.mjs'
 import { opencodeQuestionInput, opencodeQuestionReply } from './questions.mjs'
-import { commandPrompt, normalizeCommandList, resolveCommand } from '../session-control.mjs'
+import { commandPrompt, normalizeCommandList, resolveCommand, pendingWithTimeout } from '../session-control.mjs'
 
 // Bounded teardown (the codex rule): a wedged server must not hang
 // /interrupt or SIGTERM shutdown; turn-carrying calls stay unbounded.
+// A compaction is one model call over the whole session (#1553).
+const COMPACT_TIMEOUT_MS = 5 * 60_000
+
 const TEARDOWN_TIMEOUT_MS = 10_000
 
 // How long a turn may stay open after a `task` (subagent) tool_use before the
@@ -179,6 +182,8 @@ export async function createOpenCodeDriver(s, spec, h) {
 
   // ---- turn bookkeeping -----------------------------------------------------
   let turnActive = false
+  // Manual compaction in flight (#1553): a slot its session.compacted resolves.
+  let compacting = null
   let turnGen = 0
   // turnSeq numbers platform turns monotonically. The result guard is
   // per-SEQUENCE, not a boolean: a boolean reset by the next sendPrompt let a
@@ -504,6 +509,8 @@ export async function createOpenCodeDriver(s, spec, h) {
           break
 
         case 'message.part.delta': {
+          // The summary a compaction streams is not a turn's output.
+          if (compacting) break
           // Streaming granularity when the server offers it; the
           // part.updated diffing below covers builds that do not. A delta for
           // a part we have not seen yet still creates the entry (review) —
@@ -526,6 +533,9 @@ export async function createOpenCodeDriver(s, spec, h) {
         case 'message.part.updated': {
           const part = props.part
           if (!part) break
+          // The summary a compaction writes is a message too; it is not a
+          // turn's output and must not stream into the timeline as one.
+          if (compacting) break
           // The bus streams USER message parts too (probed): without this,
           // the user's own prompt renders as assistant text and can become
           // the run summary. message.updated precedes a message's parts
@@ -616,6 +626,15 @@ export async function createOpenCodeDriver(s, spec, h) {
           break
         }
 
+        case 'session.compacted': {
+          // OpenCode reports no token counts. A manual compaction (#1553)
+          // in flight is the one this belongs to; anything else is the
+          // server compacting on its own.
+          if (compacting) compacting.resolve()
+          else s.pusher.emit('context.compacted', { trigger: 'auto' })
+          break
+        }
+
         case 'session.error': {
           if (props.error) turnError = props.error
           // Terminal only when no turn is open to carry it: an in-turn error
@@ -634,7 +653,7 @@ export async function createOpenCodeDriver(s, spec, h) {
           // with no armed turn re-opens one, UNLESS an interrupt superseded
           // the last prompt (lastPromptGen) — a cancelled turn's tail must
           // not resurrect itself.
-          if (st === 'busy' && !turnActive && !finished && !closed && !s.ending &&
+          if (st === 'busy' && !turnActive && !compacting && !finished && !closed && !s.ending &&
               lastPromptGen === abortGen && resultEmittedSeq >= turnSeq) {
             resetTurnState()
             turnActive = true
@@ -919,6 +938,34 @@ export async function createOpenCodeDriver(s, spec, h) {
     async setModel({ model, effort }) {
       if (model) spec.model = model
       if (effort) spec.effort = effort
+    },
+
+    // Manual compaction (#1553): the server's summarize route, which returns
+    // once the summary is written on the session; the session.compacted
+    // event it emits is consumed rather than recorded twice.
+    async compact({ instructions } = {}) {
+      if (compacting) throw Object.assign(new Error('a compaction is already in flight'), { status: 409 })
+      // The event usually precedes the response; a late one gets a moment
+      // so it is not recorded as a second, automatic compaction.
+      const slot = pendingWithTimeout(2_000, 'session.compacted did not arrive')
+      slot.promise.catch(() => {})
+      compacting = slot
+      try {
+        await server.request('POST', `/session/${ocSessionId}/summarize`, {
+          providerID: OPENCODE_PROVIDER_ID,
+          modelID: spec.model || currentModel(),
+        }, { timeoutMS: COMPACT_TIMEOUT_MS })
+        await slot.promise.catch(() => {})
+      } catch (err) {
+        throw Object.assign(new Error(`opencode compaction failed: ${err?.message || err}`), { status: 502 })
+      } finally {
+        compacting = null
+      }
+      // OpenCode takes no instructions (recorded, not sent) and reports no
+      // token counts. Explicit null: a compaction is not a turn.
+      const payload = { trigger: 'manual', ...(instructions ? { instructions } : {}) }
+      s.pusher.emit('context.compacted', payload, { turnId: null })
+      return payload
     },
 
     beginEnd() {

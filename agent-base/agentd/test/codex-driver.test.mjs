@@ -46,7 +46,7 @@ function newHarness({ scenario = 'simple', spec = {} } = {}) {
     sdkSessionId: null,
     pending: new Map(),
     parks: new Map(),
-    pusher: { emit: (type, payload, opts) => events.push({ type, payload, ephemeral: !!opts?.ephemeral }) },
+    pusher: { emit: (type, payload, opts) => events.push({ type, payload, ephemeral: !!opts?.ephemeral, ...(opts && 'turnId' in opts ? { turnId: opts.turnId } : {}) }) },
     lastResult: null,
     ending: false,
     driver: null,
@@ -205,6 +205,41 @@ test('setModel re-points the NEXT turn/start and leaves the thread alone (#1552)
   // Assistant text after the switch is attributed to the new model.
   const texts = ofType(ctx.events, 'sdk.assistant')
   assert.equal(texts[texts.length - 1].payload.message.model, 'gpt-5.6')
+  await ctx.driver.shutdownStop()
+})
+
+test('compact asks the app-server between turns and resolves on its signal; auto-compactions are recorded once (#1553)', async () => {
+  const ctx = await build(newHarness({ scenario: 'simple' }))
+  ctx.driver.start()
+  assert.equal(ctx.driver.queueMessage('first'), true)
+  await until(ctx.events, (e) => ofType(e, 'sdk.result').length === 1, 'first result')
+
+  const outcome = await ctx.driver.compact({ instructions: 'recorded, not sent' })
+  assert.deepEqual(outcome, { trigger: 'manual', instructions: 'recorded, not sent' }, 'codex 0.153.4 reports no counts')
+  assert.equal(sentCalls(ctx.tracePath, 'thread/compact/start').length, 1)
+  // The driver records the manual compaction once, outside any turn; the
+  // second signal for the same compaction must not become an 'auto' one.
+  await new Promise((r) => setTimeout(r, 50))
+  const recorded = ofType(ctx.events, 'context.compacted')
+  assert.equal(recorded.length, 1)
+  assert.equal(recorded[0].turnId, null, 'recorded outside any turn')
+  assert.deepEqual(recorded[0].payload, outcome)
+  assert.equal(ctx.s.state, 'idle', 'a compaction is not a turn')
+
+  assert.equal(ctx.driver.queueMessage('second'), true)
+  await until(ctx.events, (e) => ofType(e, 'sdk.result').length === 2, 'second result')
+  assert.equal(sentCalls(ctx.tracePath, 'thread/start').length, 1, 'the thread is not restarted')
+  await ctx.driver.shutdownStop()
+})
+
+test('an automatic codex compaction lands on the timeline as one context.compacted (#1553)', async () => {
+  const ctx = await build(newHarness({ scenario: 'auto-compaction' }))
+  ctx.driver.start()
+  assert.equal(ctx.driver.queueMessage('go'), true)
+  await until(ctx.events, (e) => ofType(e, 'sdk.result').length === 1, 'result')
+  const compacted = ofType(ctx.events, 'context.compacted')
+  assert.equal(compacted.length, 1, 'both signals describe one compaction')
+  assert.deepEqual(compacted[0].payload, { trigger: 'auto' })
   await ctx.driver.shutdownStop()
 })
 

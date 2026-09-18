@@ -30,6 +30,7 @@
 //    client (#1090) — otherwise escalation would go dark on this harness.
 
 import { createHash, randomUUID } from 'node:crypto'
+import { pendingWithTimeout } from '../session-control.mjs'
 import { mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { CodexRPC } from './codex-rpc.mjs'
 import {
@@ -73,6 +74,11 @@ export function isStaleCodexTurnCompletion(doneId, currentTurnId, turnActive) {
 // /interrupt forever, nor hold SIGTERM shutdown past the daemon's own deadline
 // into a SIGKILL with dirty pages. Turn-carrying calls stay unbounded — a turn
 // legitimately takes minutes.
+// A compaction is one model call over the whole thread (#1553): generous
+// for long threads, bounded so a silent app-server cannot hold the
+// session's reservation forever.
+const COMPACT_TIMEOUT_MS = 5 * 60_000
+
 const TEARDOWN_TIMEOUT_MS = 10_000
 
 // The permission modes this harness can host. Exported so the server's driver
@@ -505,11 +511,74 @@ export async function createCodexDriver(s, spec, h) {
   }
 
   // ---- notifications --------------------------------------------------------
+  // Compaction bookkeeping (#1553). The app-server reports one compaction
+  // twice: a contextCompaction item (with the counts) and a thread/compacted
+  // notification. `compacting` is a manual one in flight (its instructions
+  // ride along for the record); whichever signal lands first settles it and
+  // `owedSignal` absorbs the other. An automatic compaction is recorded from
+  // the item alone (it carries the counts); its notification is ignored. A
+  // turn the app-server opens for a compaction is remembered by id so its
+  // completion or error is that compaction's, never a phantom result.
+  let compacting = null
+  let compactInstructions = ''
+  let owedSignal = false
+  let compactionTurnId = null
+  // The pinned app-server's contextCompaction item carries only an id (no
+  // counts, checked in codex-cli 0.153.4), so this yields {} today; the
+  // names are read defensively for a build that adds them.
+  function compactionTokens(source) {
+    const pick = (...keys) => {
+      for (const key of keys) {
+        const v = source?.[key]
+        if (Number.isFinite(v)) return v
+      }
+      return undefined
+    }
+    const pre = pick('tokensBefore', 'tokens_before', 'activeContextTokensBefore', 'active_context_tokens_before')
+    const post = pick('tokensAfter', 'tokens_after', 'activeContextTokensAfter', 'active_context_tokens_after', 'textTokensAfter', 'text_tokens_after')
+    return { ...(pre !== undefined ? { pre_tokens: pre } : {}), ...(post !== undefined ? { post_tokens: post } : {}) }
+  }
+  function onCompacted(tokens, fromItem) {
+    if (owedSignal) {
+      owedSignal = false
+      return
+    }
+    if (compacting) {
+      const waiting = compacting
+      compacting = null
+      owedSignal = true
+      const payload = { trigger: 'manual', ...(compactInstructions ? { instructions: compactInstructions } : {}), ...tokens }
+      // Explicit null: a compaction is not a turn (the daemon syncs before
+      // answering).
+      s.pusher.emit('context.compacted', payload, { turnId: null })
+      waiting.resolve(payload)
+      return
+    }
+    if (fromItem) s.pusher.emit('context.compacted', { trigger: 'auto', ...tokens })
+  }
+
+  function failCompaction(message) {
+    const waiting = compacting
+    if (!waiting) return
+    compacting = null
+    waiting.reject(Object.assign(new Error(message), { status: 502 }))
+  }
+
   function onNotification(method, params) {
     try {
       switch (method) {
         case 'turn/started': {
           const startedId = params?.turn?.id ?? null
+          // A compaction may open a turn of its own on the app-server; it
+          // is not one this driver armed, and not one to interrupt. Its id
+          // is kept so its completion is not read as a real turn's.
+          if (compacting && openingTurns.length === 0) {
+            compactionTurnId = startedId
+            h.log(`codex: turn ${startedId} opened by the compaction; leaving it alone`)
+            break
+          }
+          // A real turn settles whatever a previous compaction left owed.
+          owedSignal = false
           // Judge this turn by the generation of the request that opened it,
           // not by the generation in force when the notification happens to
           // land. An interrupt that arrived while the turn was still opening
@@ -570,9 +639,11 @@ export async function createCodexDriver(s, spec, h) {
             const todos = todosFromCodexItem(item)
             if (todos) s.pusher.emit('todo.updated', { todos })
             else h.log('codex: todoList item with unrecognized shape dropped')
+          } else if (item?.type === 'contextCompaction') {
+            onCompacted(compactionTokens(item), true)
           } else if (item?.type) {
             // ThreadItem is a growing union (plan, collabAgentToolCall,
-            // imageGeneration, contextCompaction, …). Dropping a shape this
+            // imageGeneration, …). Dropping a shape this
             // build cannot render beats putting an unreadable payload in the
             // durable timeline — but it must not be silent, because the pin
             // will move and a dropped TOOL CALL would be invisible.
@@ -594,6 +665,11 @@ export async function createCodexDriver(s, spec, h) {
           // recorded result as "run complete" and tears the VM down under a
           // working agent.
           const doneId = params?.turn?.id ?? null
+          if (doneId && doneId === compactionTurnId) {
+            compactionTurnId = null
+            if (params?.turn?.status === 'failed') failCompaction(`codex compaction failed: ${params?.turn?.error?.message ?? 'turn failed'}`)
+            break
+          }
           if (isStaleCodexTurnCompletion(doneId, currentTurnId, turnActive)) {
             h.log(`codex: ignoring turn/completed for stale turn ${doneId}`)
             break
@@ -622,6 +698,12 @@ export async function createCodexDriver(s, spec, h) {
           // Same staleness guard as turn/completed: an error belonging to a
           // turn that has already been superseded must not clear the live one.
           const errTurnId = params?.turnId ?? null
+          // A compaction's own failure: reported to the waiting call, not to
+          // the timeline as a turn error.
+          if (compacting && (!errTurnId || errTurnId === compactionTurnId)) {
+            failCompaction(`codex compaction failed: ${params?.error?.message ?? 'error'}`)
+            break
+          }
           if (errTurnId && currentTurnId && errTurnId !== currentTurnId) {
             h.log(`codex: ignoring error for stale turn ${errTurnId}`)
             break
@@ -664,6 +746,10 @@ export async function createCodexDriver(s, spec, h) {
           }
           break
         }
+
+        case 'thread/compacted':
+          if (!params?.threadId || params.threadId === threadId) onCompacted(compactionTokens(params), false)
+          break
 
         case 'thread/status/changed':
           if (params?.status?.type === 'systemError') {
@@ -1055,6 +1141,28 @@ export async function createCodexDriver(s, spec, h) {
         currentModel = model
       }
       if (effort) spec.effort = effort
+    },
+
+    // Manual compaction (#1553): the app-server's thread/compact/start.
+    // Codex takes no custom instructions; they are recorded on the event
+    // but not sent. Completion is the thread/compacted notification (or the
+    // contextCompaction item), bounded by a timeout.
+    async compact({ instructions } = {}) {
+      if (compacting) throw Object.assign(new Error('a compaction is already in flight'), { status: 409 })
+      const slot = pendingWithTimeout(COMPACT_TIMEOUT_MS, 'compaction timed out')
+      compacting = slot
+      compactInstructions = instructions || ''
+      compactionTurnId = null
+      // A new compaction settles any signal still owed from the last one.
+      owedSignal = false
+      try {
+        await rpc.request('thread/compact/start', { threadId })
+      } catch (err) {
+        compacting = null
+        slot.reject(err)
+        throw Object.assign(new Error(`codex compaction failed: ${err?.message || err}`), { status: 502 })
+      }
+      return await slot.promise.finally(() => { if (compacting === slot) compacting = null })
     },
 
     beginEnd() {

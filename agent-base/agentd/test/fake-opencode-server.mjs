@@ -20,6 +20,7 @@ export async function startFakeOpenCode({ password = 'test', expectProvider = 'z
     sessions: new Map(), // id -> {id, cost, tokens}
     prompts: [], // validated prompt bodies, in order
     commandInvocations: [], // validated POST /session/:id/command bodies
+    summaries: [], // validated POST /session/:id/summarize bodies (#1553)
     replies: [], // {permissionID, response}
     aborts: 0,
     pendingAsks: new Set(), // permission ids the fake has asked and not seen replied
@@ -142,6 +143,27 @@ export async function startFakeOpenCode({ password = 'test', expectProvider = 'z
         // answers immediately because tests drive the turn over SSE and the
         // driver never awaits this response.
         res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ info: {}, parts: [] }))
+        return
+      }
+      if (req.method === 'POST' && parts[2] === 'summarize' && parts.length === 3) {
+        // Manual compaction (#1553): the real route takes the model to
+        // summarize with and returns once the summary is written, emitting
+        // session.compacted on the way.
+        let body
+        try {
+          body = JSON.parse(await readBody(req))
+        } catch {
+          violate('summarize body is not JSON')
+          res.writeHead(400).end()
+          return
+        }
+        if (body.providerID !== expectProvider || typeof body.modelID !== 'string' || !body.modelID) {
+          violate(`summarize model malformed: ${JSON.stringify(body)}`)
+        }
+        state.summaries.push(body)
+        const line = `data: ${JSON.stringify({ type: 'session.compacted', properties: { sessionID: sess.id } })}\n\n`
+        for (const c of sseClients) c.write(line)
+        res.writeHead(200, { 'content-type': 'application/json' }).end('true')
         return
       }
       if (req.method === 'POST' && parts[2] === 'permissions' && parts.length === 4) {
