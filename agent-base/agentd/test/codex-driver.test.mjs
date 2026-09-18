@@ -213,6 +213,12 @@ test('compact asks the app-server between turns and resolves on its signal; auto
   ctx.driver.start()
   assert.equal(ctx.driver.queueMessage('first'), true)
   await until(ctx.events, (e) => ofType(e, 'sdk.result').length === 1, 'first result')
+  // Context usage rides every result (#1553): this turn's request against
+  // the window the app-server reports.
+  const usage = ofType(ctx.events, 'context.usage')
+  assert.equal(usage.length, 1)
+  assert.deepEqual(usage[0].payload, { tokens: 30, window: 400000 })
+  assert.equal(usage[0].turnId, null, 'session-level accounting, outside any turn')
 
   const outcome = await ctx.driver.compact({ instructions: 'recorded, not sent' })
   assert.deepEqual(outcome, { trigger: 'manual', instructions: 'recorded, not sent' }, 'codex 0.153.4 reports no counts')

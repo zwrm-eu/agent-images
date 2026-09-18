@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { permissionDecisionPayload } from '../event-payloads.mjs'
+import { contextTokensFromUsage, contextUsagePayload, permissionDecisionPayload } from '../event-payloads.mjs'
 
 test('permission decisions durably retain updated input and question answers', () => {
   const updatedInput = {
@@ -37,4 +37,17 @@ test('null updated input is omitted from cancellation decisions', () => {
     behavior: 'cancel',
     message: 'interrupted',
   })
+})
+
+test('contextUsagePayload reports tokens, and the window when known (#1553)', () => {
+  assert.deepEqual(contextUsagePayload(84_000, 200_000), { tokens: 84000, window: 200000 })
+  assert.deepEqual(contextUsagePayload(1234.6), { tokens: 1235 })
+  assert.equal(contextUsagePayload(0, 200_000), null)
+  assert.equal(contextUsagePayload(undefined, 200_000), null)
+})
+
+test('contextTokensFromUsage sums the normalized usage shape (#1553)', () => {
+  assert.equal(contextTokensFromUsage({ input_tokens: 10, output_tokens: 5, cache_read_input_tokens: 70, cache_creation_input_tokens: 15 }), 100)
+  assert.equal(contextTokensFromUsage({ input_tokens: 10 }), 10)
+  assert.equal(contextTokensFromUsage(undefined), undefined)
 })

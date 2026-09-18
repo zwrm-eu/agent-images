@@ -59,7 +59,7 @@ import {
   toolCallResponse,
   connectorFingerprint,
 } from './codex-tools.mjs'
-import { permissionDecisionPayload } from '../event-payloads.mjs'
+import { permissionDecisionPayload, contextUsagePayload } from '../event-payloads.mjs'
 import { todosFromCodexItem } from './todos.mjs'
 
 export function isStaleCodexTurnCompletion(doneId, currentTurnId, turnActive) {
@@ -329,6 +329,11 @@ export async function createCodexDriver(s, spec, h) {
       numTurns: 1,
       durationMS,
     }))
+    // Context usage (#1553): this turn's request size against the model's
+    // window, both from the app-server's own accounting (totalTokens already
+    // counts the cached input, which is a subset of inputTokens).
+    const usage = contextUsagePayload(lastUsage?.totalTokens, lastContextWindow)
+    if (usage) s.pusher.emit('context.usage', usage, { turnId: null })
     if (finished) return
     if (closed || s.ending) {
       await finish()
@@ -523,6 +528,8 @@ export async function createCodexDriver(s, spec, h) {
   let compactInstructions = ''
   let owedSignal = false
   let compactionTurnId = null
+  // The model's context window, from thread/tokenUsage/updated (#1553).
+  let lastContextWindow = null
   // The pinned app-server's contextCompaction item carries only an id (no
   // counts, checked in codex-cli 0.153.4), so this yields {} today; the
   // names are read defensively for a build that adds them.
@@ -655,6 +662,7 @@ export async function createCodexDriver(s, spec, h) {
         case 'thread/tokenUsage/updated':
           // `last` is this turn's usage; `total` is thread-cumulative.
           lastUsage = params?.tokenUsage?.last ?? null
+          if (Number.isFinite(params?.tokenUsage?.modelContextWindow)) lastContextWindow = params.tokenUsage.modelContextWindow
           break
 
         case 'turn/completed': {

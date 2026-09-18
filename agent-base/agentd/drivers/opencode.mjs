@@ -26,6 +26,7 @@
 //    subtracts the baseline captured at resume (the pi open-baseline rule).
 //    Billing happens at the gateway (#1193); the CP does not re-bank this.
 import { randomBytes } from 'node:crypto'
+import { contextTokensFromUsage, contextUsagePayload } from '../event-payloads.mjs'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -127,6 +128,17 @@ export async function createOpenCodeDriver(s, spec, h) {
     platformCfg = JSON.parse(readFileSync(platformCfgPath, 'utf8'))
   } catch (err) {
     h.log(`opencode: no platform config at ${platformCfgPath} (${err?.message || err}); the session has no gateway provider`)
+  }
+
+  // The model's context window (#1553), from the catalog the control plane
+  // seeded (build.OpenCodeConfigJSON writes limit.context per model) or the
+  // org's live ext/ catalog; undefined when neither names the model.
+  function modelContextWindow(modelID) {
+    if (!modelID) return undefined
+    const seeded = platformCfg?.provider?.[OPENCODE_PROVIDER_ID]?.models?.[modelID]?.limit?.context
+    if (Number.isFinite(seeded) && seeded > 0) return seeded
+    const ext = spec.opencode_models?.[modelID]?.limit?.context
+    return Number.isFinite(ext) && ext > 0 ? ext : undefined
   }
 
   // append_system_prompt (platform instructions + memory block + run
@@ -339,6 +351,11 @@ export async function createOpenCodeDriver(s, spec, h) {
       numTurns: 1,
       durationMS,
     }))
+    // Context usage (#1553): the last request's size from the server's own
+    // token accounting (the normalized shape stored on lastResult above)
+    // against the model's window from the seeded catalog.
+    const usage = contextUsagePayload(contextTokensFromUsage(s.lastResult?.usage), modelContextWindow(currentModel()))
+    if (usage) s.pusher.emit('context.usage', usage, { turnId: null })
     releaseControl()
     if (finished) return
     if (closed || s.ending) {
