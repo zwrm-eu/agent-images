@@ -12,7 +12,7 @@ import { z } from 'zod'
 import { applyTaskMessage, countBackgroundTasks } from './claude-tasks.mjs'
 import { createTodoTracker } from './todos.mjs'
 import { claudeQuestionDecision, claudeQuestionInput } from './questions.mjs'
-import { permissionDecisionPayload } from '../event-payloads.mjs'
+import { permissionDecisionPayload, contextUsagePayload, contextTokensFromUsage } from '../event-payloads.mjs'
 import { commandPrompt, normalizeCommandList, resolveCommand, pendingWithTimeout } from '../session-control.mjs'
 import { SLEEP_DESCRIPTION, SLEEP_UNTIL_DESCRIPTION, runSleep, runSleepUntil, mapOutcome } from './run-tools.mjs'
 
@@ -247,6 +247,9 @@ export function createClaudeDriver(s, spec, h) {
   let compactGrace = null
   let awaitingCompactResult = false
   let compactResultSlot = null
+  // The last assistant call's usage (#1553): its input plus cache reads and
+  // writes plus output is the size of the context at that call.
+  let lastAssistantUsage = null
 
   // Task-list ledger (#1424): TodoWrite calls become durable todo.updated
   // events once their tool_result confirms the list was actually adopted.
@@ -471,6 +474,36 @@ export function createClaudeDriver(s, spec, h) {
     // answering).
     s.pusher.emit('context.compacted', payload, { turnId: null })
     waiting.resolve(payload)
+    void emitContextUsage()
+  }
+
+  // The session model's context window from a result's per-model usage
+  // (#1553). modelUsage is keyed by the API model name while spec.model may
+  // be a family alias, so an exact key, then a key that starts with it, then
+  // the only entry; several entries with no match (subagents on other
+  // models) report no window rather than a wrong one.
+  function sessionModelWindow(modelUsage) {
+    const entries = Object.entries(modelUsage || {})
+    if (entries.length === 0) return undefined
+    const wanted = spec.model || ''
+    const match = (wanted && entries.find(([k]) => k === wanted)) ||
+      (wanted && entries.find(([k]) => k.startsWith(wanted))) ||
+      (entries.length === 1 ? entries[0] : null)
+    return match?.[1]?.contextWindow
+  }
+
+  // Context usage after a compaction (#1553), where no result carries it:
+  // the SDK's own accounting, one control request, best effort.
+  async function emitContextUsage() {
+    if (s.state === 'ended' || s.state === 'error') return
+    try {
+      const u = await q.getContextUsage()
+      if (s.state === 'ended' || s.state === 'error') return
+      const payload = contextUsagePayload(u?.totalTokens, u?.maxTokens)
+      if (payload) s.pusher.emit('context.usage', payload, { turnId: null })
+    } catch (err) {
+      h.log(`context usage unavailable: ${err?.message || err}`)
+    }
   }
 
   function rejectPendingCompact(message, status = 502) {
@@ -526,6 +559,9 @@ export function createClaudeDriver(s, spec, h) {
             s.pusher.emit('sdk.system', msg)
             break
           case 'assistant':
+            // The main agent's calls only: a subagent's usage is its own
+            // context, not this conversation's.
+            if (msg.message?.usage && !msg.parent_tool_use_id) lastAssistantUsage = msg.message.usage
             s.pusher.emit('sdk.assistant', msg)
             todoTracker.onAssistant(msg)
             break
@@ -566,6 +602,13 @@ export function createClaudeDriver(s, spec, h) {
             await h.syncToDisk()
             const resultIsDraining = h.isTurnDraining(s)
             s.pusher.emit('sdk.result', msg)
+            // Context usage (#1553) from what the turn already carried: the
+            // last call's usage against the window the result reports for
+            // the session's model. Session-level, so outside any turn.
+            {
+              const usage = contextUsagePayload(contextTokensFromUsage(lastAssistantUsage), sessionModelWindow(msg.modelUsage))
+              if (usage) s.pusher.emit('context.usage', usage, { turnId: null })
+            }
             // handleInterrupt owns the idle decision for an aborted provider
             // turn. A fresh message may already have opened canonical turn B;
             // this retired result must neither close nor rotate that turn.

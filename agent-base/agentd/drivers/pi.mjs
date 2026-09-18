@@ -29,6 +29,7 @@
 //    implies the bridge — 0.7.0 (driver without bridge) never shipped.
 
 import { randomUUID } from 'node:crypto'
+import { contextTokensFromUsage, contextUsagePayload } from '../event-payloads.mjs'
 import { resolve as pathResolve } from 'node:path'
 import {
   createAgentSession,
@@ -344,6 +345,11 @@ export async function createPiDriver(s, spec, h) {
       numTurns: s.lastResult.num_turns,
       durationMS: s.lastResult.duration_ms,
     }))
+    // Context usage (#1553): the last assistant call's request size (its
+    // input plus cache reads/writes plus output) against the model's window.
+    const last = (messages || []).findLast((m) => m?.role === 'assistant' && m.usage)
+    const contextUsage = last ? contextUsagePayload(contextTokensFromUsage(usagePayload(last.usage)), resolved.model?.contextWindow) : null
+    if (contextUsage) s.pusher.emit('context.usage', contextUsage, { turnId: null })
   }
 
   async function finish() {
