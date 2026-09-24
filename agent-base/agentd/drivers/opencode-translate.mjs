@@ -267,11 +267,7 @@ export const GATED_PERMISSIONS = { bash: 'ask', edit: 'ask', webfetch: 'ask', we
 //    OpenCode's `instructions` APPEND to the system prompt — the codex
 //    developerInstructions rule: add, never replace.
 //
-// KNOWN LIMIT (documented on #1392): the gateway-token refresh endpoint
-// (#1363) rewrites spec.env and the MCP header objects in place, which the
-// mcp-bridge picks up BY REFERENCE — but this config is serialized into the
-// child's environment at spawn, so a refresh does not reach a LIVE opencode
-// child; its MCP bearers age until the next session.
+// MCP URLs point at agentd's session proxy; serialized harness config holds no bearer.
 export function buildSessionConfig({ platform, mcpServers, interactive, instructionsPath, models, catalogLive }) {
   const cfg = { ...(platform && typeof platform === 'object' ? platform : {}) }
 

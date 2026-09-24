@@ -104,6 +104,7 @@ export async function createPiDriver(s, spec, h) {
     process.env[k] = v
   }
 
+  process.env.ZWRM_GATEWAY_TOKEN = 'broker'
   let mode = spec.permission_mode || 'bypassPermissions'
   if (!SUPPORTED_PERMISSION_MODES.has(mode)) {
     const e = new Error(`the pi harness supports permission modes 'default' and 'bypassPermissions', not '${mode}'`)
@@ -270,7 +271,7 @@ export async function createPiDriver(s, spec, h) {
       cwd,
       agentDir,
       modelRuntime,
-      model: resolved.model,
+      model: spec.gateway_url ? { ...resolved.model, baseUrl: spec.gateway_url } : resolved.model,
       ...(mapEffort(spec.effort) ? { thinkingLevel: mapEffort(spec.effort) } : {}),
       sessionManager,
       resourceLoader,

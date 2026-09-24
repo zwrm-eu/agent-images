@@ -122,21 +122,12 @@ test('claude sessions opt in to runtime Bypass mode changes', async () => {
   assert.match(src, /allowDangerouslySkipPermissions:\s*true/)
 })
 
-test('the gateway-token refresh endpoint covers every credential sink (#1363)', async () => {
-  // Source-text pin (the handler needs a booted daemon to exercise): the CP
-  // gates admission-time refresh on the 'token-refresh' cap, so the cap and
-  // the route must ship together, and the handler must rewrite ALL THREE
-  // places the create-time token lives — process.env (pi resolves the
-  // $ZWRM_GATEWAY_TOKEN apiKey reference per completion), spec.env (a
-  // seed-deferred construction re-applies it), and the mcp_servers headers
-  // (held by reference by the bridge transports).
+test('session startup and callbacks use the credential broker', async () => {
   const src = await readFile(SERVER, 'utf8')
-  const capsLine = src.split('\n').find((l) => l.trimStart().startsWith('caps:'))
-  assert.ok(capsLine.includes("'token-refresh'"), 'the token-refresh cap must be advertised')
-  assert.match(src, /action === 'gateway-token'/, 'the gateway-token route must be dispatched')
-  assert.match(src, /process\.env\.ZWRM_GATEWAY_TOKEN = token/)
-  assert.match(src, /s\.spec\.env = \{ \.\.\.\(s\.spec\.env \|\| \{\}\), ZWRM_GATEWAY_TOKEN: token \}/)
-  assert.match(src, /s\.spec\.mcp_servers/)
+  assert.match(src, /startSession\(await broker.activate\(spec\)\)/)
+  assert.match(src, /broker.request\(this.url/)
+  assert.doesNotMatch(src, /callback_token|handleGatewayToken/)
+  assert.match(src, /'agent-identity'/)
 })
 
 test('the model-switch endpoint ships with its cap and applies only between turns (#1552)', async () => {
