@@ -130,6 +130,11 @@ export async function createOpenCodeDriver(s, spec, h) {
     h.log(`opencode: no platform config at ${platformCfgPath} (${err?.message || err}); the session has no gateway provider`)
   }
 
+  if (spec.gateway_url && platformCfg?.provider?.[OPENCODE_PROVIDER_ID]) {
+    const provider = platformCfg.provider[OPENCODE_PROVIDER_ID]
+    provider.options = { ...provider.options, baseURL: spec.gateway_url, apiKey: 'broker' }
+  }
+
   // The model's context window (#1553), from the catalog the control plane
   // seeded (build.OpenCodeConfigJSON writes limit.context per model) or the
   // org's live ext/ catalog; undefined when neither names the model.
