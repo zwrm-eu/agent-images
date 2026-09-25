@@ -27,6 +27,13 @@ const COMPACT_STATUS_GRACE_MS = 2_000
 // local command, so it is consumed here rather than landing on the timeline
 // as a turn of its own (whether the CLI sends one is not promised).
 const COMPACT_RESULT_GRACE_MS = 5_000
+// A background task that settles while the session is idle usually wakes the
+// CLI: it hands the task's notification to the model as a turn of its own
+// (#1613), whose init followed the settle by about 80 ms in the trace. The
+// drain re-emit waits this long for that init, so a run is not completed and
+// its VM released just as the turn starts. Well inside the reaper's 30 s
+// idle backstop.
+const DRAIN_REEMIT_GRACE_MS = 5_000
 
 const CLOSED = Symbol('closed')
 
@@ -221,7 +228,10 @@ async function claudeOutcome(h, pending) {
 // h (helpers) supplies the shared machinery still owned by server.mjs:
 // { log, syncToDisk, setState, isDone, textResult, parkTurn,
 //   isEscalatedTool, VERSION, MAX_SLEEP_SECONDS }
-export function createClaudeDriver(s, spec, h) {
+//
+// opts is the test seam: startQuery stands in for the SDK's query() and
+// drainGraceMs for DRAIN_REEMIT_GRACE_MS.
+export function createClaudeDriver(s, spec, h, { startQuery = query, drainGraceMs = DRAIN_REEMIT_GRACE_MS } = {}) {
   const inputQueue = new PromiseQueue()
   // consumed counts input items handed to the SDK. The SDK's input pump is
   // EAGER (streamInput pops the queue within a microtask of a push), so
@@ -250,6 +260,14 @@ export function createClaudeDriver(s, spec, h) {
   // The last assistant call's usage (#1553): its input plus cache reads and
   // writes plus output is the size of the context at that call.
   let lastAssistantUsage = null
+  // The drain re-emit waiting out its grace (#1613); a turn that starts
+  // drops it, because that turn's result reports idle with the live count.
+  let drainReemit = null
+  // Task notifications that reached the CLI during a turn (#1613). A task
+  // that settles while the model writes its final reply is handed to it as
+  // a turn of its own right after the result, so the result's idle counts
+  // them as live work until the next turn starts or the grace passes.
+  let owedNotifications = 0
 
   // Task-list ledger (#1424): TodoWrite calls become durable todo.updated
   // events once their tool_result confirms the list was actually adopted.
@@ -387,14 +405,72 @@ export function createClaudeDriver(s, spec, h) {
       // flowing into a running one — setState no-ops then). This is the
       // working-side half of the status derivation (#913): it heals the
       // transient idle when a message lands in the instant around a result.
-      h.setState(s, 'working')
+      startWorking()
       yield item
     }
   }
 
   // A synchronous throw here (option validation, spawn setup) propagates to
   // the caller, which owns not publishing a half-initialized session.
-  q = query({ prompt: input(), options })
+  q = startQuery({ prompt: input(), options })
+
+  // Every flip to working is a turn starting or steering into a live one,
+  // and a turn reports idle with the live background count when it ends, so
+  // a drain re-emit still waiting out its grace is dropped.
+  function startWorking() {
+    clearTimeout(drainReemit)
+    drainReemit = null
+    h.setState(s, 'working')
+  }
+
+  // The CLI opens every turn with an init, including a turn it starts on its
+  // own to hand a settled background task's notification to the model
+  // (#1613). No input is consumed for that turn, so the init is the only
+  // sign of it: flip working before the init is emitted, so the init and the
+  // rest of the turn carry the turn's ID and its result settles idle like any
+  // other. A prompted turn is already working here, and a starting turn
+  // takes the notifications queued for it. Skipped:
+  //  - a manual compaction, which also opens with an init (#1601 trace, seq
+  //    61) but is not a turn: the session stays idle under the daemon's
+  //    reservation (#1553);
+  //  - an interrupt still draining: the init is most likely the aborted
+  //    turn's own, and handleInterrupt owns the idle decision, so a result
+  //    landing inside the drain skips the idle flip and would leave the
+  //    session working. A turn the CLI does start there settles through the
+  //    interrupt-raced re-emit, as before.
+  function onInit() {
+    owedNotifications = 0
+    if (s.state !== 'idle' || pendingCompact || awaitingCompactResult || h.isTurnDraining(s)) return
+    startWorking()
+  }
+
+  // Background-task ledger (#1251). A settle that drains the ledger while
+  // the session is already idle is re-announced: the CP deferred run
+  // completion on the earlier idle status (it carried a non-zero count), and
+  // with the turn over nothing else would ever emit the zero it is waiting
+  // for. A notification mid-turn is owed work the result reports (#1613).
+  function applyTaskLedger(msg) {
+    if (msg.subtype === 'task_notification' && s.state !== 'idle') owedNotifications++
+    const hadBackground = countBackgroundTasks(s.backgroundTasks) > 0
+    applyTaskMessage(s.backgroundTasks, msg)
+    if (hadBackground && s.state === 'idle' && countBackgroundTasks(s.backgroundTasks) === 0) armDrainReemit()
+  }
+
+  // The zero waits out a grace: a settled task usually wakes the CLI into a
+  // turn of its own (#1613), and a zero landing just before that turn starts
+  // would complete the run and release the VM under it. Raw emit, because
+  // setState suppresses same-state transitions (precedent: the
+  // interrupt-raced result re-emit below).
+  function armDrainReemit() {
+    clearTimeout(drainReemit)
+    drainReemit = setTimeout(() => {
+      drainReemit = null
+      if (s.state === 'idle' && countBackgroundTasks(s.backgroundTasks) === 0) {
+        s.pusher.emit('session.status', { state: 'idle', background_tasks: 0 })
+      }
+    }, drainGraceMs)
+    drainReemit.unref?.()
+  }
 
   async function listCommands() {
     if (latestCommands === null) {
@@ -525,7 +601,7 @@ export function createClaudeDriver(s, spec, h) {
       parent_tool_use_id: null,
       session_id: s.sdkSessionId || '',
     })
-    h.setState(s, 'working')
+    startWorking()
     return true
   }
 
@@ -534,28 +610,16 @@ export function createClaudeDriver(s, spec, h) {
       for await (const msg of q) {
         switch (msg.type) {
           case 'system':
-            if (msg.subtype === 'init' && msg.session_id) {
-              s.sdkSessionId = msg.session_id
+            if (msg.subtype === 'init') {
+              if (msg.session_id) s.sdkSessionId = msg.session_id
+              onInit()
             }
             if (msg.subtype === 'commands_changed') {
               latestCommands = normalizeCommandList(msg.commands)
             }
             if (msg.subtype === 'compact_boundary') onCompactBoundary(msg)
             if (msg.subtype === 'status') onCompactStatus(msg)
-            // Background-task ledger (#1251). A settle that drains the ledger
-            // while the session is already idle is re-announced: the CP
-            // deferred run completion on the earlier idle status (it carried a
-            // non-zero count), and with the turn over nothing else would ever
-            // emit the zero it is waiting for. Raw emit — setState suppresses
-            // same-state transitions (precedent: the interrupt-raced result
-            // re-emit below).
-            {
-              const hadBackground = countBackgroundTasks(s.backgroundTasks) > 0
-              applyTaskMessage(s.backgroundTasks, msg)
-              if (hadBackground && s.state === 'idle' && countBackgroundTasks(s.backgroundTasks) === 0) {
-                s.pusher.emit('session.status', { state: 'idle', background_tasks: 0 })
-              }
-            }
+            applyTaskLedger(msg)
             s.pusher.emit('sdk.system', msg)
             break
           case 'assistant':
@@ -623,7 +687,14 @@ export function createClaudeDriver(s, spec, h) {
               // Idle statuses carry the live background-task count (#1251):
               // a non-zero count tells the CP to defer run completion (the
               // VM release would kill the tasks) until the drain re-emit.
-              const bg = countBackgroundTasks(s.backgroundTasks)
+              // Notifications that reached the CLI during this turn count
+              // too (#1613): the CLI may start a turn for them right after
+              // this result, and the grace re-emits zero if it does not.
+              const owed = owedNotifications
+              owedNotifications = 0
+              const live = countBackgroundTasks(s.backgroundTasks)
+              const bg = live + owed
+              if (owed > 0 && live === 0) armDrainReemit()
               if (s.state === 'idle') {
                 // An interrupt flipped the session idle while the result was
                 // still syncing, so its idle event outran this result and the
@@ -809,7 +880,20 @@ export function createClaudeDriver(s, spec, h) {
           session_id: s.sdkSessionId || '',
         })
       }
-      const payload = await slot.promise
+      let payload
+      try {
+        payload = await slot.promise
+      } catch (err) {
+        // Only a timeout leaves the slot recorded as in flight (every other
+        // rejection clears it first). The CLI never answered, so nothing it
+        // sends later belongs to this compaction; left set, it would refuse
+        // every later compaction and hide self-started turns (#1613).
+        if (pendingCompact === slot) {
+          pendingCompact = null
+          awaitingCompactResult = false
+        }
+        throw err
+      }
       if (awaitingCompactResult) {
         const resultSlot = pendingWithTimeout(COMPACT_RESULT_GRACE_MS, 'no result')
         resultSlot.promise.catch(() => {})
