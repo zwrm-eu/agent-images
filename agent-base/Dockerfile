@@ -158,7 +158,19 @@ USER agent
 ENV HOME=/home/agent
 
 # -- Claude Code (native installer) -------------------------------------------
-RUN curl -fsSL https://claude.ai/install.sh | bash
+# PINNED (#1609): this version IS the fleet's Claude Code. Workspaces never
+# self-update — harness sessions drive the CLI headless through the Agent SDK,
+# and its auto-updater lives in the interactive UI — so new workspaces run
+# exactly this, and long-lived ones switch to it at boot
+# (zwrm_refresh_claude_launcher in build/initsh/prologue.sh). The unpinned
+# `install.sh | bash` sat behind the GHA layer cache and moved only on
+# accidental cache misses (the #968 trap). Bump deliberately, with a live
+# session check: a new model can need a newer CLI, and the API refuses older
+# ones (Opus 5.5 needs >= 2.1.280, #1606). The `test` fails the build unless
+# the installed binary is the version asked for.
+ARG CLAUDE_CODE_VERSION=2.1.281
+RUN curl -fsSL https://claude.ai/install.sh | bash -s -- "${CLAUDE_CODE_VERSION}" \
+    && test "$(/home/agent/.local/bin/claude --version | cut -d' ' -f1)" = "${CLAUDE_CODE_VERSION}"
 ENV PATH="/home/agent/.local/bin:${PATH}"
 
 # -- SSH server configuration --------------------------------------------------
