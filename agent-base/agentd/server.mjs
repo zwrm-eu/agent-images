@@ -19,7 +19,13 @@
 //    plane fans out live but does not persist — replay needs only durable
 //    events, since the complete sdk.assistant message supersedes its partials;
 //  - pushes are batched, single-in-flight, in-order, retried with backoff,
-//    and idempotent for the receiver (dedup on (session_id, seq)).
+//    and idempotent for the receiver (dedup on (session_id, seq));
+//  - no event can hold up the ones behind it (#1631): durable payloads are
+//    size-bounded at emit, batches by bytes as well as count, and a batch
+//    the control plane refuses as too large is split until the refused
+//    event stands alone, then replaced by a stub under its seq. Any other
+//    refusal is retried like a 5xx, so a durable event is never dropped.
+//    See event-pusher.mjs.
 
 import { createServer } from 'node:http'
 import { CredentialBroker } from './credential-broker.mjs'
@@ -38,9 +44,8 @@ import { parkDeadlineError } from './drivers/run-tools.mjs'
 import { TOOL_POLICIES } from './drivers/tool-policy.mjs'
 import { countBackgroundTasks } from './drivers/claude-tasks.mjs'
 import { seedState, waitSeedClear, SEED_WAIT_MAX_MS, SEED_FAILED_MESSAGE } from './seedgate.mjs'
-import { TurnEventContext } from './turn-events.mjs'
-import { permissionDecisionPayload } from './event-payloads.mjs'
-import { ChangedFileTracker } from './changed-files.mjs'
+import { EventPusher } from './event-pusher.mjs'
+import { decisionForRequest, permissionDecisionPayload } from './event-payloads.mjs'
 import { prepareMessage } from './message-context.mjs'
 import { MessageReceipts } from './message-receipts.mjs'
 import { searchWorkspaceFiles } from './file-search.mjs'
@@ -59,15 +64,6 @@ import {
 
 const DEFAULT_PORT = 9924
 const MAX_BODY_BYTES = 1024 * 1024
-// One in-flight batch keeps ordering; the short flush window coalesces token
-// partials without adding visible latency.
-const FLUSH_MS = 150
-const MAX_BATCH = 200
-const MAX_RETRY_MS = 30_000
-// Beyond this queue depth (control plane unreachable), ephemeral partials are
-// dropped oldest-first; durable events are never dropped — they are what
-// replay is built from.
-const MAX_QUEUE = 50_000
 
 const PERMISSION_MODES = new Set(['default', 'acceptEdits', 'plan', 'bypassPermissions'])
 
@@ -170,189 +166,6 @@ function platformToolsTokenMatches(s, presented) {
 function tokenMatches(presented) {
   if (typeof presented !== 'string' || presented === '') return false
   return timingSafeEqual(createHash('sha256').update(presented).digest(), tokenDigest)
-}
-
-// ---- event pusher ---------------------------------------------------------------
-
-class EventPusher {
-  constructor(url, sessionId) {
-    this.url = url
-    this.sessionId = sessionId
-    this.queue = []
-    this.seq = 0
-    this.timer = null
-    this.inFlight = false
-    this.retryMs = 1000
-    this.stopped = false
-    this.turns = new TurnEventContext()
-    this.changedFiles = new ChangedFileTracker()
-  }
-
-  beginTurn(harness) {
-    const wasDraining = this.turns.drainingTurnId !== null
-    const started = this.turns.begin(harness)
-    if (started && !wasDraining) this.changedFiles.reset()
-    if (started) this.emit('turn.started', started.payload, { turnId: started.turnId })
-    return this.turns.activeTurnId
-  }
-
-  completeTurn(status = 'completed') {
-    const completed = this.turns.complete(status)
-    if (completed) this.emit('turn.completed', completed.payload, { turnId: completed.turnId })
-    return completed?.turnId ?? null
-  }
-
-  rotateTurn(harness, status = 'completed') {
-    const { completed, started } = this.turns.rotate(harness, status)
-    if (completed) this.emit('turn.completed', completed.payload, { turnId: completed.turnId })
-    this.changedFiles.reset()
-    if (started) this.emit('turn.started', started.payload, { turnId: started.turnId })
-    return started?.turnId ?? null
-  }
-
-  startDrainingTurn(status = 'interrupted') {
-    const completed = this.turns.startDraining(status)
-    if (completed) this.emit('turn.completed', completed.payload, { turnId: completed.turnId })
-    return completed?.turnId ?? null
-  }
-
-  finishDrainingTurn(turnId) {
-    this.turns.finishDraining(turnId)
-    this.changedFiles.reset()
-  }
-
-  isTurnDraining() {
-    return this.turns.drainingTurnId !== null
-  }
-
-  emit(type, payload, options = {}) {
-    const ephemeral = options.ephemeral ?? false
-    let turnId = Object.prototype.hasOwnProperty.call(options, 'turnId')
-      ? options.turnId
-      : this.turns.implicitEventTurnId(type)
-    // Terminal drivers set s.state directly, so close any open turn here.
-    // setState handles ordinary idle and interrupt paths earlier.
-    if ((type === 'session.ended' || type === 'session.error') && this.turns.activeTurnId) {
-      this.completeTurn(type === 'session.error' ? 'error' : 'ended')
-      turnId = null
-    }
-    this.seq++
-    const ev = {
-      seq: this.seq,
-      ts: new Date().toISOString(),
-      type,
-      payload,
-      ...(turnId ? { turn_id: turnId } : {}),
-      ...(ephemeral ? { ephemeral: true } : {}),
-    }
-    if (this.queue.length >= MAX_QUEUE) {
-      if (ephemeral) return ev.seq // shed the new partial; it is superseded anyway
-      const idx = this.queue.findIndex((e) => e.ephemeral)
-      if (idx >= 0) {
-        // Evicting inside an in-flight batch region is safe: delivery removal
-        // is by seq, never by position.
-        this.queue.splice(idx, 1)
-      } else if (this.queue.length % 1000 === 0) {
-        // Durables are NEVER dropped (replay is built from them); the queue
-        // grows past the cap instead. Growth is self-limiting: user input
-        // arrives via the control plane, so a CP outage stops new turns once
-        // the current one finishes. Log periodically for diagnosability.
-        log(`event queue over cap with ${this.queue.length} durable events pending`)
-      }
-    }
-    this.queue.push(ev)
-    this.schedule()
-    const changedFiles = this.changedFiles.observe(type, payload)
-    if (changedFiles.length > 0 && turnId) {
-      this.emit('turn.files_changed', { files: changedFiles }, { turnId })
-    }
-    return ev.seq
-  }
-
-  schedule(delay = FLUSH_MS) {
-    if (this.timer || this.inFlight || this.stopped) return
-    this.timer = setTimeout(() => {
-      this.timer = null
-      this.flush()
-    }, delay)
-  }
-
-  async flush() {
-    if (this.inFlight || this.stopped || this.queue.length === 0) return
-    this.inFlight = true
-    const batch = this.queue.slice(0, MAX_BATCH)
-    try {
-      const res = await broker.request(this.url, {
-        method: 'POST',
-        headers: {
-          'content-type': 'application/json',
-        },
-        body: JSON.stringify({ session_id: this.sessionId, events: batch }),
-        signal: AbortSignal.timeout(15_000),
-      }, this.sessionId)
-      if ([401, 403, 404, 410].includes(res.status)) {
-        // Permanent: the session was deleted or the token rotated. Retrying
-        // forever would only spam the log and network.
-        log(`callback rejected events with ${res.status}; stopping pusher for session ${this.sessionId}`)
-        broker.deactivate(this.sessionId)
-        this.queue.length = 0
-        this.inFlight = false
-        this.stop()
-        return
-      }
-      if (!res.ok) throw new Error(`callback returned ${res.status}`)
-      // Remove by seq, not position: emit()'s overflow eviction may have
-      // mutated the queue under this await, so positional splice could
-      // discard an event that was never sent.
-      if (batch.some(e => e.type === 'session.ended' || e.type === 'session.error')) {
-        broker.deactivate(this.sessionId)
-        this.queue.length = 0
-        this.inFlight = false
-        this.stop()
-        return
-      }
-      const lastSeq = batch[batch.length - 1].seq
-      while (this.queue.length > 0 && this.queue[0].seq <= lastSeq) this.queue.shift()
-      this.retryMs = 1000
-      this.inFlight = false
-      if (this.queue.length > 0) this.schedule(0)
-    } catch (err) {
-      this.inFlight = false
-      if ([401, 403, 404, 410].includes(err.status)) {
-        log(`callback identity revoked for session ${this.sessionId}: ${err.message}`)
-        broker.deactivate(this.sessionId)
-        this.queue.length = 0
-        this.stop()
-        return
-      }
-      log(`event push failed (${batch.length} events, retry in ${this.retryMs}ms): ${err.message}`)
-      this.schedule(this.retryMs)
-      this.retryMs = Math.min(this.retryMs * 2, MAX_RETRY_MS)
-    }
-  }
-
-  stop() {
-    this.stopped = true
-    if (this.timer) {
-      clearTimeout(this.timer)
-      this.timer = null
-    }
-  }
-
-  // Best-effort flush, then stop. Used on shutdown and when a finished
-  // session is replaced (so no immortal retry loop outlives its session).
-  async drain(timeoutMs = 5000) {
-    const deadline = Date.now() + timeoutMs
-    while (this.queue.length > 0 && !this.stopped && Date.now() < deadline) {
-      if (this.timer) {
-        clearTimeout(this.timer)
-        this.timer = null
-      }
-      await this.flush()
-      if (this.queue.length > 0) await new Promise((r) => setTimeout(r, 250))
-    }
-    this.stop()
-  }
 }
 
 // ---- session ----------------------------------------------------------------------
@@ -514,7 +327,7 @@ async function startSession(spec) {
     // immediate subprocess. Both exclude message/command/shell admission so
     // output and turn boundaries cannot interleave ambiguously.
     controlBusy: null,
-    pusher: new EventPusher(spec.callback_url, spec.session_id),
+    pusher: new EventPusher(spec.callback_url, spec.session_id, { broker, log }),
     lastResult: null,
     ending: false,
     driver: null,
@@ -1277,11 +1090,15 @@ async function handlePermission(req, res, s, requestId) {
     throw badRequest('a question needs answers: updated_input.answers keyed by question id (a string, or an array of labels for multiSelect)')
   }
   s.pending.delete(requestId)
-  s.pusher.emit('permission.decision', permissionDecisionPayload(requestId, body))
+  // The recorded decision is the applied one: an updated_input ignored for a
+  // truncated request (#1631) is not in the timeline either.
+  const decision = decisionForRequest(p, body, s.pusher.truncatedPermissionRequests.delete(requestId))
+  if (decision !== body) log(`session ${s.id}: ignoring updated_input for permission ${requestId}: its request went out truncated`)
+  s.pusher.emit('permission.decision', permissionDecisionPayload(requestId, decision))
   p.resolve(
-    body.behavior === 'allow'
-      ? { behavior: 'allow', updatedInput: body.updated_input ?? p.input }
-      : { behavior: 'deny', message: body.message || 'denied by user', interrupt: false },
+    decision.behavior === 'allow'
+      ? { behavior: 'allow', updatedInput: decision.updated_input ?? p.input }
+      : { behavior: 'deny', message: decision.message || 'denied by user', interrupt: false },
   )
   // The turn resumes once the last outstanding approval clears: blocked ->
   // working, which the CP reads as the run leaving needs_attention (#731).
