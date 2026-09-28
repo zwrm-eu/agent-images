@@ -1,5 +1,17 @@
 import { hasAnswers } from './drivers/questions.mjs'
 
+// decisionForRequest drops updated_input from a decision on a request whose
+// permission.request event did not reach the timeline whole (#1631): the
+// client saw a truncated copy of the input, and an approval echoing it back
+// would run the truncated input. The approval then runs the input the harness
+// asked about. A question keeps updated_input: its answers ride there, and
+// every driver reads only the answers from it.
+export function decisionForRequest(pending, body, inputTruncated) {
+  if (!inputTruncated || pending.kind === 'question' || body.updated_input == null) return body
+  const { updated_input: _ignored, ...rest } = body
+  return rest
+}
+
 export function permissionDecisionPayload(requestId, body) {
   return {
     request_id: requestId,

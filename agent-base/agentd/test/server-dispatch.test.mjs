@@ -125,7 +125,10 @@ test('claude sessions opt in to runtime Bypass mode changes', async () => {
 test('session startup and callbacks use the credential broker', async () => {
   const src = await readFile(SERVER, 'utf8')
   assert.match(src, /startSession\(await broker.activate\(spec\)\)/)
-  assert.match(src, /broker.request\(this.url/)
+  // The pusher lives in its own module (#1631); the daemon hands it the broker.
+  assert.match(src, /new EventPusher\(spec\.callback_url, spec\.session_id, \{ broker, log \}\)/)
+  const pusher = await readFile(join(dirname(SERVER), 'event-pusher.mjs'), 'utf8')
+  assert.match(pusher, /this\.broker\.request\(this\.url/)
   assert.doesNotMatch(src, /callback_token|handleGatewayToken/)
   assert.match(src, /'agent-identity'/)
 })
@@ -208,6 +211,21 @@ test('an approval that answers no question is refused before the decision is rec
   const guard = handler.indexOf("body.behavior === 'allow' && p.kind === 'question' && !answeredQuestions(p.input, body.updated_input?.answers)")
   const del = handler.indexOf('s.pending.delete(requestId)')
   const emit = handler.indexOf("s.pusher.emit('permission.decision'")
+  // #1631: a request whose event went out truncated must not run an
+  // updated_input echoed back from it. The decision passes through
+  // decisionForRequest, keyed by the same id the drivers emit and park on,
+  // and both the recorded and the applied decision are its result.
+  const filter = handler.indexOf('const decision = decisionForRequest(p, body, s.pusher.truncatedPermissionRequests.delete(requestId))')
+  assert.ok(filter > del && filter < emit, 'handlePermission must filter the decision before recording it')
+  assert.match(handler, /permissionDecisionPayload\(requestId, decision\)/)
+  assert.match(handler, /updatedInput: decision\.updated_input \?\? p\.input/)
+  assert.doesNotMatch(handler, /body\.updated_input \?\? p\.input/)
+  for (const driver of ['claude', 'codex', 'opencode', 'pi']) {
+    const dsrc = await readFile(join(dirname(SERVER), 'drivers', `${driver}.mjs`), 'utf8')
+    assert.match(dsrc, /s\.pusher\.emit\('permission\.request', \{\s*request_id: requestId,/,
+      `${driver} must emit permission.request with the request_id decisions arrive with`)
+    assert.match(dsrc, /s\.pending\.set\(requestId, /, `${driver} must park the request under that same id`)
+  }
   assert.ok(guard > 0, 'handlePermission must gate question approvals on answeredQuestions')
   assert.ok(guard < del && guard < emit, 'the guard must precede the delete and the decision event')
   // Every driver stamps kind on its question entries, or the guard is inert:
