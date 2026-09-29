@@ -125,8 +125,27 @@ test('claude sessions opt in to runtime Bypass mode changes', async () => {
 test('session startup and callbacks use the credential broker', async () => {
   const src = await readFile(SERVER, 'utf8')
   assert.match(src, /startSession\(await broker.activate\(spec\)\)/)
-  // The pusher lives in its own module (#1631); the daemon hands it the broker.
-  assert.match(src, /new EventPusher\(spec\.callback_url, spec\.session_id, \{ broker, log \}\)/)
+  // The pusher lives in its own module (#1631); the daemon hands it the broker,
+  // and a pusher that stops for good ends its session (#1664) rather than
+  // leaving turns to run where no client can see them.
+  assert.match(src, /new EventPusher\(spec\.callback_url, spec\.session_id, \{ broker, log, onStopped: \(reason\) => endUndeliverable\(s, reason\) \}\)/)
+  const end = src.slice(src.indexOf('\nfunction endUndeliverable('), src.indexOf('\nfunction readMemFreeMB('))
+  assert.ok(end.length > 0, 'server.mjs must define endUndeliverable')
+  for (const step of [/if \(isDone\(s\) \|\| s\.ending\) return/, /s\.ending = true/, /cancelPendingPermissions\(s,/, /cancelPendingParks\(s,/, /s\.driver\?\.beginEnd\(\)/]) {
+    assert.match(end, step, `endUndeliverable must end the session like handleEnd: ${step}`)
+  }
+  // …stops a live turn rather than let it run unseen, and says so in
+  // /healthz, where the control plane finalizes the row it will never hear
+  // ended.
+  assert.match(end, /s\.undeliverable = reason/)
+  assert.match(end, /s\.driver\.interrupt\(\)/)
+  // codex and opencode finish on the turn's result, which the interrupt
+  // suppresses: the wind-down is started again once the turn is over.
+  assert.match(end, /if \(!isDone\(s\)\) s\.driver\.beginEnd\(\)/)
+  // Recorded before the early return: an End during the refusal streak must
+  // not leave the lost session.ended unreported.
+  assert.ok(end.indexOf('s.undeliverable = reason') < end.indexOf('if (isDone(s) || s.ending) return'))
+  assert.match(src, /undeliverable_session: session\?\.undeliverable \? session\.id : null/)
   const pusher = await readFile(join(dirname(SERVER), 'event-pusher.mjs'), 'utf8')
   assert.match(pusher, /this\.broker\.request\(this\.url/)
   assert.doesNotMatch(src, /callback_token|handleGatewayToken/)

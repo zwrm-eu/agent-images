@@ -6,7 +6,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { EventPusher, MAX_BATCH, MAX_BATCH_BYTES, MIN_BATCH_BYTES } from '../event-pusher.mjs'
+import { EventPusher, MAX_BATCH, MAX_BATCH_BYTES, MIN_BATCH_BYTES, MAX_RENEWAL_REFUSALS } from '../event-pusher.mjs'
 import { MAX_EVENT_PAYLOAD_BYTES } from '../event-bounds.mjs'
 
 const MiB = 1 << 20
@@ -25,6 +25,7 @@ function fakeCP(respond) {
     posts: [],
     delivered: [],
     deactivated: [],
+    stops: [],
     logs: [],
     broker: {
       async request(url, init, sessionID) {
@@ -48,6 +49,7 @@ function fakeCP(respond) {
   cp.pusher = new EventPusher('http://cp/events', 'sess-1', {
     broker: cp.broker,
     log: (...args) => cp.logs.push(args.join(' ')),
+    onStopped: (reason) => cp.stops.push(reason),
     flushMs: 0,
     retryMs: 1,
     maxRetryMs: 4,
@@ -296,6 +298,92 @@ test('events emitted while a refused batch is in flight still arrive in order', 
   assert.deepEqual(cp.delivered[4].payload, { late: 2 })
 })
 
+// refusingRenewals makes the fake broker throw what a refused renewal throws
+// (credential-broker.mjs renew), stamped with the broker's count of refusals
+// in a row, while refuse(n) says so for the nth request.
+function refusingRenewals(cp, status, refuse) {
+  const request = cp.broker.request
+  let n = 0
+  let refused = 0
+  cp.broker.request = async (...args) => {
+    if (refuse(n++)) {
+      const err = new Error(`metadata identity renewal refused (${status}): agent identity refused`)
+      err.status = status
+      err.refusals = ++refused
+      throw err
+    }
+    refused = 0
+    return request(...args)
+  }
+}
+
+// #1664: a woken VM renews before the wake has recorded it, and the broker
+// hands that refusal to the next push. Taking it for revocation stopped the
+// pusher for the rest of the session while turns kept running.
+test('a refused renewal is retried; it is revocation only once it persists', async () => {
+  for (const status of [401, 403, 404, 410]) {
+    const cp = fakeCP(() => 200)
+    refusingRenewals(cp, status, (n) => n < MAX_RENEWAL_REFUSALS - 1)
+    cp.pusher.emit('session.status', { permission_mode: 'bypassPermissions' })
+    cp.pusher.emit('turn.started', { harness: 'claude' })
+    await settled(cp.pusher)
+    assert.equal(cp.pusher.stopped, false, `stopped on ${MAX_RENEWAL_REFUSALS - 1} ${status} renewals`)
+    assert.deepEqual([cp.deactivated, cp.stops], [[], []])
+    assert.deepEqual(cp.delivered.map((e) => e.seq), [1, 2])
+    assert.ok(cp.logs.some((l) => l.includes('event push failed') && l.includes(`(${status})`)), cp.logs.join('\n'))
+  }
+})
+
+// A revoked identity (the session ended on the control plane, the agent's
+// creator left the org) is refused on every try, and the control plane never
+// answers the callback itself: its auth refuses the bearer first. The pusher
+// must still give up, and say so, or the daemon runs turns no one sees.
+test('refusals that persist stop the pusher once and report it', async () => {
+  const cp = fakeCP(() => 200)
+  refusingRenewals(cp, 403, () => true)
+  cp.pusher.emit('sdk.assistant', { n: 1 })
+  await settled(cp.pusher)
+  assert.equal(cp.pusher.stopped, true)
+  assert.equal(cp.posts.length, 0)
+  assert.deepEqual(cp.deactivated, ['sess-1'])
+  assert.equal(cp.stops.length, 1)
+  assert.match(cp.stops[0], new RegExp(`refused ${MAX_RENEWAL_REFUSALS} times in a row`))
+  cp.pusher.emit('sdk.assistant', { n: 2 })
+  await new Promise((r) => setTimeout(r, 20))
+  assert.equal(cp.stops.length, 1, 'a stopped pusher reports once')
+})
+
+test('a stopped pusher queues nothing more', async () => {
+  const cp = fakeCP(() => 404)
+  cp.pusher.emit('sdk.assistant', { n: 1 })
+  await settled(cp.pusher)
+  assert.equal(cp.pusher.stopped, true)
+  // The rest of the session it gave up on: the wind-down, session.ended.
+  for (let i = 0; i < 100; i++) cp.pusher.emit('sdk.assistant', { n: i })
+  cp.pusher.emit('session.ended', {})
+  assert.equal(cp.pusher.queue.length, 0)
+})
+
+// A throw without the broker's count (a transit failure, or a broker that
+// predates it) is never taken for revocation.
+test('a refusal with no count behind it is retried', async () => {
+  const cp = fakeCP(() => 200)
+  let n = 0
+  const request = cp.broker.request
+  cp.broker.request = async (...args) => {
+    if (n++ < 2 * MAX_RENEWAL_REFUSALS) {
+      const err = new Error('refused')
+      err.status = 403
+      throw err
+    }
+    return request(...args)
+  }
+  cp.pusher.emit('sdk.assistant', { n: 1 })
+  await settled(cp.pusher)
+  assert.equal(cp.pusher.stopped, false)
+  assert.deepEqual(cp.delivered.map((e) => e.seq), [1])
+})
+
 test('401/403/404/410 still stop the pusher for good', async () => {
   for (const status of [401, 403, 404, 410]) {
     const cp = fakeCP(() => status)
@@ -305,5 +393,6 @@ test('401/403/404/410 still stop the pusher for good', async () => {
     assert.equal(cp.posts.length, 1)
     assert.equal(cp.pusher.stopped, true)
     assert.deepEqual(cp.deactivated, ['sess-1'])
+    assert.equal(cp.stops.length, 1, 'the daemon hears that delivery stopped (#1664)')
   }
 })

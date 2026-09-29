@@ -327,7 +327,7 @@ async function startSession(spec) {
     // immediate subprocess. Both exclude message/command/shell admission so
     // output and turn boundaries cannot interleave ambiguously.
     controlBusy: null,
-    pusher: new EventPusher(spec.callback_url, spec.session_id, { broker, log }),
+    pusher: new EventPusher(spec.callback_url, spec.session_id, { broker, log, onStopped: (reason) => endUndeliverable(s, reason) }),
     lastResult: null,
     ending: false,
     driver: null,
@@ -1200,6 +1200,41 @@ function handleEnd(res, s) {
   send(res, 202, { ending: true })
 }
 
+// endUndeliverable ends a live session whose events can no longer reach the
+// control plane (#1664): it refused them, or revoked the session's identity.
+// Its turns would run where no client can see them, which is how chats went
+// silent for good. Ending it closes the driver's input, so new messages get
+// the finished-session 409. /healthz names it as undeliverable_session, since
+// its session.ended can never arrive: the control plane finalizes the row
+// when a send or End finds it so, and the next create starts afresh.
+function endUndeliverable(s, reason) {
+  // Recorded even when the session is already ending or done: its
+  // session.ended is lost either way, so the CP must still finalize it.
+  s.undeliverable = reason
+  if (isDone(s) || s.ending) return
+  log(`session ${s.id}: event delivery stopped (${reason}); ending the session`)
+  s.ending = true
+  cancelPendingPermissions(s, 'session event delivery stopped')
+  cancelPendingParks(s, 'session event delivery stopped; sleep aborted')
+  s.driver?.beginEnd()
+  // A turn in flight would run on unseen, spending tokens and running tools
+  // (claude's model credential is not brokered): interrupt it, as the
+  // control plane stops an orphaned session.
+  if ((s.state === 'working' || s.state === 'blocked') && typeof s.driver?.interrupt === 'function') {
+    const drainingTurnId = s.pusher.startDrainingTurn('interrupted')
+    Promise.resolve()
+      .then(() => s.driver.interrupt())
+      .catch((err) => log(`session ${s.id}: interrupt after delivery stopped failed: ${err?.message || err}`))
+      .finally(() => {
+        s.pusher.finishDrainingTurn(drainingTurnId)
+        // codex and opencode leave the wind-down to the turn's result, which
+        // the interrupt suppresses: end again now the turn is over (every
+        // driver's beginEnd is idempotent).
+        if (!isDone(s)) s.driver.beginEnd()
+      })
+  }
+}
+
 // In-guest memory reclaim (#851): drop the page cache and compact so
 // virtio-balloon free page reporting can hand idle memory back to the host
 // (FPR only sees FREE pages; cache pins host RSS until dropped). Runs the
@@ -1310,6 +1345,10 @@ const server = createServer(async (req, res) => {
         caps: ['mcp', 'escalation', 'files', 'file-search', 'message-context', 'message-receipts', 'park', 'reclaim', 'skillfetch', 'pi-multiprovider', 'pi-gateway', 'opencode-gateway', 'background-tasks', 'tool-policy', 'agent-identity', 'commands', 'shell', 'model-switch', 'compact', ...HARNESS_CAPS],
         active_session: session && !isDone(session) ? session.id : null,
         state: session?.state ?? null,
+        // A session ended because its events could no longer reach the
+        // control plane (#1664): its session.ended never will, so the CP
+        // finalizes the row itself.
+        undeliverable_session: session?.undeliverable ? session.id : null,
         // Live background work (#1251): tasks the harness still tracks after
         // a turn's result (background subagents / shells). The idle-suspend
         // sweep and the run reaper defer while this is non-zero.

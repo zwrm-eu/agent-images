@@ -2,6 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { createServer, request } from 'node:http'
 import { CredentialBroker } from '../credential-broker.mjs'
+import { EventPusher, MAX_RENEWAL_REFUSALS } from '../event-pusher.mjs'
 
 async function environment(t) {
   const state = { now: Date.now(), minted: 0, renewalRequests: [], cpNow: null, renewalStatus: 0, accepted: [], rejectNext: false, denyRenewal: false, diagnostics: [] }
@@ -170,4 +171,107 @@ test('CLI renews workspace-only identity even when restore leaves the guest cloc
   // time. CLI calls fail closed instead of handing out a potentially old key.
   state.renewalStatus = 503
   assert.equal((await fetch(broker.url + '/token')).status, 502)
+})
+
+// #1664, the whole chain with the real broker and pusher. A woken VM renews
+// before the wake has recorded it (404 before the machine row, 403 before the
+// workspace link), and the broker serves each refusal again from its backoff.
+// The pusher must retry into the recorded wake, count only the control
+// plane's refusals, and take only a persisting one for revocation.
+async function deliveryEnvironment(t, { parked = true } = {}) {
+  // A clock that moves on every read, so the broker's renewal backoff (1 s,
+  // then 2 s, … 30 s) passes while the pusher retries every few milliseconds.
+  let clock = Date.now()
+  const state = { refusals: [], minted: 0, renewals: 0, events: [], posts: 0, eventsStatus: 200 }
+  const server = createServer(async (req, res) => {
+    if (req.url.startsWith('/agent/identity/')) {
+      // Session renewals only: deactivate() renews the workspace identity.
+      if (req.url.endsWith('/session')) state.renewals++
+      const status = state.refusals === 'forever' ? 403 : state.refusals.shift()
+      if (status) { res.writeHead(status).end('agent identity refused'); return }
+      state.minted++
+      const issued_at = Math.floor(clock / 1000)
+      res.setHeader('content-type', 'application/json')
+      res.end(JSON.stringify({ token: `zwai1.test.${state.minted}`, issued_at, expires_at: issued_at + 3600 }))
+      return
+    }
+    const chunks = []
+    for await (const chunk of req) chunks.push(chunk)
+    state.posts++
+    if (state.eventsStatus !== 200) { res.writeHead(state.eventsStatus).end('{"error":"refused"}'); return }
+    state.events.push(...JSON.parse(Buffer.concat(chunks).toString()).events)
+    res.writeHead(200, { 'content-type': 'application/json' }).end('{"status":"ok"}')
+  })
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
+  const url = `http://127.0.0.1:${server.address().port}`
+  const broker = await new CredentialBroker({ metadataURL: url, platformURL: url, machineID: 'machine', now: () => (clock += 250) }).start(0)
+  // The real 15 s tick would see the fake clock's jumps as a wake and rebuild
+  // the identities mid-test on a slow runner.
+  clearInterval(broker.timer)
+  t.after(async () => { pusher.stop(); await broker.close(); server.closeAllConnections(); await new Promise(resolve => server.close(resolve)) })
+  await broker.activate({ session_id: 'session', mcp_servers: {} })
+  // Count only what the test causes: activate() renewed once.
+  state.renewals = 0
+  const stops = []
+  const pusher = new EventPusher(url + '/v1/internal/agent-sessions/session/events', 'session', { broker, onStopped: reason => stops.push(reason), flushMs: 0, retryMs: 1, maxRetryMs: 4 })
+  // Parked for an hour: the credential has lapsed, so the next push renews.
+  if (parked) clock += 3600_000
+  return { state, broker, pusher, stops }
+}
+
+async function until(done, timeoutMs = 10_000) {
+  const deadline = Date.now() + timeoutMs
+  while (!done()) {
+    if (Date.now() > deadline) throw new Error('timed out')
+    await new Promise(resolve => setTimeout(resolve, 2))
+  }
+}
+
+test('a pusher retries through the renewals a wake refuses', async t => {
+  const { state, pusher, stops } = await deliveryEnvironment(t)
+  state.refusals = [404, 403]
+  pusher.emit('session.status', { permission_mode: 'bypassPermissions' })
+  pusher.emit('turn.started', { harness: 'claude' })
+  await until(() => state.events.length === 2)
+  assert.equal(pusher.stopped, false)
+  assert.deepEqual(stops, [])
+  assert.equal(state.renewals, 3, 'each refusal is one renewal, served again from backoff rather than repeated')
+})
+
+test('a refusal streak the control plane breaks starts over', async t => {
+  const { state, pusher, stops } = await deliveryEnvironment(t)
+  // Refused one short of the limit, a 503 (retryable, e.g. mid-wake), then
+  // refused one short again: never revocation.
+  const short = Array(MAX_RENEWAL_REFUSALS - 1).fill(403)
+  state.refusals = [...short, 503, ...short]
+  pusher.emit('sdk.assistant', { n: 1 })
+  await until(() => state.events.length === 1, 30_000)
+  assert.equal(pusher.stopped, false)
+  assert.deepEqual(stops, [])
+})
+
+test('a pusher gives up on an identity the control plane keeps refusing', async t => {
+  const { state, broker, pusher, stops } = await deliveryEnvironment(t)
+  state.refusals = 'forever'
+  pusher.emit('sdk.assistant', { n: 1 })
+  await until(() => pusher.stopped, 30_000)
+  assert.equal(state.renewals, MAX_RENEWAL_REFUSALS, 'gives up after exactly the limit of real refusals')
+  assert.equal(stops.length, 1)
+  assert.deepEqual(state.events, [])
+  assert.equal(broker.sessionID, '', 'the revoked session identity is deactivated')
+})
+
+// The other way in: a bearer the broker still holds is refused by the callback
+// (401), request() renews once with the bearer marked rejected, and that
+// renewal is refused. Each attempt costs one renewal, and the refusal served
+// again from backoff is not counted twice.
+test('a refused bearer and a refused renewal behind it give up after the same count', async t => {
+  const { state, pusher, stops } = await deliveryEnvironment(t, { parked: false })
+  state.eventsStatus = 401
+  state.refusals = 'forever'
+  pusher.emit('sdk.assistant', { n: 1 })
+  await until(() => pusher.stopped, 30_000)
+  assert.equal(state.posts, 1, 'only the held bearer reaches the callback')
+  assert.equal(state.renewals, MAX_RENEWAL_REFUSALS)
+  assert.equal(stops.length, 1)
 })

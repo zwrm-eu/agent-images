@@ -20,6 +20,11 @@ class RenewableIdentity {
     this.renewing = null
     this.retryAt = 0
     this.failures = 0
+    // Renewals the control plane refused in a row, stamped on each refusal
+    // as err.refusals: callers tell a wake's passing refusal from revocation
+    // by how long it lasts (#1664), and a refusal served again from backoff
+    // must not count twice.
+    this.refused = 0
     this.lastError = null
     this.closed = false
   }
@@ -62,13 +67,19 @@ class RenewableIdentity {
       this.credential = { token: next.token, renewAt: now + lifetime / 2, expiresAt: now + lifetime - EXPIRY_MARGIN_MS }
       this.retryAt = 0
       this.failures = 0
+      this.refused = 0
       if (this.lastError) this.broker.diagnostic('identity renewal recovered', true)
       this.lastError = null
       return next.token
     } catch (err) {
       if (!this.closed && !this.broker.closed) {
         // Revocation must be immediate even if the old token has time left.
-        if ([400, 401, 403, 404, 410].includes(err.status)) this.credential = null
+        if ([400, 401, 403, 404, 410].includes(err.status)) {
+          this.credential = null
+          err.refusals = ++this.refused
+        } else {
+          this.refused = 0
+        }
         if (!this.lastError) this.broker.diagnostic(String(err.message || err), false)
         this.lastError = err
         this.retryAt = this.broker.now() + Math.min(30_000, 1000 * 2 ** Math.min(this.failures++, 5))
