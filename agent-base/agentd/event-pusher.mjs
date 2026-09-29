@@ -29,7 +29,16 @@ const MAX_RETRY_MS = 30_000
 // replay is built from.
 const MAX_QUEUE = 50_000
 
+// The answers that end delivery for good: the callback's own, at once; a
+// renewal's, only once it persists (MAX_RENEWAL_REFUSALS).
 const PERMANENT_STATUSES = [401, 403, 404, 410]
+// Renewals refused in a row (the broker's count, about half a minute of its
+// backoff) before the pusher takes them for revocation (#1664). A woken VM
+// renews before the wake has recorded it; one refusal there cost the session
+// every later event. A revoked identity (the session ended, the agent's
+// creator left the org) is refused on every try, and the control plane never
+// gets to answer the callback itself: its auth refuses the bearer first.
+export const MAX_RENEWAL_REFUSALS = 6
 
 // sizeRefusal says whether the control plane refused a batch for its size:
 // resending those bytes can never succeed, so the batch is split instead of
@@ -44,13 +53,16 @@ function sizeRefusal(status, text) {
 }
 
 export class EventPusher {
-  // broker: the credential broker (request, deactivate). flushMs/retryMs/
-  // maxRetryMs exist for tests; the daemon takes the defaults.
-  constructor(url, sessionId, { broker, log = () => {}, flushMs = FLUSH_MS, retryMs = INITIAL_RETRY_MS, maxRetryMs = MAX_RETRY_MS } = {}) {
+  // broker: the credential broker (request, deactivate). onStopped(reason)
+  // runs once if delivery ends for good, never on a drain or a delivered
+  // session.ended. flushMs/retryMs/maxRetryMs exist for tests; the daemon
+  // takes the defaults.
+  constructor(url, sessionId, { broker, log = () => {}, onStopped = () => {}, flushMs = FLUSH_MS, retryMs = INITIAL_RETRY_MS, maxRetryMs = MAX_RETRY_MS } = {}) {
     this.url = url
     this.sessionId = sessionId
     this.broker = broker
     this.log = log
+    this.onStopped = onStopped
     this.flushMs = flushMs
     this.initialRetryMs = retryMs
     this.maxRetryMs = maxRetryMs
@@ -126,6 +138,9 @@ export class EventPusher {
       turnId = null
     }
     this.seq++
+    // A stopped pusher delivers nothing more: the rest of a session it gave up
+    // on (#1664) would only sit in memory.
+    if (this.stopped) return this.seq
     // Durable events are bounded here, once, so every batch they ride in is
     // sendable (#1631). Partials are left alone: they are token deltas, and
     // shedding them is always safe.
@@ -238,11 +253,7 @@ export class EventPusher {
       if (PERMANENT_STATUSES.includes(res.status)) {
         // Permanent: the session was deleted or the token rotated. Retrying
         // forever would only spam the log and network.
-        this.log(`callback rejected events with ${res.status}; stopping pusher for session ${this.sessionId}`)
-        this.broker.deactivate(this.sessionId)
-        this.queue.length = 0
-        this.inFlight = false
-        this.stop()
+        this.giveUp(`callback rejected events with ${res.status}`)
         return
       }
       if (res.status === 400 || res.status === 413) {
@@ -274,16 +285,33 @@ export class EventPusher {
       if (this.queue.length > 0) this.schedule(0)
     } catch (err) {
       this.inFlight = false
-      if (PERMANENT_STATUSES.includes(err.status)) {
-        this.log(`callback identity revoked for session ${this.sessionId}: ${err.message}`)
-        this.broker.deactivate(this.sessionId)
-        this.queue.length = 0
-        this.stop()
+      // A throw is never the control plane's answer to these events (that is
+      // res.status, above): the broker could not produce a bearer, or the
+      // request failed in transit. A refused renewal is revocation only once
+      // it persists (#1664): see MAX_RENEWAL_REFUSALS.
+      if (PERMANENT_STATUSES.includes(err.status) && err.refusals >= MAX_RENEWAL_REFUSALS) {
+        this.giveUp(`callback identity refused ${err.refusals} times in a row (${err.message})`)
         return
       }
       this.log(`event push failed (${batch.length} events, retry in ${this.retryMs}ms): ${err.message}`)
       this.schedule(this.retryMs)
       this.retryMs = Math.min(this.retryMs * 2, this.maxRetryMs)
+    }
+  }
+
+  // giveUp ends delivery for good. The queue can never be delivered, so it
+  // goes; onStopped lets the daemon end the session rather than run turns no
+  // client can see (#1664).
+  giveUp(reason) {
+    this.log(`${reason}; stopping pusher for session ${this.sessionId}`)
+    this.broker.deactivate(this.sessionId)
+    this.queue.length = 0
+    this.inFlight = false
+    this.stop()
+    try {
+      this.onStopped(reason)
+    } catch (err) {
+      this.log(`ending session ${this.sessionId} after delivery stopped failed: ${err?.message || err}`)
     }
   }
 
