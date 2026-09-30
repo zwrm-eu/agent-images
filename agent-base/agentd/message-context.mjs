@@ -5,8 +5,11 @@ export const ATTACHED_CONTEXT_END = ATTACHED_CONTEXT_MARKER.replace('<', '</')
 
 // The control plane's limits are authoritative. These daemon-side defense-in-
 // depth caps must stay greater than or equal to the corresponding CP caps.
-const MAX_ATTACHMENTS = 8
-const MAX_ATTACHMENT_BYTES = 2 * 1024 * 1024
+// Daemons before #1666 allowed 8 files of 2 MiB each; the control plane sends
+// more than that only to a daemon that advertises the 'bulk-attachments' cap.
+// Any file the workspace upload API accepts (MAX_FILE_BYTES) can be attached.
+export const MAX_ATTACHMENTS = 100
+export const MAX_ATTACHMENT_BYTES = 100 * 1024 * 1024
 
 function cleanAttachment(value) {
   if (!value || typeof value !== 'object') return null

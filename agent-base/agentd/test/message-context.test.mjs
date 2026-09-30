@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { ATTACHED_CONTEXT_MARKER, prepareMessage } from '../message-context.mjs'
+import { ATTACHED_CONTEXT_MARKER, MAX_ATTACHMENT_BYTES, MAX_ATTACHMENTS, prepareMessage } from '../message-context.mjs'
 
 test('prepareMessage adds validated workspace references without file contents', () => {
   const result = prepareMessage('Review this', [{
@@ -28,4 +28,18 @@ test('prepareMessage preserves visible text without requiring an attachment', ()
     text: 'Keep this visible',
     attachments: [],
   })
+})
+
+test('prepareMessage accepts 100 attachments of up to 100 MiB and nothing past either cap', () => {
+  assert.equal(MAX_ATTACHMENTS, 100)
+  assert.equal(MAX_ATTACHMENT_BYTES, 100 * 1024 * 1024)
+  const refs = Array.from({ length: MAX_ATTACHMENTS }, (_, i) => ({
+    id: `a${i}`, path: `.zwrm/chat-attachments/s/a${i}/tender-${i}.pdf`, mime_type: 'application/pdf',
+    size: MAX_ATTACHMENT_BYTES, source: 'upload',
+  }))
+  const result = prepareMessage('Prepare the bid', refs)
+  assert.equal(result.attachments.length, 100)
+  assert.equal(result.prompt.split('\n').filter((line) => line.startsWith('- ')).length, 100)
+  assert.throws(() => prepareMessage('x', [...refs, { path: 'one-more.pdf', size: 1 }]), /too many attachments/)
+  assert.throws(() => prepareMessage('x', [{ path: 'huge.pdf', size: MAX_ATTACHMENT_BYTES + 1 }]), /invalid attachment/)
 })
