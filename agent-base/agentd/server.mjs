@@ -49,6 +49,7 @@ import { decisionForRequest, permissionDecisionPayload } from './event-payloads.
 import { prepareMessage } from './message-context.mjs'
 import { MessageReceipts } from './message-receipts.mjs'
 import { searchWorkspaceFiles } from './file-search.mjs'
+import { byteRange, UploadCounter, uploadBudget, volumeFullError } from './workspace-files.mjs'
 import {
   executeShellCommand,
   MAX_SHELL_OUTPUT_BYTES,
@@ -616,16 +617,19 @@ async function handleFileSearch(res, rootAbs, rootRel, query, extensions, basena
   return send(res, 200, { entries })
 }
 
-async function handleFileRead(res, abs) {
+async function handleFileRead(req, res, abs) {
   const st = await lstat(abs)
   if (st.isDirectory()) throw badRequest('path is a directory (use list=true)')
   if (!st.isFile()) throw badRequest('not a regular file')
-  res.writeHead(200, {
-    'content-type': 'application/octet-stream',
-    'content-length': String(st.size),
-  })
+  // One byte range at most (#1666): the control plane reads just the head of
+  // each chat attachment, over a connection it can then reuse.
+  const range = byteRange(req.headers.range, st.size)
+  const headers = { 'content-type': 'application/octet-stream', 'accept-ranges': 'bytes' }
+  if (range) headers['content-range'] = `bytes ${range.start}-${range.end}/${st.size}`
+  headers['content-length'] = String(range ? range.end - range.start + 1 : st.size)
+  res.writeHead(range ? 206 : 200, headers)
   try {
-    await pipeline(createReadStream(abs), res)
+    await pipeline(createReadStream(abs, range ?? {}), res)
   } catch {
     // Headers are already out — a JSON error is impossible. Kill the socket
     // so the short body vs content-length surfaces as an error client-side.
@@ -633,7 +637,14 @@ async function handleFileRead(res, abs) {
   }
 }
 
-async function handleFileWrite(req, res, abs) {
+async function handleFileWrite(req, res, abs, keepFree) {
+  // A user's upload stops short of filling the volume (#1666, see
+  // MIN_FREE_BYTES), and one that finds it past the reserve is refused
+  // before anything is created on it.
+  if (keepFree) {
+    const budget = await uploadBudget(FILES_ROOT)
+    if (budget < 0) throw volumeFullError(budget)
+  }
   await mkdir(dirname(abs), { recursive: true })
   // Write to a sibling temp file and rename into place on success: a failed
   // or oversized upload can neither leave a truncated file behind nor destroy
@@ -641,22 +652,16 @@ async function handleFileWrite(req, res, abs) {
   // on every stream (no hang on a disk-full write error) and destroys them
   // all on failure.
   const tmp = `${abs}.zwrm-tmp-${randomUUID().slice(0, 8)}`
-  let size = 0
-  const counter = new Transform({
-    transform(chunk, _enc, cb) {
-      size += chunk.length
-      if (size > MAX_FILE_BYTES) return cb(badRequest('file too large (max 100MB)'))
-      cb(null, chunk)
-    },
-  })
+  const counter = new UploadCounter({ maxBytes: MAX_FILE_BYTES, keepFree, root: FILES_ROOT })
   try {
     await pipeline(req, counter, createWriteStream(tmp, { mode: 0o644, flags: 'wx' }))
+    if (counter.refused) throw counter.refused
     await rename(tmp, abs)
   } catch (err) {
     try { await unlink(tmp) } catch {}
     throw err
   }
-  return send(res, 200, { bytes_written: size })
+  return send(res, 200, { bytes_written: counter.size })
 }
 
 async function handleFileDelete(res, abs, recursive) {
@@ -682,12 +687,13 @@ async function handleFiles(req, res, url) {
       )
     }
     if (req.method === 'GET' && url.searchParams.get('list') === 'true') return await handleFileList(res, abs, rel)
-    if (req.method === 'GET') return await handleFileRead(res, abs)
-    if (req.method === 'PUT') return await handleFileWrite(req, res, abs)
+    if (req.method === 'GET') return await handleFileRead(req, res, abs)
+    if (req.method === 'PUT') return await handleFileWrite(req, res, abs, url.searchParams.get('keep_free') === 'true')
     if (req.method === 'DELETE') return await handleFileDelete(res, abs, url.searchParams.get('recursive') === 'true')
   } catch (err) {
     if (err?.code === 'ENOENT') return send(res, 404, { error: 'no such file or directory' })
     if (err?.code === 'EACCES' || err?.code === 'EPERM') return send(res, 403, { error: 'permission denied' })
+    if (err?.code === 'ENOSPC' || err?.code === 'EDQUOT') return send(res, 507, { error: 'the workspace volume is full' })
     throw err
   }
   return send(res, 405, { error: 'method not allowed' })
@@ -1322,6 +1328,10 @@ const server = createServer(async (req, res) => {
         // advertised but unhostable (every create would 400).
         // 'message-context' (#1297): POST /messages validates and preserves
         // attachment metadata in the model prompt and durable event stream.
+        // 'bulk-attachments' (#1666): a message may reference 100 files of up
+        // to 100 MiB each (message-context.mjs), and GET /v1/files serves one
+        // byte range. The CP refuses more than 8 files, or any file over 2 MiB,
+        // on a daemon without it.
         // 'file-search' (#1297): /v1/files performs a bounded local recursive
         // path search, avoiding one CP-to-VM request per directory.
         // 'background-tasks' (#1251): this daemon reports background_tasks
@@ -1342,7 +1352,7 @@ const server = createServer(async (req, res) => {
         // 'compact' (#1553): POST /v1/sessions/{id}/compact summarizes the
         // conversation between turns and records context.compacted; the
         // CP refuses the call on a daemon without it.
-        caps: ['mcp', 'escalation', 'files', 'file-search', 'message-context', 'message-receipts', 'park', 'reclaim', 'skillfetch', 'pi-multiprovider', 'pi-gateway', 'opencode-gateway', 'background-tasks', 'tool-policy', 'agent-identity', 'commands', 'shell', 'model-switch', 'compact', ...HARNESS_CAPS],
+        caps: ['mcp', 'escalation', 'files', 'file-search', 'message-context', 'bulk-attachments', 'message-receipts', 'park', 'reclaim', 'skillfetch', 'pi-multiprovider', 'pi-gateway', 'opencode-gateway', 'background-tasks', 'tool-policy', 'agent-identity', 'commands', 'shell', 'model-switch', 'compact', ...HARNESS_CAPS],
         active_session: session && !isDone(session) ? session.id : null,
         state: session?.state ?? null,
         // A session ended because its events could no longer reach the
