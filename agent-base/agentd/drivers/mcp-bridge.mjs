@@ -1,7 +1,8 @@
-// MCP → pi tools bridge (#1065): connects the session's mcp_servers (all
-// Streamable-HTTP endpoints on the platform — org connectors via the MCP
-// gateway plus the reserved "zwrm" session server) and registers every
-// upstream tool as a pi custom tool named `mcp__<server>__<tool>`.
+// MCP → pi tools bridge (#1065): connects the session's mcp_servers
+// (Streamable-HTTP endpoints on the platform — org connectors via the MCP
+// gateway plus the reserved "zwrm" session server — and the image's local
+// stdio servers, #1676) and registers every upstream tool as a pi custom
+// tool named `mcp__<server>__<tool>`.
 //
 // The naming convention is load-bearing: the run escalation policy
 // (auto_approve / escalate_servers) matches tools by `mcp__<slug>` prefix in
@@ -19,6 +20,7 @@
 
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
+import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { ErrorCode } from '@modelcontextprotocol/sdk/types.js'
 
 // isConnectionError separates transport death (safe to reconnect + retry —
@@ -73,11 +75,12 @@ export function toolDefinitionFor(slug, tool, call) {
   }
 }
 
-// connectServer opens a Streamable-HTTP MCP client for one server config
-// ({type:'http', url, headers}). Returns null for entries the bridge cannot
-// carry (stdio — the platform never sends those to agent sessions). The
-// configured headers (the platform bearer) ride every request the transport
-// makes — POST, SSE GET, DELETE.
+// connectServer opens an MCP client for one server config: Streamable-HTTP
+// ({type:'http', url, headers}) or a local stdio child ({type:'stdio',
+// command, args, env} — image-declared servers, #1676). Returns null for
+// entries the bridge cannot carry. For HTTP, the configured headers (the
+// platform bearer) ride every request the transport makes — POST, SSE GET,
+// DELETE.
 //
 // cfg.headers is passed BY REFERENCE, not copied: the SDK transport re-reads
 // requestInit.headers on every request, so the gateway-token refresh endpoint
@@ -86,12 +89,29 @@ export function toolDefinitionFor(slug, tool, call) {
 // subsequent requests and reconnects carry the new credential. A defensive
 // copy here would silently pin every bridged tool to the create-time token,
 // which expires under sessions older than its 24h TTL.
-async function connectServer(slug, cfg) {
-  if (cfg.type !== 'http' || !cfg.url) return null
+//
+// A stdio child inherits the daemon's environment, then the session env
+// (opts.env), then the manifest's env — the claude CLI and opencode spawn
+// theirs from the same layering — and starts in the session cwd; its stderr lands in the daemon log. Reconnect after transport
+// death respawns it.
+async function connectServer(slug, cfg, opts = {}) {
+  let transport
+  if (cfg.type === 'http' && cfg.url) {
+    transport = new StreamableHTTPClientTransport(new URL(cfg.url), {
+      requestInit: { headers: cfg.headers || {} },
+    })
+  } else if (cfg.type === 'stdio' && cfg.command) {
+    transport = new StdioClientTransport({
+      command: cfg.command,
+      args: cfg.args || [],
+      env: { ...process.env, ...(opts.env || {}), ...(cfg.env || {}) },
+      ...(opts.cwd ? { cwd: opts.cwd } : {}),
+      stderr: 'inherit',
+    })
+  } else {
+    return null
+  }
   const client = new Client({ name: 'zwrm-agentd-pi-bridge', version: '1.0' })
-  const transport = new StreamableHTTPClientTransport(new URL(cfg.url), {
-    requestInit: { headers: cfg.headers || {} },
-  })
   await client.connect(transport)
   return client
 }
@@ -99,8 +119,8 @@ async function connectServer(slug, cfg) {
 // buildBridgedTools connects every server and returns the pi ToolDefinitions
 // for all their tools. Per-server failures are logged and skipped; the
 // returned closer tears the clients down at session end.
-export async function buildBridgedTools(servers, log) {
-  const { entries, close } = await connectServers(servers, log)
+export async function buildBridgedTools(servers, log, opts) {
+  const { entries, close } = await connectServers(servers, log, opts)
   const tools = []
   for (const e of entries) {
     for (const t of e.tools) tools.push(toolDefinitionFor(e.slug, t, e.call))
@@ -114,8 +134,9 @@ export async function buildBridgedTools(servers, log) {
 // and side-effect-safety rules above. Each harness renders those listings into
 // its own tool shape — pi ToolDefinitions here, codex DynamicToolSpecs in
 // codex-tools.mjs — so the transport, failure, and retry semantics stay in one
-// place and cannot drift between harnesses.
-export async function connectServers(servers, log) {
+// place and cannot drift between harnesses. opts.cwd / opts.env are the
+// session cwd and env stdio servers start with.
+export async function connectServers(servers, log, opts = {}) {
   const entries = []
   const clients = new Map() // slug -> {client, cfg, reconnecting}
   let closed = false
@@ -127,7 +148,9 @@ export async function connectServers(servers, log) {
   // inline under the CP's 15s HTTP timeout, and a blackholed endpoint must
   // degrade (skip the server) rather than stall session creation. The loser
   // of the race is defused (no unhandled rejection) and a late-completing
-  // connect closes its own client instead of leaking it.
+  // connect closes its own client instead of leaking it. A stdio server
+  // shares the budget, which is why image servers must be baked into the
+  // image rather than fetched on first spawn (image-mcp.mjs).
   const SETUP_TIMEOUT_MS = 5000
   const setupWithTimeout = async (fn, what, onLate) => {
     let timer
@@ -147,7 +170,7 @@ export async function connectServers(servers, log) {
   for (const [slug, cfg] of Object.entries(servers || {})) {
     let client = null
     try {
-      client = await setupWithTimeout(() => connectServer(slug, cfg), `connect ${slug}`,
+      client = await setupWithTimeout(() => connectServer(slug, cfg, opts), `connect ${slug}`,
         (late) => { try { late?.close?.() } catch {} })
       if (!client) {
         log(`mcp bridge: skipping server ${slug} (unsupported type ${cfg.type})`)
@@ -171,7 +194,11 @@ export async function connectServers(servers, log) {
           if (!entry.reconnecting) {
             entry.reconnecting = (async () => {
               try { entry.client.close?.() } catch {}
-              entry.client = await connectServer(slug, entry.cfg)
+              const fresh = await connectServer(slug, entry.cfg, opts)
+              // close() may have run while we reconnected: it saw the dead
+              // client, so reap the fresh one (a live stdio child) here.
+              if (closed) { try { fresh?.close?.() } catch {} ; return }
+              entry.client = fresh
             })().finally(() => { entry.reconnecting = null })
           }
           await entry.reconnecting

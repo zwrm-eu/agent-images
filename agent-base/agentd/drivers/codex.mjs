@@ -817,7 +817,7 @@ export async function createCodexDriver(s, spec, h) {
     // Imported lazily: the bridge pulls in the MCP SDK, and a session with no
     // servers must not pay for it (nor require it to be installed).
     const { connectServers } = await import('./mcp-bridge.mjs')
-    const bridge = await connectServers(spec.mcp_servers, h.log)
+    const bridge = await connectServers(spec.mcp_servers, h.log, { cwd, env: spec.env })
     closeBridge = bridge.close
     for (const entry of bridge.entries) {
       for (const t of entry.tools) {

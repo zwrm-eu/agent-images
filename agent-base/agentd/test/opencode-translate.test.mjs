@@ -110,6 +110,20 @@ test('canonical names: longest slug wins, non-MCP names pass through', () => {
   assert.equal(canonicalOpenCodeToolName('github_x', []), 'github_x')
 })
 
+test('session config: image stdio servers render as OpenCode local entries (#1676)', () => {
+  const cfg = buildSessionConfig({
+    platform: null,
+    mcpServers: {
+      browser: { type: 'stdio', command: '/opt/pw/mcp', args: ['--headless'], env: { DISPLAY: ':99' } },
+      bare: { type: 'stdio', command: '/opt/bare' },
+    },
+    interactive: true,
+  })
+  assert.deepEqual(cfg.mcp.browser, { type: 'local', command: ['/opt/pw/mcp', '--headless'], environment: { DISPLAY: ':99' }, enabled: true })
+  assert.deepEqual(cfg.mcp.bare, { type: 'local', command: ['/opt/bare'], enabled: true })
+  assert.equal(cfg.permission['browser_*'], 'ask', 'image tools ride the platform permission gate')
+})
+
 test('session config: platform base + native MCP entries + gate table', () => {
   const platform = { provider: { zwrm: { npm: 'x' } }, disabled_providers: ['opencode'], share: 'disabled' }
   const cfg = buildSessionConfig({

@@ -124,7 +124,7 @@ test('claude sessions opt in to runtime Bypass mode changes', async () => {
 
 test('session startup and callbacks use the credential broker', async () => {
   const src = await readFile(SERVER, 'utf8')
-  assert.match(src, /startSession\(await broker.activate\(spec\)\)/)
+  assert.match(src, /startSession\(withImageServers\(await broker.activate\(spec\), image, log\)\)/)
   // The pusher lives in its own module (#1631); the daemon hands it the broker,
   // and a pusher that stops for good ends its session (#1664) rather than
   // leaving turns to run where no client can see them.
@@ -254,4 +254,13 @@ test('an approval that answers no question is refused before the decision is rec
     assert.match(dsrc, /s\.pending\.set\(\w+, \{ resolve, toolName, input[^\n]*\.\.\.\((?:isQuestion|kind) \? \{ kind/,
       `${driver} must stamp kind on its pending entries`)
   }
+})
+
+test('image-declared MCP servers (#1676): advertised, and merged after broker activation', async () => {
+  const src = await readFile(new URL('../server.mjs', import.meta.url), 'utf8')
+  const capsLine = src.split('\n').find((l) => l.trimStart().startsWith('caps:'))
+  assert.ok(capsLine.includes("'image-mcp'"), 'the image-mcp cap must be advertised')
+  // The broker refuses non-platform URLs, so the image's stdio servers must
+  // join the spec AFTER activate, never before.
+  assert.match(src, /withImageServers\(await broker\.activate\(spec\), image, log\)/)
 })

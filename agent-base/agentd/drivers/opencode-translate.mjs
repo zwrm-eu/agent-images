@@ -303,12 +303,24 @@ export function buildSessionConfig({ platform, mcpServers, interactive, instruct
   const mcp = {}
   const permission = { ...GATED_PERMISSIONS }
   for (const [slug, server] of Object.entries(mcpServers || {})) {
-    if (!server || server.type !== 'http' || !server.url) continue
-    mcp[slug] = {
-      type: 'remote',
-      url: server.url,
-      ...(server.headers && typeof server.headers === 'object' ? { headers: server.headers } : {}),
-      enabled: true,
+    if (server?.type === 'http' && server.url) {
+      mcp[slug] = {
+        type: 'remote',
+        url: server.url,
+        ...(server.headers && typeof server.headers === 'object' ? { headers: server.headers } : {}),
+        enabled: true,
+      }
+    } else if (server?.type === 'stdio' && server.command) {
+      // Image-declared local server (#1676), in OpenCode's native local
+      // shape: argv as one array, env under `environment`.
+      mcp[slug] = {
+        type: 'local',
+        command: [server.command, ...(server.args || [])],
+        ...(server.env ? { environment: server.env } : {}),
+        enabled: true,
+      }
+    } else {
+      continue
     }
     permission[`${slug}_*`] = 'ask'
   }
