@@ -262,7 +262,7 @@ export async function createPiDriver(s, spec, h) {
   // native sleep/park tools (the claude driver's `platform` server analog).
   // Built LAST among the fallible construction steps so an earlier throw
   // (resume jail, model resolution, loader) can't leak connected clients.
-  const bridge = await buildBridgedTools(spec.mcp_servers, h.log)
+  const bridge = await buildBridgedTools(spec.mcp_servers, h.log, { cwd })
   const customTools = [...bridge.tools, ...(spec.interactive ? [] : buildRunTools(s, h))]
 
   let session

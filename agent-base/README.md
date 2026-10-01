@@ -79,6 +79,30 @@ default_size = "performance-4x"
 min_size = "performance-2x"
 ```
 
+## Shipping MCP Servers With a Template
+
+A template can give every agent session extra tools by declaring local (stdio)
+MCP servers. Drop one JSON manifest per server into `/etc/zwrm/mcp.d/`; the
+filename is the server name, and its tools appear to the model as
+`mcp__<name>__<tool>` on every harness (Claude, Codex, OpenCode, pi):
+
+```dockerfile
+USER root
+RUN npm install -g @playwright/mcp@0.0.83 \
+ && mkdir -p /etc/zwrm/mcp.d \
+ && echo '{"command": "/usr/local/bin/playwright-mcp", "args": ["--headless"]}' \
+      > /etc/zwrm/mcp.d/browser.json
+USER agent
+```
+
+Manifest fields: `command` (absolute path, required), `args` (string array),
+`env` (string map, merged over the session environment), and `escalate`
+(`true` makes the server's tools pause for approval on unattended runs).
+Names follow connector slug rules (lowercase letters, digits, dashes); `zwrm`
+and `platform` are reserved, and a connector with the same name takes
+precedence. Install the server into the image — a command that downloads on
+first use (`npx -y ...`) misses the startup budget and is skipped.
+
 ## Tips
 
 - Always switch to `USER root` for `apt-get`, then back to `USER agent` for user-space installs

@@ -177,3 +177,28 @@ test('isConnectionError gates the retry: transport death yes, timeout/server err
   assert.ok(!isConnectionError(new Error('MCP error -32602: invalid params')))
   assert.ok(!isConnectionError(new Error('upstream exploded')))
 })
+
+test('stdio servers (#1676): spawned with manifest env + session cwd, images survive', async () => {
+  const { connectServers } = await import('../drivers/mcp-bridge.mjs')
+  const { fileURLToPath } = await import('node:url')
+  const os = await import('node:os')
+  const fixture = fileURLToPath(new URL('./fixtures/stdio-mcp-server.mjs', import.meta.url))
+  const cwd = await import('node:fs').then((fs) => fs.realpathSync(os.tmpdir()))
+  const logs = []
+  const bridge = await connectServers({
+    local: { type: 'stdio', command: process.execPath, args: [fixture, '--flag'], env: { FIXTURE_MARKER: 'm1' } },
+    bogus: { type: 'stdio' },
+  }, (m) => logs.push(m), { cwd })
+  try {
+    assert.deepEqual(bridge.entries.map((e) => e.slug), ['local'], 'a command-less stdio entry is skipped')
+    const entry = bridge.entries[0]
+    assert.deepEqual(entry.tools.map((t) => t.name).sort(), ['snap', 'whereami'])
+    const where = JSON.parse((await entry.call('whereami', {})).content[0].text)
+    assert.deepEqual(where, { marker: 'm1', cwd, argv: ['--flag'] })
+    const def = toolDefinitionFor('local', entry.tools.find((t) => t.name === 'snap'), entry.call)
+    assert.equal(def.name, 'mcp__local__snap')
+    assert.deepEqual((await def.execute('id', {})).content, [{ type: 'image', data: 'iVBORw0KGgo=', mimeType: 'image/png' }])
+  } finally {
+    bridge.close()
+  }
+})

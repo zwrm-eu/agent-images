@@ -49,6 +49,7 @@ import { decisionForRequest, permissionDecisionPayload } from './event-payloads.
 import { prepareMessage } from './message-context.mjs'
 import { MessageReceipts } from './message-receipts.mjs'
 import { searchWorkspaceFiles } from './file-search.mjs'
+import { loadImageMCPServers, withImageServers } from './image-mcp.mjs'
 import { byteRange, UploadCounter, uploadBudget, volumeFullError } from './workspace-files.mjs'
 import {
   executeShellCommand,
@@ -921,7 +922,11 @@ async function handleCreate(req, res) {
   creating = true
   let s
   try {
-    s = await startSession(await broker.activate(spec))
+    // Image-declared servers (#1676) merge AFTER activation: the broker
+    // proxies only platform URLs, and a local stdio server has no bearer.
+    // Read per create: a handful of small files, and tests point ZWRM_MCP_DIR elsewhere.
+    const image = await loadImageMCPServers(process.env.ZWRM_MCP_DIR || undefined, log)
+    s = await startSession(withImageServers(await broker.activate(spec), image, log))
   } catch (err) {
     broker.deactivate(spec.session_id)
     throw err
@@ -1352,7 +1357,9 @@ const server = createServer(async (req, res) => {
         // 'compact' (#1553): POST /v1/sessions/{id}/compact summarizes the
         // conversation between turns and records context.compacted; the
         // CP refuses the call on a daemon without it.
-        caps: ['mcp', 'escalation', 'files', 'file-search', 'message-context', 'bulk-attachments', 'message-receipts', 'park', 'reclaim', 'skillfetch', 'pi-multiprovider', 'pi-gateway', 'opencode-gateway', 'background-tasks', 'tool-policy', 'agent-identity', 'commands', 'shell', 'model-switch', 'compact', ...HARNESS_CAPS],
+        // 'image-mcp' (#1676): this build mounts the image's /etc/zwrm/mcp.d
+        // stdio servers into every session; image_mcp_servers lists them.
+        caps: ['mcp', 'escalation', 'files', 'file-search', 'message-context', 'bulk-attachments', 'message-receipts', 'park', 'reclaim', 'skillfetch', 'pi-multiprovider', 'pi-gateway', 'opencode-gateway', 'background-tasks', 'tool-policy', 'agent-identity', 'commands', 'shell', 'model-switch', 'compact', 'image-mcp', ...HARNESS_CAPS],
         active_session: session && !isDone(session) ? session.id : null,
         state: session?.state ?? null,
         // A session ended because its events could no longer reach the
@@ -1367,6 +1374,9 @@ const server = createServer(async (req, res) => {
         // Informational: the CP never blocks on it, but it explains a session
         // that answers healthz yet sits in 'starting'.
         home_seed: await seedState(),
+        // Image-declared MCP server slugs (#1676), e.g. ['browser',
+        // 'computer'] on the browser template; [] on agent-base.
+        image_mcp_servers: Object.keys((await loadImageMCPServers(process.env.ZWRM_MCP_DIR || undefined)).servers),
       })
     }
 
