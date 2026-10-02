@@ -50,6 +50,7 @@ import { prepareMessage } from './message-context.mjs'
 import { MessageReceipts } from './message-receipts.mjs'
 import { searchWorkspaceFiles } from './file-search.mjs'
 import { loadImageMCPServers, withImageServers } from './image-mcp.mjs'
+import { desktopStatus, loadDesktop, relayVNC, startDesktop, writeControl } from './desktop.mjs'
 import { byteRange, UploadCounter, uploadBudget, volumeFullError } from './workspace-files.mjs'
 import {
   executeShellCommand,
@@ -1359,7 +1360,9 @@ const server = createServer(async (req, res) => {
         // CP refuses the call on a daemon without it.
         // 'image-mcp' (#1676): this build mounts the image's /etc/zwrm/mcp.d
         // stdio servers into every session; image_mcp_servers lists them.
-        caps: ['mcp', 'escalation', 'files', 'file-search', 'message-context', 'bulk-attachments', 'message-receipts', 'park', 'reclaim', 'skillfetch', 'pi-multiprovider', 'pi-gateway', 'opencode-gateway', 'background-tasks', 'tool-policy', 'agent-identity', 'commands', 'shell', 'model-switch', 'compact', 'image-mcp', ...HARNESS_CAPS],
+        // 'desktop' (#1680): /desktop status/start/control plus the
+        // Upgrade: zwrm-vnc relay; `desktop` says whether the image has one.
+        caps: ['mcp', 'escalation', 'files', 'file-search', 'message-context', 'bulk-attachments', 'message-receipts', 'park', 'reclaim', 'skillfetch', 'pi-multiprovider', 'pi-gateway', 'opencode-gateway', 'background-tasks', 'tool-policy', 'agent-identity', 'commands', 'shell', 'model-switch', 'compact', 'image-mcp', 'desktop', ...HARNESS_CAPS],
         active_session: session && !isDone(session) ? session.id : null,
         state: session?.state ?? null,
         // A session ended because its events could no longer reach the
@@ -1377,7 +1380,33 @@ const server = createServer(async (req, res) => {
         // Image-declared MCP server slugs (#1676), e.g. ['browser',
         // 'computer'] on the browser template; [] on agent-base.
         image_mcp_servers: Object.keys((await loadImageMCPServers(process.env.ZWRM_MCP_DIR || undefined)).servers),
+        desktop: (await loadDesktop(process.env.ZWRM_DESKTOP_MANIFEST || undefined)) !== null,
       })
+    }
+
+    // Image-declared desktop (#1680): status, start, and who holds input. The
+    // VNC stream itself is the Upgrade handler below. Read per request (one
+    // small file) like the MCP manifests; tests point ZWRM_DESKTOP_MANIFEST
+    // elsewhere.
+    if (url.pathname === '/desktop' || url.pathname.startsWith('/desktop/')) {
+      const desktop = await loadDesktop(process.env.ZWRM_DESKTOP_MANIFEST || undefined, log)
+      if (req.method === 'GET' && url.pathname === '/desktop') {
+        return send(res, 200, await desktopStatus(desktop))
+      }
+      if (!desktop) return send(res, 409, { error: 'this workspace image has no desktop' })
+      if (req.method === 'POST' && url.pathname === '/desktop/start') {
+        try {
+          await startDesktop(desktop, log)
+        } catch (err) {
+          return send(res, 502, { error: err?.message || String(err) })
+        }
+        return send(res, 200, { running: true })
+      }
+      if (req.method === 'PUT' && url.pathname === '/desktop/control') {
+        const body = await readBody(req)
+        const c = await writeControl(desktop, { holder: body?.holder, userId: body?.user_id, renew: body?.renew === true })
+        return send(res, 200, { control: c.holder, ...(c.userId ? { control_user_id: c.userId } : {}) })
+      }
     }
 
     if (req.method === 'POST' && url.pathname === '/reclaim') {
@@ -1424,6 +1453,34 @@ server.on('error', (err) => {
   console.error(`zwrm-agentd failed to listen on :${PORT}: ${err?.message || err}`)
   process.exit(1)
 })
+// The live-view stream (#1680): the control plane asks for
+// `GET /desktop/vnc` with `Upgrade: zwrm-vnc` and the daemon token, and the
+// socket becomes a raw relay to the image's loopback VNC server. Node hands
+// every Upgrade request here instead of to the request handler above, so the
+// token gate is repeated; anything else on this path is refused.
+server.on('upgrade', async (req, socket, head) => {
+  const refuse = (status, text, body) => socket.end(
+    `HTTP/1.1 ${status} ${text}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n${JSON.stringify(body)}`)
+  socket.on('error', () => socket.destroy())
+  try {
+    const url = new URL(req.url, 'http://localhost')
+    const auth = req.headers.authorization || ''
+    if (!tokenMatches(auth.startsWith('Bearer ') ? auth.slice(7).trim() : '')) {
+      return refuse(401, 'Unauthorized', { error: 'unauthorized' })
+    }
+    if (req.method !== 'GET' || url.pathname !== '/desktop/vnc' ||
+        String(req.headers.upgrade || '').toLowerCase() !== 'zwrm-vnc') {
+      return refuse(404, 'Not Found', { error: 'not found' })
+    }
+    const desktop = await loadDesktop(process.env.ZWRM_DESKTOP_MANIFEST || undefined, log)
+    if (!desktop) return refuse(409, 'Conflict', { error: 'this workspace image has no desktop' })
+    relayVNC(desktop, socket, head, log)
+  } catch (err) {
+    log(`desktop: upgrade failed: ${err?.message || err}`)
+    socket.destroy()
+  }
+})
+
 server.listen(PORT, '0.0.0.0', () => {
   // The opencode driver builds the platform-tools URL its file tools call
   // from this; exported here so the port has exactly one owner.

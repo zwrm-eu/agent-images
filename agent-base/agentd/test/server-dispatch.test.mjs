@@ -264,3 +264,18 @@ test('image-declared MCP servers (#1676): advertised, and merged after broker ac
   // join the spec AFTER activate, never before.
   assert.match(src, /withImageServers\(await broker\.activate\(spec\), image, log\)/)
 })
+
+test('desktop (#1680): advertised, routed, and the upgrade path is token-gated', async () => {
+  const src = await readFile(new URL('../server.mjs', import.meta.url), 'utf8')
+  const capsLine = src.split('\n').find((l) => l.trimStart().startsWith('caps:'))
+  assert.ok(capsLine.includes("'desktop'"), 'the desktop cap must be advertised')
+  const up = src.slice(src.indexOf("server.on('upgrade'"), src.indexOf('server.listen(PORT'))
+  const relay = up.indexOf('relayVNC(')
+  assert.ok(relay > 0, 'the upgrade handler relays to the desktop')
+  // Every gate must come before the relay: the daemon token, GET only, the
+  // exact path, and the zwrm-vnc upgrade protocol — anything else is refused.
+  for (const gate of ['tokenMatches(', "req.method !== 'GET'", "url.pathname !== '/desktop/vnc'", "!== 'zwrm-vnc'"]) {
+    const at = up.indexOf(gate)
+    assert.ok(at > 0 && at < relay, `upgrade gate ${gate} must run before relayVNC`)
+  }
+})
