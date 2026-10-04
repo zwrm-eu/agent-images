@@ -221,7 +221,7 @@ test('compact asks the app-server between turns and resolves on its signal; auto
   assert.equal(usage[0].turnId, null, 'session-level accounting, outside any turn')
 
   const outcome = await ctx.driver.compact({ instructions: 'recorded, not sent' })
-  assert.deepEqual(outcome, { trigger: 'manual', instructions: 'recorded, not sent' }, 'codex 0.153.4 reports no counts')
+  assert.deepEqual(outcome, { trigger: 'manual', instructions: 'recorded, not sent' }, 'codex 0.160.0 reports no counts')
   assert.equal(sentCalls(ctx.tracePath, 'thread/compact/start').length, 1)
   // The driver records the manual compaction once, outside any turn; the
   // second signal for the same compaction must not become an 'auto' one.

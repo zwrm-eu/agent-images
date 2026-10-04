@@ -2,7 +2,7 @@
 // A scripted stand-in for `codex app-server`, used by codex-driver.test.mjs.
 //
 // It speaks the same newline-delimited JSON-RPC the real binary does (verified
-// against @openai/codex 0.153.4) and replays a scenario named by
+// against @openai/codex 0.160.0) and replays a scenario named by
 // FAKE_CODEX_SCENARIO, so the driver's turn state machine, approval gate, and
 // result contract can be tested without an API key or a network.
 
@@ -27,7 +27,7 @@ const TURN_ID = 'turn-1'
 // the pinned @openai/codex — keep them in step when moving that pin.
 const KNOWN = {
   'thread/start': new Set(['allowProviderModelFallback', 'approvalPolicy', 'approvalsReviewer',
-    'baseInstructions', 'config', 'cwd', 'developerInstructions', 'dynamicTools', 'environments',
+    'baseInstructions', 'config', 'cwd', 'daybreakEnabled', 'developerInstructions', 'dynamicTools', 'environments',
     'ephemeral', 'experimentalRawEvents', 'historyMode', 'mockExperimentalField', 'model',
     'modelProvider', 'multiAgentMode', 'permissions', 'personality', 'projectId',
     'runtimeWorkspaceRoots', 'sandbox', 'selectedCapabilityRoots', 'serviceName', 'serviceTier',
@@ -36,7 +36,7 @@ const KNOWN = {
     'developerInstructions', 'excludeTurns', 'history', 'initialTurnsPage', 'model', 'modelProvider',
     'path', 'permissions', 'personality', 'runtimeWorkspaceRoots', 'sandbox', 'serviceTier', 'threadId']),
   'turn/start': new Set(['additionalContext', 'approvalPolicy', 'approvalsReviewer',
-    'clientUserMessageId', 'collaborationMode', 'cwd', 'cyberAccessProgram', 'effort', 'environments',
+    'clientUserMessageId', 'collaborationMode', 'cwd', 'cyberAccessProgram', 'disabledPluginIds', 'effort', 'environments',
     'input', 'model', 'multiAgentMode', 'outputSchema', 'permissions', 'personality',
     'responsesapiClientMetadata', 'runtimeWorkspaceRoots', 'sandboxPolicy', 'serviceTier',
     'serviceTierForTurn', 'summary', 'threadId', 'toolOutput', 'turnTrigger']),
@@ -49,7 +49,7 @@ const ENUMS = {
   approvalPolicy: new Set(['untrusted', 'on-failure', 'on-request', 'never']),
   sandbox: new Set(['read-only', 'workspace-write', 'danger-full-access']),
   // The PLATFORM ladder, which is what the driver may legitimately send. Codex
-  // itself types ReasoningEffort as an open string in 0.153 and validates it
+  // itself types ReasoningEffort as an open string in 0.160 and validates it
   // nowhere locally, so this set exists to catch the driver inventing a level,
   // not to mirror a protocol enum. ('minimal' is gone: no model in the pinned
   // lineup offers it. 'ultra' is deliberately absent — codex has it, the
@@ -370,7 +370,7 @@ rl.on('line', async (line) => {
       trace('thread/compact/start', msg.params)
       send({ id: msg.id, result: {} })
       await sleep(5)
-      // codex-cli 0.153.4's item is id-only (no token counts).
+      // codex-cli 0.160.0's item is id-only (no token counts).
       notify('item/completed', {
         threadId: THREAD_ID, turnId: null,
         item: { type: 'contextCompaction', id: 'compact-1' },

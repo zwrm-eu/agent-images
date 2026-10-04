@@ -12,7 +12,8 @@
 //  - dashboard agentTranscript.ts: assistant/user content blocks;
 //    partialTextDelta reads payload.event.content_block_delta.delta.text_delta.
 //
-// Probed wire facts this module is written against (1.18.25):
+// Probed wire facts this module is written against (1.18.25; the permission
+// ask/reply, prompt_async and cost facts re-probed on 1.18.34):
 //  - the ask event is `permission.asked` (docs say permission.updated; the
 //    binary disagrees), carrying {id, sessionID, permission, patterns,
 //    metadata, always, tool:{messageID, callID}};

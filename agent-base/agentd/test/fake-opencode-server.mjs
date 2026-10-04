@@ -6,7 +6,8 @@
 // against itself. A violation is recorded and fails the test via
 // assertNoViolations, not swallowed.
 //
-// Wire shapes mirror the probed 1.18.25 binary: `permission.asked` events
+// Wire shapes mirror the probed 1.18.25 binary (permission ask/reply, prompt_async
+// and cost re-probed on 1.18.34): `permission.asked` events
 // (not the docs' permission.updated), POST /session/:id/permissions/:pid
 // {response}, prompt_async 204, session-cumulative cost on GET /session/:id,
 // and the question service (#1555): `question.asked` events answered by POST
