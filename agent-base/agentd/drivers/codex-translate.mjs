@@ -323,7 +323,7 @@ export function classifyCodexError(err) {
 //
 // The set below is therefore a sanity filter, not a policy: an unrecognized
 // level is dropped rather than forwarded, because the app-server validates
-// NOTHING locally — probed against the pinned 0.153.4, a turn/start carrying
+// NOTHING locally — probed against the pinned 0.160.0, a turn/start carrying
 // the literal string 'bogus-effort' is accepted and opens a turn. Dropping
 // falls back to the model's own default, which is the safe end of that trade.
 const CODEX_EFFORTS = new Set(['low', 'medium', 'high', 'xhigh', 'max'])
@@ -364,7 +364,7 @@ export function sandboxConfigFor(mode) {
 //
 // The shape is version-sensitive (0.111 carried a `readOnlyAccess` field that
 // 0.145 dropped), so it tracks the pinned @openai/codex in the Dockerfile;
-// re-verified against 0.153.4, and must be re-verified on the next pin move.
+// re-verified against 0.160.0, and must be re-verified on the next pin move.
 export function sandboxPolicyFor(mode, cwd) {
   if (mode === 'bypassPermissions') return { type: 'dangerFullAccess' }
   return {

@@ -54,7 +54,7 @@ RUN curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # -- Node.js 22 (required for Codex; pi requires >= 22.19, #1063) --------------
-ENV NODE_VERSION=22.23.1
+ENV NODE_VERSION=22.23.3
 RUN curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.xz" \
     | tar -xJ -C /usr/local --strip-components=1 \
     && corepack enable
@@ -89,7 +89,7 @@ RUN (apt-get update || true) && apt-get install -y --no-install-recommends bubbl
 # The driver adds no npm dependency of its own: this binary IS the SDK, so this
 # pin is the whole lockstep. Bump it deliberately, and re-run
 # `codex app-server generate-json-schema` to refresh the driver's fixture.
-RUN npm install -g @openai/codex@0.153.4 && npm cache clean --force
+RUN npm install -g @openai/codex@0.160.0 && npm cache clean --force
 
 # -- Pi coding agent (PINNED via agentd — #1062/#1063/#1347) --------------------
 # pi ships ONLY inside agentd's node_modules (agentd/package.json pins it);
@@ -108,7 +108,7 @@ RUN echo 'export PI_SKIP_VERSION_CHECK=1' > /etc/profile.d/pi-env.sh
 # re-probe the surface, and refresh the driver's fixtures. The profile.d
 # entries keep gateway-only VMs (#1024) from stalling on its autoupdate,
 # models.dev fetch, and LSP downloads.
-RUN curl -fsSL https://registry.npmjs.org/opencode-linux-x64/-/opencode-linux-x64-1.18.25.tgz -o /tmp/opencode.tgz \
+RUN curl -fsSL https://registry.npmjs.org/opencode-linux-x64/-/opencode-linux-x64-1.18.34.tgz -o /tmp/opencode.tgz \
     && tar -xzf /tmp/opencode.tgz -C /tmp package/bin/opencode \
     && install -m 0755 /tmp/package/bin/opencode /usr/local/bin/opencode \
     && rm -rf /tmp/opencode.tgz /tmp/package
@@ -139,7 +139,7 @@ COPY opencode-tools/ /etc/opencode/run/tool/
 # completes empty — no assistant output, the model never reached. Interactive
 # sessions use the tools-free /etc/opencode/session dir and never import it.
 RUN mkdir -p /etc/opencode/session /etc/opencode/run \
-    && npm install --prefix /etc/opencode/run @opencode-ai/plugin@1.18.25 \
+    && npm install --prefix /etc/opencode/run @opencode-ai/plugin@1.18.34 \
     && npm cache clean --force \
     && chmod 755 /etc/opencode /etc/opencode/run /etc/opencode/run/tool /etc/opencode/session \
     && chmod 644 /etc/opencode/run/tool/*.ts \
@@ -168,7 +168,7 @@ ENV HOME=/home/agent
 # session check: a new model can need a newer CLI, and the API refuses older
 # ones (Opus 5.5 needs >= 2.1.280, #1606). The `test` fails the build unless
 # the installed binary is the version asked for.
-ARG CLAUDE_CODE_VERSION=2.1.281
+ARG CLAUDE_CODE_VERSION=2.1.289
 RUN curl -fsSL https://claude.ai/install.sh | bash -s -- "${CLAUDE_CODE_VERSION}" \
     && test "$(/home/agent/.local/bin/claude --version | cut -d' ' -f1)" = "${CLAUDE_CODE_VERSION}"
 ENV PATH="/home/agent/.local/bin:${PATH}"
@@ -193,7 +193,8 @@ COPY agentd /opt/zwrm-agentd
 # CLI copies (~470 MB) are dead weight — the linux-x64 pair lands only because
 # npm's os/cpu optionalDependency gates have no libc dimension. Prune them in
 # the SAME layer as npm ci. NEVER use --omit=optional instead: pi's nested
-# optional platform deps (clipboard binaries) must survive.
+# optional platform deps must survive (since pi 1.0 that is esbuild's
+# @esbuild/linux-x64 binary, via @earendil-works/chord).
 # The test -x guards that the native claude launcher exists — this image must
 # never ship claude-less.
 RUN cd /opt/zwrm-agentd && npm ci --omit=dev \

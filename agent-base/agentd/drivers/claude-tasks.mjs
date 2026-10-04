@@ -8,7 +8,9 @@
 // Pure functions over a Map so the ledger is unit-testable without the SDK
 // (claude.mjs constructs `query` directly; there is no injection seam).
 //
-// Lifecycle, per SDK 0.3.201:
+// Lifecycle, per SDK 0.3.201 (typings re-checked on 0.3.289: only optional
+// fields were added — reason, resource_links, ambient, is_backgrounded,
+// spawn_depth):
 //   task_started     -> add. Fires for FOREGROUND tasks too (that is how
 //                       Ctrl+B finds them); foreground tasks settle via
 //                       task_updated {status:'completed'} before the turn's
@@ -48,6 +50,10 @@ export function applyTaskMessage(tasks, msg, now = Date.now()) {
   }
   switch (msg.subtype) {
     case 'task_started':
+      // Ambient tasks (SDK >= 0.3.289: live-update watchers, skip_transcript
+      // tasks) are not activity; the SDK says hosts must not count them.
+      // Counting one would hold every run open and the VM awake for the TTL.
+      if (msg.ambient === true || msg.skip_transcript === true) return false
       tasks.set(msg.task_id, { ts: now, description: msg.description || '' })
       return true
     case 'task_progress':

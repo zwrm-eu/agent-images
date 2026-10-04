@@ -172,7 +172,7 @@ export async function createCodexDriver(s, spec, h) {
     // harness is broken" and sends them hunting in the wrong place.
     //
     // The checks mirror what codex itself enforces when it reads the file,
-    // measured against the pinned 0.153.4 with `codex login status`:
+    // measured against the pinned 0.160.0 with `codex login status`:
     //   - `tokens` must be an object; a bare token string is rejected with
     //     "invalid type: string, expected struct TokenData";
     //   - `id_token` is MANDATORY ("missing field `id_token`") and is parsed
@@ -531,7 +531,7 @@ export async function createCodexDriver(s, spec, h) {
   // The model's context window, from thread/tokenUsage/updated (#1553).
   let lastContextWindow = null
   // The pinned app-server's contextCompaction item carries only an id (no
-  // counts, checked in codex-cli 0.153.4), so this yields {} today; the
+  // counts, checked in codex-cli 0.160.0), so this yields {} today; the
   // names are read defensively for a build that adds them.
   function compactionTokens(source) {
     const pick = (...keys) => {

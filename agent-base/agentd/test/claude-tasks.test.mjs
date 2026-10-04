@@ -125,3 +125,14 @@ test('liveness signals refresh the TTL clock', () => {
   applyTaskMessage(tasks, updated('t1', 'running'), 2 * BACKGROUND_TASK_TTL_MS)
   assert.equal(countBackgroundTasks(tasks, 2 * BACKGROUND_TASK_TTL_MS + 1000), 1)
 })
+
+test('ambient tasks are not counted as background work (SDK >= 0.3.289)', () => {
+  const tasks = new Map()
+  assert.equal(applyTaskMessage(tasks, { type: 'system', subtype: 'task_started', task_id: 'w1', ambient: true }), false)
+  assert.equal(applyTaskMessage(tasks, { type: 'system', subtype: 'task_started', task_id: 's1', skip_transcript: true }), false)
+  assert.equal(countBackgroundTasks(tasks), 0)
+  // Their notifications are harmless no-ops.
+  assert.equal(applyTaskMessage(tasks, { type: 'system', subtype: 'task_notification', task_id: 'w1' }), false)
+  assert.equal(applyTaskMessage(tasks, { type: 'system', subtype: 'task_started', task_id: 'b1' }), true)
+  assert.equal(countBackgroundTasks(tasks), 1)
+})
