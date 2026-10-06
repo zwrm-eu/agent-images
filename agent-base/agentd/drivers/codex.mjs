@@ -31,7 +31,7 @@
 
 import { createHash, randomUUID } from 'node:crypto'
 import { pendingWithTimeout } from '../session-control.mjs'
-import { mkdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { access, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { CodexRPC } from './codex-rpc.mjs'
 import {
   approvalPolicyFor,
@@ -196,6 +196,7 @@ export async function createCodexDriver(s, spec, h) {
     }
   }
 
+  let authWriteErr = null
   try {
     if (subscriptionRecord) {
       await writeAuth(subscriptionRecord, 'OPENAI_CODEX_AUTH')
@@ -225,6 +226,30 @@ export async function createCodexDriver(s, spec, h) {
     // Not fatal on its own: an existing login may still carry the session.
     // Failing here would turn a recoverable state into a hard refusal.
     h.log(`codex: could not update ${authPath}: ${err?.message || err}`)
+    authWriteErr = err
+  }
+
+  // No login at all: refuse now, with the fix, rather than start an
+  // app-server that can only fail. Without auth.json every turn is rejected
+  // by OpenAI (401), which codex reports only as an opaque `systemError`
+  // thread status — the user would see "codex reported a system error" and
+  // nothing else (#1703). The user's own `codex login` over SSH counts,
+  // including one kept in the OS keyring (cli_auth_credentials_store =
+  // "keyring" | "auto" in their codex config), which leaves no auth.json.
+  if (!(await fileExists(authPath)) && !(await usesCredentialStore(codexHome))) {
+    if (authWriteErr && (subscriptionRecord || apiKey)) {
+      // The secret IS set; writing the login failed. Say that, not "set it".
+      const e = new Error(`could not write the codex login to ${authPath}: ${authWriteErr?.message || authWriteErr}`)
+      e.status = authWriteErr?.code === 'ENOSPC' ? 507 : 500
+      throw e
+    }
+    const e = new Error(
+      'No OpenAI credential for the codex harness. Set OPENAI_API_KEY (an OpenAI API key) or ' +
+      'OPENAI_CODEX_AUTH (the contents of ~/.codex/auth.json after `codex login`) as an organization ' +
+      'or agent secret; it reaches the agent when its workspace next boots.',
+    )
+    e.status = 400
+    throw e
   }
 
   // Dynamic tools: connector + platform tools are executed by THIS daemon, so
@@ -761,7 +786,10 @@ export async function createCodexDriver(s, spec, h) {
 
         case 'thread/status/changed':
           if (params?.status?.type === 'systemError') {
-            chain(() => fail(new Error('codex reported a system error')))
+            // Codex gives no reason here. The usual one is OpenAI rejecting
+            // the credential (a revoked or wrong key): say so (#1703).
+            chain(() => fail(new Error('codex reported a system error; this usually means OpenAI rejected the ' +
+              "agent's credential: check its OPENAI_API_KEY or OPENAI_CODEX_AUTH secret")))
           }
           break
 
@@ -1197,5 +1225,26 @@ export async function createCodexDriver(s, spec, h) {
       chain(finish)
       await serial
     },
+  }
+}
+
+async function fileExists(path) {
+  try {
+    await access(path)
+    return true
+  } catch {
+    return false
+  }
+}
+
+// usesCredentialStore reports a codex config that keeps logins in the OS
+// keyring rather than auth.json (cli_auth_credentials_store "keyring" or
+// "auto"). Unreadable or absent config means the default file store.
+async function usesCredentialStore(codexHome) {
+  try {
+    const cfg = await readFile(`${codexHome}/config.toml`, 'utf8')
+    return /^\s*cli_auth_credentials_store\s*=\s*["'](keyring|auto)["']/m.test(cfg)
+  } catch {
+    return false
   }
 }
