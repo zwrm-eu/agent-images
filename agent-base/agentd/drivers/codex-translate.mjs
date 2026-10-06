@@ -314,8 +314,8 @@ export function classifyCodexError(err) {
 // mapEffort passes a platform effort level through to codex.
 //
 // It does NOT narrow per model, and must not try to: which levels a model
-// accepts is catalog knowledge (Astra and gpt-5.6-* take `max`; gpt-5.5,
-// gpt-5.4-mini and gpt-5.3-codex-spark stop at `xhigh`), and the catalog lives
+// accepts is catalog knowledge (the GPT-6 and gpt-5.6 families take `max`;
+// gpt-5.5 stops at `xhigh`), and the catalog lives
 // in the control plane, which resolves the model and clamps the effort to it
 // before either ever reaches this daemon
 // (state.ClampCodexEffort, #1089). A second, model-blind clamp here could only
