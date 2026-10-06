@@ -84,7 +84,9 @@ function newHarness({ scenario = 'simple', spec = {} } = {}) {
     cwd: process.cwd(),
     permission_mode: 'bypassPermissions',
     ...spec,
-    env: { FAKE_CODEX_SCENARIO: scenario, FAKE_CODEX_TRACE: tracePath, CODEX_HOME: codexHome, ...(spec.env || {}) },
+    // A credential by default: without one the driver refuses to start
+    // (#1703). Tests about credentials set or clear it themselves.
+    env: { FAKE_CODEX_SCENARIO: scenario, FAKE_CODEX_TRACE: tracePath, CODEX_HOME: codexHome, OPENAI_API_KEY: 'sk-test-default', ...(spec.env || {}) },
   }
   return { s, h, spec: fullSpec, events, tracePath, codexHome }
 }
@@ -296,7 +298,7 @@ test('no OpenAI key leaves an existing login untouched', async () => {
   delete process.env.OPENAI_API_KEY
   try {
     const ctx = await build(newHarness({
-      spec: { env: { FAKE_CODEX_SCENARIO: 'simple', CODEX_HOME: codexHome } },
+      spec: { env: { FAKE_CODEX_SCENARIO: 'simple', CODEX_HOME: codexHome, OPENAI_API_KEY: '' } },
     }))
     const got = JSON.parse(readFileSync(join(codexHome, 'auth.json'), 'utf8'))
     assert.equal(got.auth_mode, 'chatgpt', 'an interactive login must survive')
@@ -395,7 +397,7 @@ test('an interactive login that supersedes ours is never revoked', async () => {
   delete process.env.OPENAI_API_KEY
   delete process.env.OPENAI_CODEX_AUTH
   try {
-    const ctx = await build(newHarness({ spec: { env: { CODEX_HOME: codexHome } } }))
+    const ctx = await build(newHarness({ spec: { env: { CODEX_HOME: codexHome, OPENAI_API_KEY: '' } } }))
     const got = JSON.parse(readFileSync(join(codexHome, 'auth.json'), 'utf8'))
     assert.equal(got.tokens.access_token, 'theirs', "the user's own login must survive revocation")
     await ctx.driver.shutdownStop()
@@ -425,10 +427,13 @@ test('a revoked credential removes the login the platform wrote', async () => {
   delete process.env.OPENAI_API_KEY
   delete process.env.OPENAI_CODEX_AUTH
   try {
-    const ctx = await build(newHarness({ spec: { env: { CODEX_HOME: codexHome } } }))
+    // Revoked and nothing else to log in with: the login we wrote is
+    // removed, and the session is refused with the fix rather than started
+    // into a 401 (#1703).
+    await assert.rejects(build(newHarness({ spec: { env: { CODEX_HOME: codexHome, OPENAI_API_KEY: '' } } })),
+      (err) => err.status === 400 && /No OpenAI credential/.test(err.message))
     assert.equal(existsSync(join(codexHome, 'auth.json')), false,
       'a revoked credential must remove the login the platform wrote')
-    await ctx.driver.shutdownStop()
   } finally {
     if (prevKey !== undefined) process.env.OPENAI_API_KEY = prevKey
     if (prevTok !== undefined) process.env.OPENAI_CODEX_AUTH = prevTok
@@ -447,8 +452,50 @@ test('a hand-made login the platform never wrote is left alone', async () => {
   delete process.env.OPENAI_API_KEY
   delete process.env.OPENAI_CODEX_AUTH
   try {
-    const ctx = await build(newHarness({ spec: { env: { CODEX_HOME: codexHome } } }))
+    const ctx = await build(newHarness({ spec: { env: { CODEX_HOME: codexHome, OPENAI_API_KEY: '' } } }))
     assert.ok(existsSync(join(codexHome, 'auth.json')), "a login we did not write must survive")
+    await ctx.driver.shutdownStop()
+  } finally {
+    if (prevKey !== undefined) process.env.OPENAI_API_KEY = prevKey
+    if (prevTok !== undefined) process.env.OPENAI_CODEX_AUTH = prevTok
+  }
+})
+
+test('no credential and no login refuses the session with the fix (#1703)', async () => {
+  // Without any login every turn is a 401 that codex reports only as an
+  // opaque systemError; the driver must say what is missing instead.
+  const codexHome = mkdtempSync(join(tmpdir(), 'codexhome-'))
+  const prevKey = process.env.OPENAI_API_KEY
+  const prevTok = process.env.OPENAI_CODEX_AUTH
+  delete process.env.OPENAI_API_KEY
+  delete process.env.OPENAI_CODEX_AUTH
+  try {
+    await assert.rejects(build(newHarness({ spec: { env: { CODEX_HOME: codexHome, OPENAI_API_KEY: '' } } })),
+      (err) => err.status === 400 && /OPENAI_API_KEY/.test(err.message) && /OPENAI_CODEX_AUTH/.test(err.message))
+  } finally {
+    if (prevKey !== undefined) process.env.OPENAI_API_KEY = prevKey
+    if (prevTok !== undefined) process.env.OPENAI_CODEX_AUTH = prevTok
+  }
+})
+
+test('a set credential whose login cannot be written is reported as such, not as missing', async () => {
+  // CODEX_HOME is a FILE, so mkdir/write fail while the key is configured.
+  const dir = mkdtempSync(join(tmpdir(), 'codexhome-'))
+  const codexHome = join(dir, 'not-a-dir')
+  writeFileSync(codexHome, 'x')
+  await assert.rejects(build(newHarness({ spec: { env: { CODEX_HOME: codexHome, OPENAI_API_KEY: 'sk-set' } } })),
+    (err) => err.status === 500 && /could not write the codex login/.test(err.message) && !/No OpenAI credential/.test(err.message))
+})
+
+test('a keyring-stored login (no auth.json) is not refused', async () => {
+  const codexHome = mkdtempSync(join(tmpdir(), 'codexhome-'))
+  writeFileSync(join(codexHome, 'config.toml'), 'cli_auth_credentials_store = "keyring"\n')
+  const prevKey = process.env.OPENAI_API_KEY
+  const prevTok = process.env.OPENAI_CODEX_AUTH
+  delete process.env.OPENAI_API_KEY
+  delete process.env.OPENAI_CODEX_AUTH
+  try {
+    const ctx = await build(newHarness({ spec: { env: { FAKE_CODEX_SCENARIO: 'simple', CODEX_HOME: codexHome, OPENAI_API_KEY: '' } } }))
     await ctx.driver.shutdownStop()
   } finally {
     if (prevKey !== undefined) process.env.OPENAI_API_KEY = prevKey
