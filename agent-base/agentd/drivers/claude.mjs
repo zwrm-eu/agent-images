@@ -105,6 +105,24 @@ export function resolveClaudeExecutable(env = process.env, home = accountHome())
   return p
 }
 
+// CLAUDE_SESSION_ENV holds Claude Code settings every harness session gets,
+// read from the 2.1.289 CLI. They are defaults: the VM environment (agent and
+// org secrets) and the session spec still override them.
+export const CLAUDE_SESSION_ENV = Object.freeze({
+  // Todo ledger (#1698). Current models get no todo tool at all unless
+  // CLAUDE_CODE_ENABLE_TODO_TOOLS opts in, and the opt-in offers the
+  // TaskCreate/TaskUpdate tools unless CLAUDE_CODE_ENABLE_TASKS is off.
+  // TodoWrite is the tool the ledger (todos.mjs) reads.
+  CLAUDE_CODE_ENABLE_TODO_TOOLS: '1',
+  CLAUDE_CODE_ENABLE_TASKS: '0',
+  // Background shells (#1702). A run_in_background command is stopped at its
+  // `timeout`: 30 minutes by default, at most max(2 h, BASH_MAX_TIMEOUT_MS).
+  // Raising the ceiling to 24 h lets an agent keep a dev server or long job
+  // alive by asking for it; the Bash tool's description tells the model the
+  // default and the maximum. The foreground default (2 minutes) is unchanged.
+  BASH_MAX_TIMEOUT_MS: String(24 * 60 * 60 * 1000),
+})
+
 // classifyRunError turns a raw SDK/child-process death into a human-readable
 // cause the operator can act on (#793), keeping the raw string as `detail`.
 // The Agent SDK surfaces the claude subprocess dying as
@@ -272,6 +290,10 @@ export function createClaudeDriver(s, spec, h, { startQuery = query, drainGraceM
   // Task-list ledger (#1424): TodoWrite calls become durable todo.updated
   // events once their tool_result confirms the list was actually adopted.
   const todoTracker = createTodoTracker((todos) => s.pusher.emit('todo.updated', { todos }))
+  // The ledger reads TodoWrite only. A CLI that stops offering it (a version
+  // change, or a secret overriding CLAUDE_SESSION_ENV) empties the todo list
+  // without an error, so the first init that lacks it is logged.
+  let todoToolChecked = false
 
   const canUseTool = async (toolName, input, opts = {}) => {
     // After /end, the in-flight turn may still reach for another tool; a new
@@ -337,7 +359,7 @@ export function createClaudeDriver(s, spec, h, { startQuery = query, drainGraceM
 
   const options = {
     cwd: spec.cwd || process.env.HOME || '/home/agent',
-    env: { ...process.env, ...(spec.env || {}) },
+    env: { ...CLAUDE_SESSION_ENV, ...process.env, ...(spec.env || {}) },
     pathToClaudeCodeExecutable: claudeExecutable,
     includePartialMessages: true,
     permissionMode: spec.permission_mode || 'bypassPermissions',
@@ -612,6 +634,12 @@ export function createClaudeDriver(s, spec, h, { startQuery = query, drainGraceM
           case 'system':
             if (msg.subtype === 'init') {
               if (msg.session_id) s.sdkSessionId = msg.session_id
+              if (!todoToolChecked && Array.isArray(msg.tools)) {
+                todoToolChecked = true
+                if (!msg.tools.includes('TodoWrite')) {
+                  h.log(`warning: claude ${msg.claude_code_version || '(unknown version)'} offers no TodoWrite tool; the session's todo list will stay empty`)
+                }
+              }
               onInit()
             }
             if (msg.subtype === 'commands_changed') {
