@@ -5,7 +5,7 @@
 // the test scripts the messages the CLI would send back.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { createClaudeDriver } from '../drivers/claude.mjs'
+import { CLAUDE_SESSION_ENV, createClaudeDriver } from '../drivers/claude.mjs'
 import { TurnEventContext } from '../turn-events.mjs'
 
 const GRACE_MS = 100
@@ -302,5 +302,76 @@ test('an init while an interrupt drains opens no turn', async () => {
   assert.equal(s.state, 'idle')
   assert.deepEqual(statuses(events), [{ state: 'working' }, { state: 'idle', background_tasks: 0 }])
   assert.equal(events.filter((e) => e.type === 'turn.started').length, 1)
+  fake.end()
+})
+
+test('sessions get the todo-tool and background-shell defaults; the VM env and the spec override them (#1698, #1702)', () => {
+  process.env.ZWRM_CLAUDE_BIN = process.execPath
+  // Hermetic: a host (or an agentd session running this suite) may export
+  // these already.
+  const keys = Object.keys(CLAUDE_SESSION_ENV)
+  const saved = Object.fromEntries(keys.map((k) => [k, process.env[k]]))
+  for (const k of keys) delete process.env[k]
+  process.env.BASH_MAX_TIMEOUT_MS = '3600000'
+  try {
+    const fake = fakeQuery()
+    const { s, h } = newHarness()
+    const spec = { interactive: true, cwd: process.cwd(), env: { CLAUDE_CODE_ENABLE_TASKS: '1' } }
+    s.driver = createClaudeDriver(s, spec, h, { startQuery: fake.startQuery, drainGraceMs: GRACE_MS })
+    s.driver.start()
+    const env = fake.options.env
+    assert.equal(env.CLAUDE_CODE_ENABLE_TODO_TOOLS, '1')
+    assert.equal(env.CLAUDE_CODE_ENABLE_TASKS, '1', 'the session spec wins')
+    assert.equal(env.BASH_MAX_TIMEOUT_MS, '3600000', 'the VM environment wins')
+    assert.equal(env.ZWRM_CLAUDE_BIN, process.execPath, 'the VM environment still reaches the CLI')
+    fake.end()
+  } finally {
+    for (const k of keys) {
+      if (saved[k] === undefined) delete process.env[k]
+      else process.env[k] = saved[k]
+    }
+  }
+  assert.deepEqual(CLAUDE_SESSION_ENV, {
+    CLAUDE_CODE_ENABLE_TODO_TOOLS: '1',
+    CLAUDE_CODE_ENABLE_TASKS: '0',
+    BASH_MAX_TIMEOUT_MS: '86400000',
+  })
+})
+
+test('the first init without TodoWrite is logged once (#1698)', async () => {
+  process.env.ZWRM_CLAUDE_BIN = process.execPath
+  const fake = fakeQuery()
+  const { s, h, events } = newHarness()
+  const logs = []
+  h.log = (...args) => logs.push(args.join(' '))
+  s.driver = createClaudeDriver(s, { interactive: true, cwd: process.cwd() }, h, {
+    startQuery: fake.startQuery,
+    drainGraceMs: GRACE_MS,
+  })
+  s.driver.start()
+  const bare = { type: 'system', subtype: 'init', session_id: 'sdk-1', claude_code_version: '9.9.9', tools: ['Bash', 'TaskCreate'] }
+  fake.send(bare)
+  fake.send({ ...bare })
+  await until(events, (ev) => ev.filter(isInit).length === 2, 'both inits')
+  assert.deepEqual(logs.filter((l) => l.includes('TodoWrite')), [
+    "warning: claude 9.9.9 offers no TodoWrite tool; the session's todo list will stay empty",
+  ])
+  fake.end()
+})
+
+test('an init that offers TodoWrite logs nothing about it (#1698)', async () => {
+  process.env.ZWRM_CLAUDE_BIN = process.execPath
+  const fake = fakeQuery()
+  const { s, h, events } = newHarness()
+  const logs = []
+  h.log = (...args) => logs.push(args.join(' '))
+  s.driver = createClaudeDriver(s, { interactive: true, cwd: process.cwd() }, h, {
+    startQuery: fake.startQuery,
+    drainGraceMs: GRACE_MS,
+  })
+  s.driver.start()
+  fake.send({ type: 'system', subtype: 'init', session_id: 'sdk-1', tools: ['Bash', 'TodoWrite'] })
+  await until(events, (ev) => ev.some(isInit), 'the init')
+  assert.equal(logs.filter((l) => l.includes('TodoWrite')).length, 0)
   fake.end()
 })
