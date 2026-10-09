@@ -7,6 +7,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { CLAUDE_SESSION_ENV, createClaudeDriver } from '../drivers/claude.mjs'
 import { TurnEventContext } from '../turn-events.mjs'
+import { createTaskLedger, levelTaskTtlMs } from '../drivers/claude-tasks.mjs'
 
 const GRACE_MS = 100
 
@@ -70,7 +71,7 @@ function newHarness() {
     sdkSessionId: null,
     pending: new Map(),
     parks: new Map(),
-    backgroundTasks: new Map(),
+    backgroundTasks: createTaskLedger(),
     pusher: { emit, turns },
     lastResult: null,
     ending: false,
@@ -101,11 +102,11 @@ function newHarness() {
   return { s, h, events, hooks }
 }
 
-function build() {
+function build(spec = {}) {
   process.env.ZWRM_CLAUDE_BIN = process.execPath
   const fake = fakeQuery()
   const { s, h, events, hooks } = newHarness()
-  const driver = createClaudeDriver(s, { interactive: true, cwd: process.cwd() }, h, {
+  const driver = createClaudeDriver(s, { interactive: true, cwd: process.cwd(), ...spec }, h, {
     startQuery: fake.startQuery,
     drainGraceMs: GRACE_MS,
   })
@@ -281,6 +282,105 @@ test('a notification that arrives mid-turn with no turn after it releases the ze
   const reemit = events.findLast((e) => e.type === 'session.status')
   assert.deepEqual(reemit.payload, { state: 'idle', background_tasks: 0 })
   assertWaitedGrace(idle, reemit, 'the zero went out')
+  fake.end()
+})
+
+// The same turn on a CLI that sends the level (#1712): the level confirms
+// the shell; a foreground task's started edge, which the level never lists,
+// does not count even though it has not settled by the result.
+async function turnLeavingLevelTask(driver, fake, events) {
+  driver.queueMessage('start a dev server in the background')
+  fake.send(init)
+  fake.send({ type: 'system', subtype: 'background_tasks_changed', tasks: [{ task_id: 'bg-1', task_type: 'local_bash', description: 'dev server' }] })
+  fake.send({ type: 'system', subtype: 'task_started', task_id: 'bg-1', is_backgrounded: true })
+  fake.send({ type: 'system', subtype: 'task_started', task_id: 'fg-1', is_backgrounded: false })
+  fake.send(result)
+  await until(events, (ev) => ev.some((e) => e.type === 'turn.completed'), 'the prompted turn to end')
+  assert.deepEqual(statuses(events), [{ state: 'working' }, { state: 'idle', background_tasks: 1 }])
+}
+
+test('the level reports the background count at the end of a turn (#1712)', async () => {
+  const { s, driver, fake, events } = build()
+  await turnLeavingLevelTask(driver, fake, events)
+  assert.equal(s.backgroundTasks.level, true)
+  fake.end()
+})
+
+test("the ledger's level TTL follows the CLI's shell ceiling, including a raised one (#1712)", () => {
+  const { s, fake } = build()
+  assert.equal(s.backgroundTasks.levelTtlMs, levelTaskTtlMs(fake.options.env))
+  assert.equal(levelTaskTtlMs(CLAUDE_SESSION_ENV), 25 * 60 * 60 * 1000, 'the 24 h default')
+  fake.end()
+  const raised = build({ env: { BASH_MAX_TIMEOUT_MS: String(48 * 60 * 60 * 1000) } })
+  assert.equal(raised.s.backgroundTasks.levelTtlMs, 49 * 60 * 60 * 1000)
+  raised.fake.end()
+})
+
+test('under the level, a task that settles mid-turn is still owed to the result (#1712, #1613)', async () => {
+  const { driver, fake, events } = build()
+  driver.queueMessage('start a job in the background, then write a story')
+  fake.send(init)
+  fake.send({ type: 'system', subtype: 'background_tasks_changed', tasks: [{ task_id: 'bg-1', task_type: 'local_bash', description: 'job' }] })
+  fake.send({ type: 'system', subtype: 'task_started', task_id: 'bg-1', is_backgrounded: true })
+  fake.send({ type: 'system', subtype: 'background_tasks_changed', tasks: [] })
+  fake.send({ type: 'system', subtype: 'task_updated', task_id: 'bg-1', patch: { status: 'completed' } })
+  fake.send({ type: 'system', subtype: 'task_notification', task_id: 'bg-1', status: 'completed' })
+  fake.send(assistant('a story'))
+  fake.send(result)
+  await until(events, (ev) => ev.some((e) => e.type === 'turn.completed'), 'the turn to end')
+  assert.deepEqual(statuses(events), [{ state: 'working' }, { state: 'idle', background_tasks: 1 }],
+    'live 0 + owed 1: the CP must not complete the run on this idle')
+  const mark = events.length
+  fake.send(init)
+  fake.send(assistant('noticed'))
+  fake.send(result)
+  await until(events, (ev) => ev.slice(mark).some((e) => e.type === 'turn.completed'), 'the self-started turn to end')
+  assert.deepEqual(statuses(events.slice(mark)), [{ state: 'working' }, { state: 'idle', background_tasks: 0 }])
+  const settled = events.length
+  await sleep(GRACE_MS * 3)
+  assert.deepEqual(events.slice(settled), [], 'the held zero was dropped when the turn started')
+  fake.end()
+})
+
+test('under the level, a live task and an owed one both hold the idle count (#1712, #1613)', async () => {
+  const { driver, fake, events } = build()
+  const lvl = (...ids) => ({ type: 'system', subtype: 'background_tasks_changed', tasks: ids.map((id) => ({ task_id: id, task_type: 'local_bash', description: id })) })
+  driver.queueMessage('start two background jobs')
+  fake.send(init)
+  fake.send(lvl('a', 'b'))
+  fake.send(lvl('a'))
+  fake.send({ type: 'system', subtype: 'task_notification', task_id: 'b', status: 'completed' })
+  fake.send(result)
+  await until(events, (ev) => ev.some((e) => e.type === 'turn.completed'), 'the turn to end')
+  assert.deepEqual(statuses(events), [{ state: 'working' }, { state: 'idle', background_tasks: 2 }])
+  const mark = events.length
+  fake.send(init)
+  fake.send(assistant('b finished'))
+  fake.send(result)
+  await until(events, (ev) => ev.slice(mark).some((e) => e.type === 'turn.completed'), 'the self-started turn to end')
+  assert.deepEqual(statuses(events.slice(mark)), [{ state: 'working' }, { state: 'idle', background_tasks: 1 }])
+  await sleep(GRACE_MS * 3)
+  assert.equal(statuses(events.slice(mark)).length, 2, 'no zero while a is live')
+  fake.end()
+})
+
+test('a level that drains while idle re-announces idle with a zero count after the grace (#1712)', async () => {
+  const { driver, fake, events } = build()
+  await turnLeavingLevelTask(driver, fake, events)
+  const mark = events.length
+
+  // 2.1.289 order on a kill: the level leads the settle edges.
+  fake.send({ type: 'system', subtype: 'background_tasks_changed', tasks: [] })
+  fake.send({ type: 'system', subtype: 'task_updated', task_id: 'bg-1', patch: { status: 'killed' } })
+  fake.send({ type: 'system', subtype: 'task_notification', task_id: 'bg-1', status: 'stopped' })
+  await until(events, (ev) => statuses(ev.slice(mark)).length === 1, 'the drain re-emit')
+  const own = events.slice(mark)
+  const reemit = own.find((e) => e.type === 'session.status')
+  assert.deepEqual(reemit.payload, { state: 'idle', background_tasks: 0 })
+  const drained = own.find((e) => e.type === 'sdk.system' && e.payload.subtype === 'background_tasks_changed')
+  assertWaitedGrace(drained, reemit, 'the zero went out')
+  await sleep(GRACE_MS * 3)
+  assert.equal(statuses(events.slice(mark)).length, 1, 'a single re-emit')
   fake.end()
 })
 
