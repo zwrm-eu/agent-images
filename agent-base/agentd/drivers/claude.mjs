@@ -9,7 +9,7 @@ import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { query, tool, createSdkMcpServer } from '@anthropic-ai/claude-agent-sdk'
 import { z } from 'zod'
-import { applyTaskMessage, countBackgroundTasks } from './claude-tasks.mjs'
+import { applyTaskMessage, clearTaskLedger, countBackgroundTasks, createTaskLedger } from './claude-tasks.mjs'
 import { createTodoTracker } from './todos.mjs'
 import { claudeQuestionDecision, claudeQuestionInput } from './questions.mjs'
 import { permissionDecisionPayload, contextUsagePayload, contextTokensFromUsage } from '../event-payloads.mjs'
@@ -120,6 +120,8 @@ export const CLAUDE_SESSION_ENV = Object.freeze({
   // Raising the ceiling to 24 h lets an agent keep a dev server or long job
   // alive by asking for it; the Bash tool's description tells the model the
   // default and the maximum. The foreground default (2 minutes) is unchanged.
+  // The background-task count derives its TTL from this (levelTaskTtlMs in
+  // claude-tasks.mjs), so a secret raising it keeps longer shells counted.
   BASH_MAX_TIMEOUT_MS: String(24 * 60 * 60 * 1000),
 })
 
@@ -431,6 +433,10 @@ export function createClaudeDriver(s, spec, h, { startQuery = query, drainGraceM
       yield item
     }
   }
+
+  // One background-task ledger per CLI process (#1712): the level signal
+  // starts empty with the process, and entries live as long as its shells can.
+  s.backgroundTasks = createTaskLedger(options.env)
 
   // A synchronous throw here (option validation, spawn setup) propagates to
   // the caller, which owns not publishing a half-initialized session.
@@ -762,7 +768,7 @@ export function createClaudeDriver(s, spec, h, { startQuery = query, drainGraceM
       rejectPendingCompact('session ended', 409)
       await h.syncToDisk()
       s.state = 'ended'
-      s.backgroundTasks.clear() // the SDK process is winding down; its tasks die with it
+      clearTaskLedger(s.backgroundTasks) // the SDK process is winding down; its tasks die with it
       s.pusher.emit('session.ended', { sdk_session_id: s.sdkSessionId, last_result: s.lastResult })
     } catch (err) {
       h.log(`session ${s.id} failed: ${err?.stack || err}`)
@@ -774,7 +780,7 @@ export function createClaudeDriver(s, spec, h, { startQuery = query, drainGraceM
       // before the state flip for the same isDone invariant as above.
       await h.syncToDisk()
       s.state = 'error'
-      s.backgroundTasks.clear()
+      clearTaskLedger(s.backgroundTasks)
       s.pusher.emit('session.error', { message: c.message, cause: c.cause, detail: c.detail })
     }
   }

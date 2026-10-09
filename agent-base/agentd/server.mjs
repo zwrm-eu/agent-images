@@ -42,7 +42,7 @@ import { handlePlatformTool } from './drivers/opencode-run-tools.mjs'
 import { answeredQuestions } from './drivers/questions.mjs'
 import { parkDeadlineError } from './drivers/run-tools.mjs'
 import { TOOL_POLICIES } from './drivers/tool-policy.mjs'
-import { countBackgroundTasks } from './drivers/claude-tasks.mjs'
+import { countBackgroundTasks, createTaskLedger } from './drivers/claude-tasks.mjs'
 import { seedState, waitSeedClear, SEED_WAIT_MAX_MS, SEED_FAILED_MESSAGE } from './seedgate.mjs'
 import { EventPusher } from './event-pusher.mjs'
 import { decisionForRequest, permissionDecisionPayload } from './event-payloads.mjs'
@@ -316,7 +316,7 @@ async function startSession(spec) {
     sdkSessionId: spec.resume_sdk_session_id || null,
     pending: new Map(), // request_id -> {resolve, toolName, input, ts}
     parks: new Map(), // park_id -> {resolve, kind, deadline, ts, resultText} (#803)
-    backgroundTasks: new Map(), // task_id -> {ts, description} (#1251, claude driver)
+    backgroundTasks: createTaskLedger(), // #1251/#1712; the claude driver replaces it per CLI process
     // While the home volume is still seeding, the stub driver queues prompt
     // strings. Keep the visible user message in lockstep and emit it only
     // when the real driver opens the canonical turn after seeding.
