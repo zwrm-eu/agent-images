@@ -30,7 +30,52 @@ function cleanAttachment(value) {
 // The control plane has already read and validated these references against
 // this session's workspace. Agentd keeps a second, cheap shape/path check so
 // a direct daemon caller cannot smuggle arbitrary paths into the prompt.
-export function prepareMessage(text, requestedAttachments) {
+const MAX_AUTHOR_FIELD = 256
+
+// cleanAuthor bounds the member identity the control plane attributes a
+// message or decision to ({id, name?, email?, image?}, #1784). Null when
+// there is none or it is malformed, so a direct daemon caller cannot smuggle
+// arbitrary shapes into the durable timeline.
+export function cleanAuthor(value) {
+  if (!value || typeof value !== 'object') return null
+  const field = (name) => (typeof value[name] === 'string' ? value[name].trim().slice(0, MAX_AUTHOR_FIELD) : '')
+  const id = field('id')
+  if (!id) return null
+  const author = { id }
+  for (const name of ['name', 'email', 'image']) {
+    const cleaned = field(name)
+    if (cleaned) author[name] = cleaned
+  }
+  return author
+}
+
+// speakerLine leads a shared chat's prompt with who is talking, in the
+// "[From: Name <email>]" form the control plane's SharedChatPrompt tells the
+// model to expect. Never part of the visible message text.
+export function speakerLine(author) {
+  if (!author) return ''
+  // Line breaks, invisible characters and brackets can't break out of the
+  // header or start another one.
+  const name = (author.name || author.email || author.id).replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\[\]［］]/gu, ' ')
+  const email = author.email && author.email !== name
+    ? ` <${author.email.replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}<>\[\]［］]/gu, ' ')}>`
+    : ''
+  return `[From: ${name}${email}]`
+}
+
+// escapeSpeakerLines keeps a shared chat's message text from posing as the
+// platform: every "[From:" in it is escaped, wherever it stands (a quote,
+// bold, after an invisible character) and however it is spaced or bracketed,
+// so the only header the model reads as a speaker is the one speakerLine
+// adds.
+export function escapeSpeakerLines(text) {
+  return text.replace(/([\[［])([\s\p{Cf}]*from[\s\p{Cf}]*[:：])/giu, '\\$1$2')
+}
+
+// options.attributed marks a shared chat's message (#1784): options.speaker
+// (a cleaned author, null for a message no member sent) leads the prompt
+// with speakerLine, and the text's own "[From:" lines are escaped.
+export function prepareMessage(text, requestedAttachments, options = {}) {
   if (typeof text !== 'string') throw new Error('missing text')
   if (requestedAttachments != null && !Array.isArray(requestedAttachments)) throw new Error('attachments must be an array')
   if ((requestedAttachments?.length ?? 0) > MAX_ATTACHMENTS) throw new Error('too many attachments')
@@ -39,11 +84,15 @@ export function prepareMessage(text, requestedAttachments) {
   if (text.trim() === '' && attachments.length === 0) throw new Error('missing text')
 
   const visibleText = text.trim()
-  if (attachments.length === 0) return { prompt: visibleText, text: visibleText, attachments }
+  const attributed = options.attributed === true || !!options.speaker
+  const speaker = speakerLine(options.speaker)
+  const lead = speaker ? `${speaker}\n` : ''
+  const body = attributed ? escapeSpeakerLines(visibleText) : visibleText
+  if (attachments.length === 0) return { prompt: `${lead}${body}`, text: visibleText, attachments }
   const references = attachments.map((attachment) =>
     `- ${JSON.stringify(attachment.path)} (${attachment.mime_type}, ${attachment.size} bytes)`).join('\n')
   return {
-    prompt: `${visibleText}${visibleText ? '\n\n' : ''}${ATTACHED_CONTEXT_MARKER}\n` +
+    prompt: `${lead}${body}${body ? '\n\n' : ''}${ATTACHED_CONTEXT_MARKER}\n` +
       'The user attached these validated files from the current workspace. Read them with your file tools before relying on their contents:\n' +
       `${references}\n${ATTACHED_CONTEXT_END}`,
     text: visibleText,

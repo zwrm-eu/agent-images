@@ -69,3 +69,16 @@ test('contextTokensFromUsage sums the normalized usage shape (#1553)', () => {
   assert.equal(contextTokensFromUsage({ input_tokens: 10 }), 10)
   assert.equal(contextTokensFromUsage(undefined), undefined)
 })
+
+test('a decision names who made it when the control plane says so', () => {
+  const by = { id: 'u2', name: 'Mia' }
+  assert.deepEqual(permissionDecisionPayload('request-4', { behavior: 'deny', decided_by: by }), {
+    request_id: 'request-4',
+    behavior: 'deny',
+    decided_by: by,
+  })
+  assert.deepEqual(permissionDecisionPayload('request-5', { behavior: 'allow', decided_by: null }), {
+    request_id: 'request-5',
+    behavior: 'allow',
+  })
+})

@@ -46,7 +46,7 @@ import { countBackgroundTasks, createTaskLedger } from './drivers/claude-tasks.m
 import { seedState, waitSeedClear, SEED_WAIT_MAX_MS, SEED_FAILED_MESSAGE } from './seedgate.mjs'
 import { EventPusher } from './event-pusher.mjs'
 import { decisionForRequest, permissionDecisionPayload } from './event-payloads.mjs'
-import { prepareMessage } from './message-context.mjs'
+import { cleanAuthor, prepareMessage } from './message-context.mjs'
 import { searchWorkspaceFiles } from './file-search.mjs'
 import { loadImageMCPServers, withImageServers } from './image-mcp.mjs'
 import { desktopStatus, loadDesktop, relayVNC, startDesktop, writeControl } from './desktop.mjs'
@@ -927,9 +927,17 @@ async function handleCreate(req, res) {
 
 async function handleMessage(req, res, s) {
   const body = await readBody(req)
+  // Who is speaking (shared chats, #1784): stamped on the durable user
+  // message for every viewer, and led into the prompt only when the control
+  // plane asks (attribute_author), so a private chat's transcript stays plain.
+  const author = cleanAuthor(body.author)
   let prepared
   try {
-    prepared = prepareMessage(body.text, body.attachments)
+    const attributed = body.attribute_author === true
+    prepared = prepareMessage(body.text, body.attachments, {
+      attributed,
+      speaker: attributed ? author : null,
+    })
   } catch (err) {
     throw badRequest(err.message)
   }
@@ -942,7 +950,7 @@ async function handleMessage(req, res, s) {
     return send(res, 409, { error: 'session is not accepting messages', state: s.state })
   }
   if (pendingCount > 0) s.pendingContexts.splice(0, pendingCount)
-  const visibleMessage = { text: prepared.text, attachments: prepared.attachments }
+  const visibleMessage = { text: prepared.text, attachments: prepared.attachments, ...(author ? { author } : {}) }
   if (s.state === 'starting') s.deferredMessages.push(visibleMessage)
   else emitUserMessage(s, visibleMessage)
   send(res, 202, { queued: true })
@@ -1076,6 +1084,10 @@ async function handlePermission(req, res, s, requestId) {
     throw badRequest('a question needs answers: updated_input.answers keyed by question id (a string, or an array of labels for multiSelect)')
   }
   s.pending.delete(requestId)
+  // Whose answer or approval it was (#1784): the other members of a shared
+  // chat see it on the decision, so a resolved prompt is not a mystery to
+  // them. Bounded here, before the decision is built from the body.
+  body.decided_by = cleanAuthor(body.decided_by)
   // The recorded decision is the applied one: an updated_input ignored for a
   // truncated request (#1631) is not in the timeline either.
   const decision = decisionForRequest(p, body, s.pusher.truncatedPermissionRequests.delete(requestId))
@@ -1336,7 +1348,10 @@ const server = createServer(async (req, res) => {
         // stdio servers into every session; image_mcp_servers lists them.
         // 'desktop' (#1680): /desktop status/start/control plus the
         // Upgrade: zwrm-vnc relay; `desktop` says whether the image has one.
-        caps: ['mcp', 'escalation', 'files', 'file-search', 'message-context', 'bulk-attachments', 'park', 'reclaim', 'skillfetch', 'pi-multiprovider', 'pi-gateway', 'opencode-gateway', 'background-tasks', 'tool-policy', 'agent-identity', 'commands', 'shell', 'model-switch', 'compact', 'image-mcp', 'desktop', ...HARNESS_CAPS],
+        // 'speaker-attribution' (#1784): a shared chat's messages are led
+        // by "[From: …]" and their own such lines escaped (attribute_author);
+        // the CP tells the model so only when this is advertised.
+        caps: ['mcp', 'escalation', 'files', 'file-search', 'message-context', 'bulk-attachments', 'park', 'reclaim', 'skillfetch', 'pi-multiprovider', 'pi-gateway', 'opencode-gateway', 'background-tasks', 'tool-policy', 'agent-identity', 'commands', 'shell', 'model-switch', 'compact', 'image-mcp', 'desktop', 'speaker-attribution', ...HARNESS_CAPS],
         active_session: session && !isDone(session) ? session.id : null,
         state: session?.state ?? null,
         // A session ended because its events could no longer reach the
