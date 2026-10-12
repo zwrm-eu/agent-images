@@ -19,6 +19,7 @@ export function permissionDecisionPayload(requestId, body) {
     ...(body.message ? { message: body.message } : {}),
     ...(body.updated_input != null ? { updated_input: body.updated_input } : {}),
     ...(hasAnswers(body.updated_input?.answers) ? { answers: body.updated_input.answers } : {}),
+    ...(body.decided_by ? { decided_by: body.decided_by } : {}),
   }
 }
 

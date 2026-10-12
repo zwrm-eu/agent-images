@@ -269,6 +269,7 @@ test('desktop (#1680): advertised, routed, and the upgrade path is token-gated',
   const src = await readFile(new URL('../server.mjs', import.meta.url), 'utf8')
   const capsLine = src.split('\n').find((l) => l.trimStart().startsWith('caps:'))
   assert.ok(capsLine.includes("'desktop'"), 'the desktop cap must be advertised')
+  assert.ok(capsLine.includes("'speaker-attribution'"), 'the speaker-attribution cap must be advertised')
   const up = src.slice(src.indexOf("server.on('upgrade'"), src.indexOf('server.listen(PORT'))
   const relay = up.indexOf('relayVNC(')
   assert.ok(relay > 0, 'the upgrade handler relays to the desktop')
