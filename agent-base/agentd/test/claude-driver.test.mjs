@@ -475,3 +475,19 @@ test('an init that offers TodoWrite logs nothing about it (#1698)', async () => 
   assert.equal(logs.filter((l) => l.includes('TodoWrite')).length, 0)
   fake.end()
 })
+
+test('every session, a resume included, runs on its own append, never a recorded one (#1832)', () => {
+  process.env.ZWRM_CLAUDE_BIN = process.execPath
+  for (const spec of [
+    { interactive: true, cwd: process.cwd(), append_system_prompt: 'shared chat set-up', resume_sdk_session_id: 'sdk-alice' },
+    { interactive: true, cwd: process.cwd() },
+  ]) {
+    const fake = fakeQuery()
+    const { s, h } = newHarness()
+    s.driver = createClaudeDriver(s, spec, h, { startQuery: fake.startQuery, drainGraceMs: GRACE_MS })
+    s.driver.start()
+    assert.equal(fake.options.systemPrompt.snapshot, false)
+    assert.equal(fake.options.systemPrompt.append, spec.append_system_prompt)
+    fake.end()
+  }
+})

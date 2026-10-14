@@ -280,3 +280,9 @@ test('desktop (#1680): advertised, routed, and the upgrade path is token-gated',
     assert.ok(at > 0 && at < relay, `upgrade gate ${gate} must run before relayVNC`)
   }
 })
+
+test('session-instructions (#1832): advertised, so the CP resumes a chat shared since its conversation began', async () => {
+  const src = await readFile(new URL('../server.mjs', import.meta.url), 'utf8')
+  const capsLine = src.split('\n').find((l) => l.trimStart().startsWith('caps:'))
+  assert.ok(capsLine.includes("'session-instructions'"), 'the session-instructions cap must be advertised')
+})

@@ -1351,7 +1351,12 @@ const server = createServer(async (req, res) => {
         // 'speaker-attribution' (#1784): a shared chat's messages are led
         // by "[From: …]" and their own such lines escaped (attribute_author);
         // the CP tells the model so only when this is advertised.
-        caps: ['mcp', 'escalation', 'files', 'file-search', 'message-context', 'bulk-attachments', 'park', 'reclaim', 'skillfetch', 'pi-multiprovider', 'pi-gateway', 'opencode-gateway', 'background-tasks', 'tool-policy', 'agent-identity', 'commands', 'shell', 'model-switch', 'compact', 'image-mcp', 'desktop', 'speaker-attribution', ...HARNESS_CAPS],
+        // 'session-instructions' (#1832): a resumed conversation runs on the
+        // session's own append_system_prompt, not the one it started with
+        // (claude: snapshot false; codex: a thread whose instructions_scope
+        // changed is rebuilt without its old developer instructions). The
+        // CP resumes a chat shared since its conversation began only here.
+        caps: ['mcp', 'escalation', 'files', 'file-search', 'message-context', 'bulk-attachments', 'park', 'reclaim', 'skillfetch', 'pi-multiprovider', 'pi-gateway', 'opencode-gateway', 'background-tasks', 'tool-policy', 'agent-identity', 'commands', 'shell', 'model-switch', 'compact', 'image-mcp', 'desktop', 'speaker-attribution', 'session-instructions', ...HARNESS_CAPS],
         active_session: session && !isDone(session) ? session.id : null,
         state: session?.state ?? null,
         // A session ended because its events could no longer reach the
