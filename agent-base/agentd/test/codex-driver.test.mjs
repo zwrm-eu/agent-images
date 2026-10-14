@@ -1162,6 +1162,26 @@ test('a thread from before the scope record is rebuilt for a shared chat (#1832)
   }
 })
 
+test("a shared chat that brings its owner's memories or skills is a set-up of its own (#1836)", async () => {
+  // A thread from before the scope record is a shared chat's like any other.
+  const legacy = await build(scopedHarness({ scope: 'shared;memories:alice', record: { [FIXTURE.basic]: '' } }))
+  try {
+    assert.equal(sentCalls(legacy.tracePath, 'thread/resume').length, 0)
+    assert.equal(sentCalls(legacy.tracePath, 'thread/inject_items').length, 1)
+    assert.deepEqual(threadRecords(legacy.codexHome)['thread-abc'], { tools: '', scope: 'shared;memories:alice' })
+  } finally {
+    await legacy.driver.shutdownStop()
+  }
+  // The owner switching their memories off is another set-up: rebuilt.
+  const off = await build(scopedHarness({ scope: 'shared', record: { [FIXTURE.basic]: { tools: '', scope: 'shared;memories:alice' } } }))
+  try {
+    assert.equal(sentCalls(off.tracePath, 'thread/resume').length, 0)
+    assert.equal(sentCalls(off.tracePath, 'thread/inject_items').length, 1)
+  } finally {
+    await off.driver.shutdownStop()
+  }
+})
+
 test('a thread from before the scope record still resumes in a private chat (#1832)', async () => {
   const ctx = await build(scopedHarness({ scope: 'member:alice', record: { [FIXTURE.basic]: '' } }))
   assert.equal(sentCalls(ctx.tracePath, 'thread/resume').length, 1)

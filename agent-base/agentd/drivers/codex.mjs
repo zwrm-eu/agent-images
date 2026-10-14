@@ -940,7 +940,9 @@ export async function createCodexDriver(s, spec, h) {
   //
   // The control plane says whose set-up a session's instructions are:
   // instructions_scope is "member:<id>" in a member's private workspace and
-  // "shared" anywhere else (absent from an older control plane: unknown).
+  // "shared" anywhere else (absent from an older control plane: unknown),
+  // followed by what of its owner's own a shared chat brings, e.g.
+  // "shared;memories:<id>" (#1836).
   // The record keeps the scope each thread was CREATED (or rebuilt) for,
   // and a thread whose scope is another one is REBUILT, never resumed:
   //   - recorded scope known and different from this session's: rebuild;
@@ -979,7 +981,7 @@ export async function createCodexDriver(s, spec, h) {
       h.log(`codex: connectors changed since thread ${resumeHandle} was created ` +
         `(was "${recorded.tools}", now "${fingerprint}"); starting a fresh thread`)
       resumeHandle = ''
-    } else if (recorded?.scope !== undefined ? recorded.scope !== scope : scope === 'shared') {
+    } else if (recorded?.scope !== undefined ? recorded.scope !== scope : isSharedScope(scope)) {
       h.log(`codex: thread ${resumeHandle} was created for instructions scope ` +
         `"${recorded?.scope ?? 'unknown'}", this session's is "${scope ?? 'unknown'}"; rebuilding it without its old instructions`)
       rebuildFrom = resumeHandle
@@ -1377,6 +1379,12 @@ async function usesCredentialStore(codexHome) {
   } catch {
     return false
   }
+}
+
+// isSharedScope reports an instructions_scope for a shared chat or a run:
+// "shared", with or without what of its owner's own it brings (#1836).
+function isSharedScope(scope) {
+  return scope === 'shared' || (typeof scope === 'string' && scope.startsWith('shared;'))
 }
 
 // threadRecord reads one entry of .zwrm-thread-tools.json: {tools, scope}
