@@ -9,10 +9,16 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { fileURLToPath } from 'node:url'
-import { mkdtempSync, readFileSync, existsSync, statSync, writeFileSync } from 'node:fs'
+import { cpSync, mkdtempSync, readFileSync, readdirSync, existsSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { createCodexDriver, isStaleCodexTurnCompletion } from '../drivers/codex.mjs'
+import {
+  codexRolloutHistory,
+  createCodexDriver,
+  isCodexContextualUserText,
+  isStaleCodexTurnCompletion,
+  readCodexRolloutLineage,
+} from '../drivers/codex.mjs'
 
 const FAKE = fileURLToPath(new URL('./fake-codex-app-server.mjs', import.meta.url))
 
@@ -1005,4 +1011,586 @@ test('shutdown ends the session and reports the last result', async () => {
   const ended = ofType(ctx.events, 'session.ended')
   assert.equal(ended.length, 1)
   assert.equal(ended[0].payload.sdk_session_id, 'thread-abc')
+})
+
+// ---- instructions scope (#1832) ---------------------------------------------
+//
+// A thread created for one member's private chat carries that member's
+// instructions in its developer message, and codex replays it on resume. A
+// session with another instructions scope must REBUILD the thread instead:
+// a new thread on its own instructions, with the old conversation injected.
+//
+// The rollouts under fixtures/codex-rollouts were recorded against the pinned
+// codex 0.160.0 with a fake model (then trimmed, paths and ids replaced):
+// Alice's private chat, developerInstructions ALICE-PRIVATE-MEMORY-7731 and a
+// private skill alice-private-notes, one turn with an exec_command call and a
+// reasoning item, then a second turn. `compact` adds a manual compaction and
+// a third turn; `revert` reverts the second turn, which leaves the thread on
+// a second rollout that continues the first (session_meta.history_base).
+// `remote` ran on codex's built-in OpenAI provider (a fake key against a
+// loopback server), whose compaction is remote: the older turns become one
+// encrypted compaction item, plus the plain messages it retained.
+
+const ROLLOUTS = fileURLToPath(new URL('./fixtures/codex-rollouts/', import.meta.url))
+const FIXTURE = {
+  basic: '019a1832-0000-7000-8000-0000000000b1',
+  compact: '019a1832-0000-7000-8000-0000000000c1',
+  revert: '019a1832-0000-7000-8000-0000000000d1',
+  remote: '019a1832-0000-7000-8000-0000000000e1',
+}
+const ALICE_TEXT = ['ALICE-PRIVATE-MEMORY-7731', 'alice-private-notes', 'ALICE-SKILL-DESC-9191']
+// Codex's own compaction summary prefix (prompts/templates/compact/summary_prefix.md).
+const SUMMARY_PREFIX = 'Another language model started to solve this problem and produced a summary of its ' +
+  'thinking process. You also have access to the state of the tools that were used by that language model. ' +
+  'Use this to build on the work that has already been done and avoid duplicating work. Here is the summary ' +
+  'produced by the other language model, use the information in this summary to assist with your own analysis:'
+
+// One line per item, enough to read a history at a glance in an assertion.
+const describe = (it) => `${it.type}:${it.role ?? ''}:${it.content?.[0]?.text ?? it.call_id ?? it.encrypted_content ?? ''}`
+
+// What a rebuild carries of the basic fixture: the plain conversation. The
+// reasoning item (encrypted, and bound to the account that made it) stays
+// behind.
+const BASIC_CONVERSATION = [
+  'message:user:RUN-TOOL: draft the offer for ACME',
+  'function_call::call_probe_1',
+  'function_call_output::call_probe_1',
+  'message:assistant:after-tool-2: the command printed its marker',
+  'message:user:SECOND-TURN: make it more formal',
+  'message:assistant:ack-3',
+]
+
+// Copy a fixture into the harness's CODEX_HOME; returns the thread's current
+// rollout (a reverted thread's newer one).
+function seedRollout(codexHome, name) {
+  cpSync(join(ROLLOUTS, name), codexHome, { recursive: true })
+  const dir = join(codexHome, 'sessions', '2026', '10', '14')
+  const files = readdirSync(dir)
+  return join(dir, files.find((f) => f.includes('_')) ?? files[0])
+}
+
+// A session resuming a fixture thread under an instructions scope. The fake's
+// thread/read answers with the seeded rollout unless pointRead is false.
+function scopedHarness({ scenario = 'simple', scope, resume = FIXTURE.basic, record, rollout = 'basic', pointRead = true } = {}) {
+  const ctx = newHarness({
+    scenario,
+    spec: {
+      resume_sdk_session_id: resume,
+      append_system_prompt: 'SHARED PROMPT',
+      ...(scope !== undefined ? { instructions_scope: scope } : {}),
+    },
+  })
+  if (rollout) {
+    const path = seedRollout(ctx.codexHome, rollout)
+    if (pointRead) ctx.spec.env.FAKE_CODEX_ROLLOUT = path
+  }
+  if (record !== undefined) recordThreadConnectors(ctx.codexHome, record)
+  return ctx
+}
+
+const threadRecords = (codexHome) => JSON.parse(readFileSync(join(codexHome, '.zwrm-thread-tools.json'), 'utf8'))
+
+// The session is on a usable thread: the init event names it and a turn runs.
+async function assertUsable(ctx, threadId = 'thread-abc') {
+  ctx.driver.start()
+  assert.equal(ofType(ctx.events, 'sdk.system')[0].payload.session_id, threadId)
+  ctx.driver.queueMessage('go')
+  await until(ctx.events, (e) => ofType(e, 'sdk.result').length > 0, 'sdk.result')
+  assert.equal(ofType(ctx.events, 'sdk.result')[0].payload.result, 'MARKER')
+}
+
+test('a thread resumes when the session has the scope it was created for (#1832)', async () => {
+  const ctx = await build(scopedHarness({
+    scope: 'member:alice',
+    record: { [FIXTURE.basic]: { tools: '', scope: 'member:alice' } },
+  }))
+  assert.equal(sentCalls(ctx.tracePath, 'thread/resume').length, 1)
+  assert.equal(sentCalls(ctx.tracePath, 'thread/resume')[0].threadId, FIXTURE.basic)
+  assert.equal(sentCalls(ctx.tracePath, 'thread/start').length, 0)
+  assert.equal(sentCalls(ctx.tracePath, 'thread/read').length, 0, 'nothing to rebuild')
+  assert.equal(sentCalls(ctx.tracePath, 'thread/inject_items').length, 0)
+  assert.deepEqual(threadRecords(ctx.codexHome)['thread-abc'], { tools: '', scope: 'member:alice' })
+  await ctx.driver.shutdownStop()
+})
+
+test("a member's thread continued in a shared chat is rebuilt without its instructions (#1832)", async () => {
+  const ctx = await build(scopedHarness({
+    scope: 'shared',
+    record: { [FIXTURE.basic]: { tools: '', scope: 'member:alice' } },
+  }))
+  // Resuming would replay the developer message the thread began with.
+  assert.equal(sentCalls(ctx.tracePath, 'thread/resume').length, 0, 'the old thread must never be resumed')
+  assert.deepEqual(sentCalls(ctx.tracePath, 'thread/read').map((p) => p.threadId), [FIXTURE.basic])
+  const starts = sentCalls(ctx.tracePath, 'thread/start')
+  assert.equal(starts.length, 1)
+  assert.equal(starts[0].developerInstructions, 'SHARED PROMPT', "the new thread runs on this session's instructions")
+
+  const injects = sentCalls(ctx.tracePath, 'thread/inject_items')
+  assert.equal(injects.length, 1)
+  assert.equal(injects[0].threadId, 'thread-abc', 'into the NEW thread')
+  assert.deepEqual(injects[0].items.map(describe), BASIC_CONVERSATION)
+  const carried = JSON.stringify(injects[0].items)
+  for (const text of ALICE_TEXT) assert.ok(!carried.includes(text), `${text} must stay behind`)
+  assert.ok(!carried.includes('<environment_context>'), 'codex writes the new thread its own context')
+  // Nothing encrypted, and no ids naming the old account's items; the call
+  // still comes before its output.
+  assert.ok(!carried.includes('ENC-REASONING-6060-1'), 'the encrypted reasoning stays behind')
+  assert.ok(injects[0].items.every((i) => i.id === undefined), 'no item ids')
+  const call = injects[0].items.find((i) => i.type === 'function_call')
+  const output = injects[0].items.find((i) => i.type === 'function_call_output')
+  assert.equal(call.call_id, output.call_id)
+  assert.match(JSON.stringify(output.output), /TOOL-OUTPUT-5150/)
+
+  // The control plane stamps the new thread from the init event, and the
+  // record holds the scope it was rebuilt for.
+  assert.deepEqual(threadRecords(ctx.codexHome)['thread-abc'], { tools: '', scope: 'shared' })
+  assert.deepEqual(threadRecords(ctx.codexHome)[FIXTURE.basic], { tools: '', scope: 'member:alice' })
+  await assertUsable(ctx)
+  await ctx.driver.shutdownStop()
+})
+
+test('a thread from before the scope record is rebuilt for a shared chat (#1832)', async () => {
+  // A private chat's thread from an older daemon may be continued in a
+  // shared chat now; nothing says whose instructions it carries.
+  for (const record of [{ [FIXTURE.basic]: '' }, undefined]) {
+    const ctx = await build(scopedHarness({ scope: 'shared', record }))
+    assert.equal(sentCalls(ctx.tracePath, 'thread/resume').length, 0, JSON.stringify(record))
+    assert.equal(sentCalls(ctx.tracePath, 'thread/inject_items').length, 1, JSON.stringify(record))
+    assert.deepEqual(sentCalls(ctx.tracePath, 'thread/inject_items')[0].items.map(describe), BASIC_CONVERSATION)
+    assert.deepEqual(threadRecords(ctx.codexHome)['thread-abc'], { tools: '', scope: 'shared' })
+    await ctx.driver.shutdownStop()
+  }
+})
+
+test('a thread from before the scope record still resumes in a private chat (#1832)', async () => {
+  const ctx = await build(scopedHarness({ scope: 'member:alice', record: { [FIXTURE.basic]: '' } }))
+  assert.equal(sentCalls(ctx.tracePath, 'thread/resume').length, 1)
+  assert.equal(sentCalls(ctx.tracePath, 'thread/inject_items').length, 0)
+  // Resuming says nothing about the instructions the thread carries: its
+  // scope stays unknown, and a shared chat would still rebuild it.
+  assert.deepEqual(threadRecords(ctx.codexHome)['thread-abc'], { tools: '' })
+  await ctx.driver.shutdownStop()
+})
+
+test('a control plane that sends no scope resumes as before, unless the thread has a known one (#1832)', async () => {
+  const unknown = await build(scopedHarness({ record: { [FIXTURE.basic]: '' } }))
+  assert.equal(sentCalls(unknown.tracePath, 'thread/resume').length, 1)
+  await unknown.driver.shutdownStop()
+
+  const known = await build(scopedHarness({ record: { [FIXTURE.basic]: { tools: '', scope: 'member:alice' } } }))
+  assert.equal(sentCalls(known.tracePath, 'thread/resume').length, 0, 'a known scope that differs is rebuilt')
+  assert.equal(sentCalls(known.tracePath, 'thread/inject_items').length, 1)
+  assert.deepEqual(threadRecords(known.codexHome)['thread-abc'], { tools: '' })
+  await known.driver.shutdownStop()
+})
+
+test('a connector change still forfeits the thread before any rebuild (#1832)', async () => {
+  const ctx = await build(scopedHarness({
+    scope: 'shared',
+    record: { [FIXTURE.basic]: { tools: 'github', scope: 'member:alice' } },
+  }))
+  assert.equal(sentCalls(ctx.tracePath, 'thread/resume').length, 0)
+  assert.equal(sentCalls(ctx.tracePath, 'thread/read').length, 0)
+  assert.equal(sentCalls(ctx.tracePath, 'thread/inject_items').length, 0)
+  assert.equal(sentCalls(ctx.tracePath, 'thread/start').length, 1)
+  await ctx.driver.shutdownStop()
+})
+
+test('a thread that cannot be rebuilt starts fresh and is never resumed (#1832)', async () => {
+  const record = { [FIXTURE.basic]: { tools: '', scope: 'member:alice' } }
+  const cases = {
+    // thread/read names no rollout and the sessions directory has none.
+    'no rollout': scopedHarness({ scope: 'shared', record, rollout: null }),
+    // The file the app-server names is not a codex rollout.
+    'not a rollout': (() => {
+      const ctx = scopedHarness({ scope: 'shared', record, rollout: null })
+      const bogus = join(ctx.codexHome, 'bogus.jsonl')
+      writeFileSync(bogus, '{"type":"event_msg","payload":{"type":"task_started"}}\nnot json\n')
+      ctx.spec.env.FAKE_CODEX_ROLLOUT = bogus
+      return ctx
+    })(),
+    // The app-server refuses the items.
+    'inject refused': scopedHarness({ scenario: 'inject-fails', scope: 'shared', record }),
+  }
+  for (const [name, h0] of Object.entries(cases)) {
+    const ctx = await build(h0)
+    assert.equal(sentCalls(ctx.tracePath, 'thread/resume').length, 0, `${name}: the old thread must never be resumed`)
+    assert.equal(sentCalls(ctx.tracePath, 'thread/start').length, 1, `${name}: one fresh thread`)
+    assert.equal(sentCalls(ctx.tracePath, 'thread/start')[0].developerInstructions, 'SHARED PROMPT', name)
+    assert.equal(sentCalls(ctx.tracePath, 'thread/inject_items').length, name === 'inject refused' ? 1 : 0, name)
+    assert.deepEqual(threadRecords(ctx.codexHome)['thread-abc'], { tools: '', scope: 'shared' }, name)
+    await assertUsable(ctx)
+    await ctx.driver.shutdownStop()
+  }
+})
+
+test('a rebuild finds the rollout itself when thread/read fails (#1832)', async () => {
+  const ctx = await build(scopedHarness({
+    scenario: 'read-fails',
+    scope: 'shared',
+    record: { [FIXTURE.basic]: { tools: '', scope: 'member:alice' } },
+  }))
+  assert.equal(sentCalls(ctx.tracePath, 'thread/read').length, 1)
+  assert.deepEqual(sentCalls(ctx.tracePath, 'thread/inject_items')[0].items.map(describe), BASIC_CONVERSATION)
+  await ctx.driver.shutdownStop()
+})
+
+test('a rebuild whose fresh thread cannot start is a bad gateway (#1832)', async () => {
+  await assert.rejects(
+    () => build(scopedHarness({ scenario: 'start-fails', scope: 'shared', record: { [FIXTURE.basic]: { tools: '', scope: 'member:alice' } } })),
+    (err) => err.status === 502 && /failed to start codex thread/.test(err.message),
+  )
+})
+
+test('a reverted thread is rebuilt from its current rollout and the prefix it continues (#1832)', async () => {
+  const ctx = await build(scopedHarness({
+    scope: 'shared',
+    resume: FIXTURE.revert,
+    rollout: 'revert',
+    record: { [FIXTURE.revert]: { tools: '', scope: 'member:alice' } },
+  }))
+  // The second turn was reverted; the first, with its tool call, remains.
+  assert.deepEqual(sentCalls(ctx.tracePath, 'thread/inject_items')[0].items.map(describe), BASIC_CONVERSATION.slice(0, 4))
+  await ctx.driver.shutdownStop()
+})
+
+test('the scope record stays bounded (#1832)', async () => {
+  const record = {}
+  for (let i = 0; i < 60; i++) record[`thread-${i}`] = { tools: '', scope: 'shared' }
+  const ctx = await build(scopedHarness({ scope: 'shared', resume: '', rollout: null, record }))
+  const kept = threadRecords(ctx.codexHome)
+  assert.equal(Object.keys(kept).length, 50)
+  assert.deepEqual(kept['thread-abc'], { tools: '', scope: 'shared' })
+  assert.equal(kept['thread-0'], undefined, 'the oldest go first')
+  await ctx.driver.shutdownStop()
+})
+
+test('the scope record evicts the thread used least recently, not the one recorded first (#1832)', async () => {
+  const record = { 'thread-abc': { tools: '', scope: 'shared' } }
+  for (let i = 0; i < 49; i++) record[`thread-${i}`] = { tools: '', scope: 'shared' }
+  // thread-abc is the first recorded; this session resumes it, then one more
+  // thread would push the record past its bound.
+  const ctx = await build(scopedHarness({ scope: 'shared', resume: 'thread-abc', rollout: null, record }))
+  let kept
+  try {
+    kept = threadRecords(ctx.codexHome)
+    assert.equal(Object.keys(kept).at(-1), 'thread-abc', 'a resumed thread is the most recently used')
+  } finally {
+    await ctx.driver.shutdownStop()
+  }
+  const more = { ...kept, 'thread-new': { tools: '', scope: 'shared' } }
+  const next = await build(scopedHarness({ scope: 'shared', resume: '', rollout: null, record: more }))
+  try {
+    const after = threadRecords(next.codexHome)
+    assert.deepEqual(after['thread-abc'], { tools: '', scope: 'shared' }, 'the thread in use survives the bound')
+    assert.equal(after['thread-0'], undefined)
+  } finally {
+    await next.driver.shutdownStop()
+  }
+})
+
+test("a fresh thread after a failed resume is recorded for this session's scope (#1832)", async () => {
+  // A legacy thread (scope unknown) resumes in a private chat. When it is
+  // gone, the fresh thread is the member's, and must say so: recorded as
+  // unknown, a later shared session would resume it rather than rebuild.
+  const ctx = await build(scopedHarness({
+    scenario: 'resume-fails',
+    scope: 'member:alice',
+    resume: 'thread-gone',
+    rollout: null,
+    record: { 'thread-gone': '' },
+  }))
+  try {
+    assert.equal(sentCalls(ctx.tracePath, 'thread/resume').length, 1)
+    assert.equal(sentCalls(ctx.tracePath, 'thread/start').length, 1)
+    assert.deepEqual(threadRecords(ctx.codexHome)['thread-abc'], { tools: '', scope: 'member:alice' })
+  } finally {
+    await ctx.driver.shutdownStop()
+  }
+})
+
+// ---- rollout reconstruction (#1832) -----------------------------------------
+
+async function fixtureHistory(name) {
+  const dir = join(ROLLOUTS, name, 'sessions', '2026', '10', '14')
+  const files = readdirSync(dir)
+  const path = join(dir, files.find((f) => f.includes('_')) ?? files[0])
+  return codexRolloutHistory(await readCodexRolloutLineage(join(ROLLOUTS, name), path), FIXTURE[name])
+}
+
+test('a compacted thread carries its compaction, not the instructions written after it (#1832)', async () => {
+  // Codex replaces the history with the compaction's replacement_history and
+  // re-writes the developer message (Alice's, again) at the next turn.
+  const dir = join(ROLLOUTS, 'compact', 'sessions', '2026', '10', '14')
+  const raw = readFileSync(join(dir, readdirSync(dir)[0]), 'utf8')
+  assert.equal(raw.split('ALICE-PRIVATE-MEMORY-7731').length - 1 >= 2, true, 'the fixture holds the instructions twice')
+  const items = await fixtureHistory('compact')
+  assert.deepEqual(items.map(describe), [
+    'message:user:RUN-TOOL: draft the offer for ACME',
+    'message:user:SECOND-TURN: make it more formal',
+    `message:user:${SUMMARY_PREFIX}\nSUMMARY-8080: the user drafted an offer; echo ran; second turn made it formal.`,
+    'message:user:THIRD-TURN-AFTER-COMPACT: add a deadline',
+    'message:assistant:ack-5',
+  ])
+  for (const text of ALICE_TEXT) assert.ok(!JSON.stringify(items).includes(text), text)
+})
+
+test('a reverted thread reads through its history base (#1832)', async () => {
+  const dir = join(ROLLOUTS, 'revert', 'sessions', '2026', '10', '14')
+  const current = join(dir, readdirSync(dir).find((f) => f.includes('_')))
+  const lineage = await readCodexRolloutLineage(join(ROLLOUTS, 'revert'), current)
+  assert.equal(lineage.length, 2, 'the immutable prefix, then the current rollout')
+  assert.deepEqual(codexRolloutHistory(lineage, FIXTURE.revert).map(describe), BASIC_CONVERSATION.slice(0, 4))
+  // The current rollout alone holds none of the conversation.
+  assert.deepEqual(codexRolloutHistory(readFileSync(current, 'utf8'), FIXTURE.revert), [])
+})
+
+// Rollout lines shaped like codex 0.160.0's, for what the recorded fixtures
+// cannot show: thread_rolled_back (no 0.160.0 code path writes one; older
+// pins and the TUI's backtrack did) and compactions in the older format.
+const rl = (type, payload, extra = {}) => JSON.stringify({ timestamp: '2026-10-14T00:00:00.000Z', type, payload, ...extra })
+const metaLine = (id, extra = {}) => rl('session_meta', {
+  id, session_id: id, timestamp: '2026-10-14T00:00:00.000Z', cwd: '/home/agent/workspace',
+  originator: 'zwrm-agentd', cli_version: '0.160.0', ...extra,
+})
+const ev = (type, fields = {}) => rl('event_msg', { type, ...fields })
+const msgLine = (role, text, extra = {}) => rl('response_item', {
+  type: 'message', role, content: [{ type: role === 'assistant' ? 'output_text' : 'input_text', text }], ...extra,
+})
+const turnLines = (id, ...lines) => [
+  ev('task_started', { turn_id: id }), rl('turn_context', { turn_id: id, cwd: '/home/agent/workspace' }),
+  ...lines, ev('task_complete', { turn_id: id, last_agent_message: null }),
+]
+const item = (role, text) => ({ type: 'message', role, content: [{ type: role === 'assistant' ? 'output_text' : 'input_text', text }] })
+const DEV = msgLine('developer', 'ALICE-PRIVATE-MEMORY-7731')
+const ENV = msgLine('user', '<environment_context>\n  <cwd>/home/agent/workspace</cwd>\n</environment_context>')
+const SUMMARY = `${SUMMARY_PREFIX}\nSUMMARY`
+const T = 'thread-synthetic'
+
+function twoTurnsWithCompaction({ compaction = {}, mode } = {}) {
+  return [
+    metaLine(T, mode ? { history_mode: mode } : {}),
+    ...turnLines('a', DEV, ENV, msgLine('user', 'A-MSG'), msgLine('assistant', 'A-REPLY')),
+    ...turnLines('b',
+      msgLine('user', 'B-MSG'),
+      rl('response_item', { type: 'function_call', name: 'exec_command', arguments: '{}', call_id: 'call_b' }),
+      rl('response_item', { type: 'function_call_output', call_id: 'call_b', output: 'B-OUT' }),
+      // A mid-turn compaction writes the developer message into its
+      // replacement history.
+      rl('compacted', {
+        message: SUMMARY,
+        replacement_history: [item('developer', 'ALICE-PRIVATE-MEMORY-7731'), item('user', 'A-MSG'), item('user', 'B-MSG'), item('user', SUMMARY)],
+        ...compaction,
+      }),
+      msgLine('assistant', 'B-REPLY')),
+  ]
+}
+
+test('a rollback undoes its turns, the compaction inside them included (#1832)', () => {
+  // Older format: the compaction carries no window_number, so it bounds the
+  // replay only if no rollback undid it. Here one did.
+  const lines = [...twoTurnsWithCompaction(), ev('thread_rolled_back', { num_turns: 1 })]
+  assert.deepEqual(codexRolloutHistory(lines.join('\n'), T).map(describe), ['message:user:A-MSG', 'message:assistant:A-REPLY'])
+
+  // Not undone, the same compaction replaces the history before it.
+  assert.deepEqual(codexRolloutHistory(twoTurnsWithCompaction().join('\n'), T).map(describe), [
+    'message:user:A-MSG', 'message:user:B-MSG', `message:user:${SUMMARY}`, 'message:assistant:B-REPLY',
+  ])
+})
+
+test('a compaction in the current format bounds the replay, and rollbacks after it apply to it (#1832)', () => {
+  // window_number + resume_metadata (or a paginated thread) make the newest
+  // compaction the base, even one inside a later rolled-back turn.
+  const current = { window_number: 1, resume_metadata: { last_started_turn_id: 'b' } }
+  const lines = [
+    ...twoTurnsWithCompaction({ compaction: current }),
+    ...turnLines('c', DEV, msgLine('user', 'C-MSG'), msgLine('assistant', 'C-REPLY')),
+    ev('thread_rolled_back', { num_turns: 1 }),
+  ]
+  assert.deepEqual(codexRolloutHistory(lines.join('\n'), T).map(describe), [
+    'message:user:A-MSG', 'message:user:B-MSG', `message:user:${SUMMARY}`, 'message:assistant:B-REPLY',
+  ])
+
+  const paginated = [...twoTurnsWithCompaction({ compaction: { window_number: 1 }, mode: 'paginated' }),
+    ev('thread_rolled_back', { num_turns: 1 })]
+  assert.deepEqual(codexRolloutHistory(paginated.join('\n'), T).map(describe), ['message:user:A-MSG'])
+})
+
+test('what codex does not keep, and the context it wrote, stay behind (#1832)', () => {
+  const lines = [
+    metaLine(T, { history_mode: 'paginated' }),
+    ...turnLines('a',
+      DEV,
+      rl('response_item', { type: 'additional_tools', role: 'developer', tools: [{ name: 'old_tool' }] }),
+      msgLine('system', 'SYSTEM-TEXT'),
+      ENV,
+      msgLine('user', '# AGENTS.md instructions for /home/agent\n\n<INSTRUCTIONS>\nALICE-AGENTS\n</INSTRUCTIONS>'),
+      msgLine('user', '<skill>\n<name>alice-private-notes</name>\nALICE-SKILL-BODY\n</skill>'),
+      msgLine('user', 'U-MSG'),
+      rl('response_item', { type: 'ghost_snapshot', ghost_commit: {} }),
+      rl('response_item', { type: 'custom_tool_call', call_id: 'ct1', name: 'apply_patch', input: '*** Begin Patch' }),
+      rl('response_item', { type: 'custom_tool_call_output', call_id: 'ct1', output: 'Done' }),
+      rl('response_item', { type: 'configuration_update', reasoning: { effort: 'high' } }, { metadata: { harness_authored_configuration: true } }),
+      rl('response_item', {
+        type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'DELIVERED' }],
+        internal_chat_message_metadata_passthrough: { turn_id: 'a' },
+      }, { metadata: { delivered_assistant_message: 'codex:code-mode-delivery:v1:complete', user_input_order: 1 } }),
+      rl('response_item', { type: 'compaction', encrypted_content: 'ENC-COMPACTION' }),
+      msgLine('user', '<turn_aborted>\nThe user interrupted the previous turn.\n</turn_aborted>'),
+      msgLine('user', '<hook_prompt hook_run_id="run-1">HOOK TEXT</hook_prompt>'),
+      msgLine('assistant', 'A-REPLY')),
+    '{"type":"response_item","payload":{"type":"message","role":"user","con', // a write torn by a crash
+  ]
+  assert.deepEqual(codexRolloutHistory(lines.join('\n'), T).map(describe), [
+    'message:user:U-MSG',
+    'custom_tool_call::ct1',
+    'custom_tool_call_output::ct1',
+    'message:assistant:A-REPLY',
+  ])
+})
+
+test('a remote compaction carries the plain messages it kept, never its encrypted item (#1832)', async () => {
+  // The compaction request held Alice's developer message, and its encrypted
+  // item is the server's encoding of that window: carried over, the shared
+  // thread's model would read her instructions back out of it.
+  const dir = join(ROLLOUTS, 'remote', 'sessions', '2026', '10', '14')
+  const raw = readFileSync(join(dir, readdirSync(dir)[0]), 'utf8')
+  assert.ok(raw.includes('"type":"compaction"'), 'the fixture holds an encrypted compaction')
+  assert.ok(raw.includes('"retained_context"'), 'and the messages it retained')
+  const items = await fixtureHistory('remote')
+  assert.deepEqual(items.map(describe), [
+    'message:user:RUN-TOOL: draft the offer',
+    'message:assistant:after-tool-2: the command printed its marker',
+    'message:user:AFTER-COMPACT: go on',
+  ])
+  const carried = JSON.stringify(items)
+  for (const text of ALICE_TEXT) assert.ok(!carried.includes(text), text)
+  assert.ok(!carried.includes('encrypted_content'), 'nothing encrypted')
+  assert.ok(items.every((i) => i.id === undefined), 'no item ids')
+})
+
+// A remote compaction as codex 0.160.0 writes one: every user message kept
+// whole in replacement_history, the rest in an encrypted item, and the
+// replies retained as plain text (at most 8, each cut short), all numbered
+// by one acceptance order.
+const BRIEF = `BRIEF ${'details '.repeat(3000)}`
+function remoteCompaction({ retained, metadata = true } = {}) {
+  return [
+    metaLine(T, { history_mode: 'paginated' }),
+    ...turnLines('c', DEV, rl('compacted', {
+      message: '',
+      replacement_history: [item('user', BRIEF), item('user', 'U-2'), item('user', 'U-3'),
+        { type: 'compaction', encrypted_content: 'ENC-REMOTE' }],
+      ...(metadata ? { replacement_history_metadata: [{ user_input_order: 0 }, { user_input_order: 2 }, { user_input_order: 4 }, null] } : {}),
+      retained_context: retained ?? {
+        // The brief is past what retained_context keeps of the users.
+        user_messages: [{ order: 2, text: 'U-2' }, { order: 4, text: 'U-3' }],
+        user_messages_incomplete: true,
+        assistant_messages: [
+          { order: 5, text: 'A-3', phase: 'final_answer' },
+          { order: 1, text: 'A-1', phase: 'final_answer' },
+          { order: 3, text: 'A-2 (cut short)', phase: 'commentary' },
+          { order: 6, text: '' },
+        ],
+      },
+      window_number: 1,
+      resume_metadata: { last_started_turn_id: 'c' },
+    })),
+    ...turnLines('d', DEV, ENV, msgLine('user', 'AFTER')),
+  ].join('\n')
+}
+
+test('a remote compaction keeps every user message whole, with its replies in their order (#1832)', () => {
+  const items = codexRolloutHistory(remoteCompaction(), T)
+  assert.deepEqual(items.map(describe), [
+    `message:user:${BRIEF}`,
+    'message:assistant:A-1',
+    'message:user:U-2',
+    'message:assistant:A-2 (cut short)',
+    'message:user:U-3',
+    'message:assistant:A-3',
+    'message:user:AFTER',
+  ])
+  assert.deepEqual(items[1], { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'A-1' }], phase: 'final_answer' })
+  assert.equal(items[3].phase, 'commentary')
+  const carried = JSON.stringify(items)
+  assert.ok(!carried.includes('ENC-') && !carried.includes('ALICE'), carried.slice(0, 200))
+})
+
+test('a remote compaction with no replies retained still carries its user messages (#1832)', () => {
+  const items = codexRolloutHistory(remoteCompaction({ retained: { user_messages: [], assistant_messages: [] } }), T)
+  assert.deepEqual(items.map(describe), [`message:user:${BRIEF}`, 'message:user:U-2', 'message:user:U-3', 'message:user:AFTER'])
+})
+
+test('a remote compaction whose messages carry no order falls back to what it retained (#1832)', () => {
+  const items = codexRolloutHistory(remoteCompaction({ metadata: false }), T)
+  assert.deepEqual(items.map(describe), [
+    'message:assistant:A-1', 'message:user:U-2', 'message:assistant:A-2 (cut short)',
+    'message:user:U-3', 'message:assistant:A-3', 'message:user:AFTER',
+  ])
+})
+
+test('a rebuild strips encrypted tool arguments and output parts (#1832)', () => {
+  const lines = [
+    metaLine(T, { history_mode: 'paginated' }),
+    ...turnLines('a',
+      msgLine('user', 'U-MSG', { id: 'msg_1' }),
+      rl('response_item', { type: 'reasoning', id: 'rs_1', summary: [], encrypted_content: 'ENC-R' }),
+      rl('response_item', { type: 'function_call', id: 'fc_1', name: 'exec_command', arguments: '{"cmd":"ls"}', encrypted_function_args: ['ENC-ARGS'], call_id: 'c1' }),
+      rl('response_item', { type: 'function_call_output', call_id: 'c1', output: [{ type: 'input_text', text: 'OUT' }, { type: 'encrypted_content', encrypted_content: 'ENC-OUT' }] }),
+      rl('response_item', { type: 'context_compaction', id: 'cc_1', encrypted_content: 'ENC-CC' }),
+      rl('response_item', { type: 'compaction_summary', encrypted_content: 'ENC-CS' }),
+      rl('response_item', { type: 'agent_message', author: '/root/a', content: [{ type: 'encrypted_content', encrypted_content: 'ENC-AM' }] }),
+      rl('response_item', { type: 'function_call', name: 'mcp__x__y', arguments: '{}', call_id: 'c2' }),
+      rl('response_item', { type: 'function_call_output', call_id: 'c2', output: [{ type: 'encrypted_content', encrypted_content: 'ENC-ONLY' }] }),
+      msgLine('assistant', 'A-REPLY', { id: 'msg_2' })),
+  ]
+  const items = codexRolloutHistory(lines.join('\n'), T)
+  assert.deepEqual(items.map(describe), [
+    'message:user:U-MSG', 'function_call::c1', 'function_call_output::c1',
+    'function_call::c2', 'function_call_output::c2', 'message:assistant:A-REPLY',
+  ])
+  // An output that was all encrypted still answers its call, and says why.
+  assert.match(items[4].output, /not carried over/)
+  assert.ok(!JSON.stringify(items).includes('ENC-'), JSON.stringify(items))
+  assert.ok(items.every((i) => i.id === undefined))
+  assert.equal(items[1].arguments, '{"cmd":"ls"}')
+  assert.deepEqual(items[2].output, [{ type: 'input_text', text: 'OUT' }])
+})
+
+test('a rollout that cannot be rebuilt faithfully is refused, not guessed at (#1832)', () => {
+  const ok = [metaLine(T), ...turnLines('a', msgLine('user', 'A-MSG'))]
+  assert.throws(() => codexRolloutHistory(ok.join('\n'), 'another-thread'), /not another-thread/)
+  assert.throws(() => codexRolloutHistory(turnLines('a', msgLine('user', 'A-MSG')).join('\n'), T), /no session_meta/)
+  assert.throws(() => codexRolloutHistory([metaLine(T, { history_mode: 'sharded' })].join('\n'), T), /history mode/)
+  assert.throws(() => codexRolloutHistory([...ok, rl('compacted', { message: 'SUMMARY' })].join('\n'), T), /legacy compaction/)
+  assert.throws(() => codexRolloutHistory([...ok, rl('inter_agent_communication', { author: '/root', recipient: '/root/a', content: 'x', trigger_turn: true })].join('\n'), T), /multi-agent/)
+})
+
+test('the context codex writes is told from what the user wrote (#1832)', () => {
+  for (const text of [
+    '<environment_context>\n  <cwd>/x</cwd>\n</environment_context>',
+    '  <ENVIRONMENT_CONTEXT>x</environment_context>\n',
+    '# AGENTS.md instructions for /x\n\n<INSTRUCTIONS>\nhi\n</INSTRUCTIONS>',
+    '<skill>\n<name>a</name>\n<path>/x/SKILL.md</path>\nbody\n</skill>',
+    '<user_shell_command>x</user_shell_command>',
+    '<turn_aborted>x</turn_aborted>',
+    '<subagent_notification>x</subagent_notification>',
+    '<agent_message_board_notification>x</agent_message_board_notification>',
+    '<recommended_plugins>x</recommended_plugins>',
+    '<external_slack>x</external_slack>',
+    '<codex_internal_context source="goal_v2">x</codex_internal_context>',
+    '<goal_context>x</goal_context>',
+    '<hook_prompt hook_run_id="r1">x</hook_prompt>',
+    'Warning: The maximum number of unified exec processes you can keep open is 8.',
+  ]) assert.equal(isCodexContextualUserText(text), true, text)
+  for (const text of [
+    'hello',
+    'please read the <skill> docs',
+    '<environment_context> only opens',
+    '<external_a>x</external_b>',
+    '<hook_prompt hook_run_id="">x</hook_prompt>',
+    '<codex_internal_context source="Bad">x</codex_internal_context>',
+    `${SUMMARY_PREFIX}\nsummary`,
+  ]) assert.equal(isCodexContextualUserText(text), false, text)
 })

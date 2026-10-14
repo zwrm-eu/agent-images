@@ -44,6 +44,8 @@ const KNOWN = {
     'responsesapiClientMetadata', 'threadId']),
   'turn/interrupt': new Set(['threadId', 'turnId']),
   'thread/compact/start': new Set(['threadId']),
+  'thread/read': new Set(['includeTurns', 'threadId']),
+  'thread/inject_items': new Set(['items', 'threadId']),
 }
 const ENUMS = {
   approvalPolicy: new Set(['untrusted', 'on-failure', 'on-request', 'never']),
@@ -280,6 +282,14 @@ rl.on('line', async (line) => {
     return
   }
 
+  // Refused the way the real app-server refuses a malformed request, so a
+  // misspelled param fails the test that sent it.
+  try {
+    validate(msg.method, msg.params)
+  } catch (err) {
+    if (msg.id !== undefined) send({ id: msg.id, error: { code: -32602, message: err.message } })
+    return
+  }
   switch (msg.method) {
     case 'initialize':
       send({ id: msg.id, result: { userAgent: 'fake/1.0', codexHome: '/tmp/fake' } })
@@ -317,6 +327,42 @@ rl.on('line', async (line) => {
           reasoningEffort: null,
         },
       })
+      return
+    }
+    case 'thread/read': {
+      // A thread rebuilt for new instructions (#1832) is read for its
+      // rollout path. The real app-server answers from its state database;
+      // FAKE_CODEX_ROLLOUT stands in for that, and without it the path is
+      // null, as for a thread codex keeps no rollout for.
+      trace('thread/read', msg.params)
+      if (scenario === 'read-fails') {
+        send({ id: msg.id, error: { code: -32602, message: `thread not found: ${msg.params?.threadId}` } })
+        return
+      }
+      send({
+        id: msg.id,
+        result: { thread: { id: msg.params?.threadId, status: { type: 'notLoaded' }, turns: [], path: process.env.FAKE_CODEX_ROLLOUT || null } },
+      })
+      return
+    }
+    case 'thread/inject_items': {
+      // Experimental: raw Responses items into a LOADED thread's history.
+      // The real app-server refuses an empty list and an unknown thread, and
+      // parses every item before recording any.
+      trace('thread/inject_items', msg.params)
+      if (msg.params?.threadId !== THREAD_ID) {
+        send({ id: msg.id, error: { code: -32600, message: `thread not loaded: ${msg.params?.threadId}` } })
+        return
+      }
+      if (!Array.isArray(msg.params?.items) || msg.params.items.length === 0) {
+        send({ id: msg.id, error: { code: -32600, message: 'items must not be empty' } })
+        return
+      }
+      if (scenario === 'inject-fails') {
+        send({ id: msg.id, error: { code: -32600, message: 'items[0] is not a valid response item: unknown variant' } })
+        return
+      }
+      send({ id: msg.id, result: {} })
       return
     }
     case 'turn/start': {

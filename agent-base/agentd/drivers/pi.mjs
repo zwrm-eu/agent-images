@@ -251,6 +251,10 @@ export async function createPiDriver(s, spec, h) {
     // skills entry (seeded by init, #1062) normally points here, but the
     // file is user-editable — managed skills must survive its loss.
     additionalSkillPaths: [pathResolve(home, '.claude/skills')],
+    // A resumed session runs on this prompt, not the one it began with
+    // (#1832): the session file keeps the old one, but pi merges every system
+    // message into the current one unless the provider's compat sets
+    // supportsMidConvoSystemMessages, which build/pi_models.go never does.
     ...(spec.append_system_prompt ? { appendSystemPrompt: [spec.append_system_prompt] } : {}),
     extensionFactories: [gateExtension],
   })

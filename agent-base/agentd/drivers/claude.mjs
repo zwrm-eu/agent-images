@@ -382,10 +382,23 @@ export function createClaudeDriver(s, spec, h, { startQuery = query, drainGraceM
     // Interactive sessions want stock Claude Code behavior: the claude_code
     // preset plus the seeded ~/.claude/CLAUDE.md platform instructions ('user')
     // and the repo's CLAUDE.md ('project').
+    //
+    // snapshot: false — every session runs on the append the control plane
+    // built for it (#1832). By default the CLI records the system prompt on a
+    // conversation's first request and sends that record on every resume,
+    // ignoring a later append until compaction (probed on 2.1.289). A chat
+    // shared since would then still run on its owner's private memory index,
+    // without the shared-chat prompt. It must be false on EVERY session: one
+    // that records puts the old prompt back for the next resume. The cost is
+    // a prompt-cache miss when the append changed between sessions. Every
+    // CLI a workspace volume can hold honors it: up to 2.1.252 none records
+    // a prompt that has an append, and 2.1.257, the next release, brought
+    // the option along with recording.
     systemPrompt: {
       type: 'preset',
       preset: 'claude_code',
       ...(spec.append_system_prompt ? { append: spec.append_system_prompt } : {}),
+      snapshot: false,
     },
     settingSources: ['user', 'project'],
     canUseTool,

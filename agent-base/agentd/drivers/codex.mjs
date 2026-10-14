@@ -31,7 +31,8 @@
 
 import { createHash, randomUUID } from 'node:crypto'
 import { pendingWithTimeout } from '../session-control.mjs'
-import { access, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { access, mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises'
+import zlib from 'node:zlib'
 import { CodexRPC } from './codex-rpc.mjs'
 import {
   approvalPolicyFor,
@@ -80,6 +81,14 @@ export function isStaleCodexTurnCompletion(doneId, currentTurnId, turnActive) {
 const COMPACT_TIMEOUT_MS = 5 * 60_000
 
 const TEARDOWN_TIMEOUT_MS = 10_000
+
+// Reading the old thread and handing its conversation to the new one when a
+// thread is rebuilt (#1832). Both are local to the app-server, and both run
+// inside session create, which the control plane waits on for 15 s in all
+// (agentsession.DaemonClient): bounded well inside that, so a wedged child
+// costs the rebuild (a fresh thread), not the session.
+const REBUILD_READ_TIMEOUT_MS = 3_000
+const REBUILD_INJECT_TIMEOUT_MS = 5_000
 
 // The permission modes this harness can host. Exported so the server's driver
 // registry (drivers/registry.mjs) can enforce the same set at session create
@@ -917,7 +926,38 @@ export async function createCodexDriver(s, spec, h) {
   // failure below, and re-attaching the connector fixes it — whereas a wrong
   // reset destroys conversation context silently and permanently. Only a
   // KNOWN, genuinely different connector set forfeits the thread.
+  //
+  // Codex freezes the developer instructions too, and that one is a privacy
+  // matter (#1832). Measured on the pinned 0.160.0: thread/resume re-sends
+  // the developer message rebuilt from the rollout and silently ignores the
+  // new developerInstructions (config.developer_instructions, thread/fork and
+  // a compaction after resume all fare no better: the compaction even hands
+  // the old block to the model while it summarizes). That message carries
+  // the member's private memory index and codex's <skills_instructions>
+  // listing of the skills seeded then, their private ones included. So a
+  // member's private chat that has since been shared would keep running on
+  // that member's set-up in front of everyone it is shared with.
+  //
+  // The control plane says whose set-up a session's instructions are:
+  // instructions_scope is "member:<id>" in a member's private workspace and
+  // "shared" anywhere else (absent from an older control plane: unknown).
+  // The record keeps the scope each thread was CREATED (or rebuilt) for,
+  // and a thread whose scope is another one is REBUILT, never resumed:
+  //   - recorded scope known and different from this session's: rebuild;
+  //   - recorded scope unknown (a thread from before this record, or no
+  //     record) and this session "shared": rebuild, because that thread may
+  //     well be a member's private conversation shared since;
+  //   - recorded scope unknown otherwise: resume, as before.
+  // Rebuilding keeps the conversation, which is the point of sharing a chat:
+  // a NEW thread starts on this session's instructions and tools, and the old
+  // thread's model-visible history, minus every developer message and the
+  // context codex wrote itself, is injected into it (rebuildThread below).
+  // Whatever goes wrong there, the old thread is never resumed: that would
+  // hand its instructions straight back to the model.
   const fingerprint = connectorFingerprint(spec.mcp_servers)
+  const scope = typeof spec.instructions_scope === 'string' && spec.instructions_scope
+    ? spec.instructions_scope
+    : undefined
   const fingerprintPath = `${codexHome}/.zwrm-thread-tools.json`
   const readRecords = async () => {
     try {
@@ -928,13 +968,24 @@ export async function createCodexDriver(s, spec, h) {
     }
   }
   let resumeHandle = spec.resume_sdk_session_id || ''
+  let rebuildFrom = ''
+  // The scope of the thread the session ends up on: this session's for a
+  // thread it creates or rebuilds, the recorded one for a thread it resumes.
+  let threadScope = scope
   if (resumeHandle) {
     const records = await readRecords()
-    const recorded = records[resumeHandle]
-    if (recorded !== undefined && recorded !== fingerprint) {
+    const recorded = threadRecord(records[resumeHandle])
+    if (recorded?.tools !== undefined && recorded.tools !== fingerprint) {
       h.log(`codex: connectors changed since thread ${resumeHandle} was created ` +
-        `(was "${recorded}", now "${fingerprint}"); starting a fresh thread`)
+        `(was "${recorded.tools}", now "${fingerprint}"); starting a fresh thread`)
       resumeHandle = ''
+    } else if (recorded?.scope !== undefined ? recorded.scope !== scope : scope === 'shared') {
+      h.log(`codex: thread ${resumeHandle} was created for instructions scope ` +
+        `"${recorded?.scope ?? 'unknown'}", this session's is "${scope ?? 'unknown'}"; rebuilding it without its old instructions`)
+      rebuildFrom = resumeHandle
+      resumeHandle = ''
+    } else {
+      threadScope = recorded?.scope
     }
   }
 
@@ -942,9 +993,80 @@ export async function createCodexDriver(s, spec, h) {
   // is silently ignored (unknown params are), which would look like it worked.
   const startParams = () => (toolSpecs.length > 0 ? { ...threadParams, dynamicTools: toolSpecs } : threadParams)
 
+  // Rebuild (#1832): a new thread on this session's instructions and tools,
+  // carrying the old thread's conversation. The history is reconstructed from
+  // the old rollout the way codex itself would resume it (codexRolloutHistory
+  // below), then injected with the experimental thread/inject_items, which
+  // records raw items into the new thread's history right after the initial
+  // context thread/start wrote: the new developer message, the old turns,
+  // then the next message. Measured on the pinned 0.160.0.
+  //
+  // Any failure to read the old conversation starts a plain fresh thread,
+  // which loses the model's context but never its privacy. Only thread/start
+  // failing throws, into the same 502 as any fresh start.
+  async function rebuildThread(oldThreadId) {
+    let items
+    try {
+      const path = await locateRollout(oldThreadId)
+      items = codexRolloutHistory(await readCodexRolloutLineage(codexHome, path), oldThreadId)
+    } catch (err) {
+      h.log(`codex: could not read thread ${oldThreadId} to rebuild it (${err?.message || err}); ` +
+        'starting a fresh thread without its conversation')
+      return await rpc.request('thread/start', startParams())
+    }
+    const fresh = await rpc.request('thread/start', startParams())
+    const newThreadId = fresh?.thread?.id
+    if (!newThreadId || items.length === 0) {
+      h.log(`codex: thread ${oldThreadId} had no conversation to carry over; started a fresh thread`)
+      return fresh
+    }
+    try {
+      await rpc.request('thread/inject_items', { threadId: newThreadId, items }, { timeoutMS: REBUILD_INJECT_TIMEOUT_MS })
+      h.log(`codex: rebuilt thread ${oldThreadId} as ${newThreadId} for instructions scope "${scope ?? 'unknown'}": ` +
+        `${items.length} conversation items carried over, its old instructions left behind`)
+    } catch (err) {
+      // A refusal leaves the new thread as fresh as thread/start made it:
+      // the app-server validates every item before recording any. A timeout
+      // may still land, ahead of the first turn (inject and turn/start are
+      // serialized per thread). Either way what we sent is filtered, so no
+      // old instructions arrive.
+      h.log(`codex: injecting the conversation of ${oldThreadId} into ${newThreadId} failed ` +
+        `(${err?.message || err}); continuing on the new thread, which may lack it`)
+    }
+    return fresh
+  }
+
+  // The old thread's CURRENT rollout, as the app-server resolves it
+  // (thread.path, marked [UNSTABLE] in 0.160.0). A paginated thread that was
+  // reverted has several rollout files, and only the app-server's state
+  // database knows which one is current, so the search under sessions/ that
+  // stands in when thread/read fails accepts a single candidate only.
+  async function locateRollout(threadId) {
+    let path = ''
+    try {
+      const read = await rpc.request('thread/read', { threadId }, { timeoutMS: REBUILD_READ_TIMEOUT_MS })
+      path = typeof read?.thread?.path === 'string' ? read.thread.path : ''
+    } catch (err) {
+      h.log(`codex: thread/read ${threadId} failed (${err?.message || err}); searching ${codexHome} for its rollout`)
+    }
+    // Cold-rollout compression (off by default in 0.160.0) may have turned
+    // the file the app-server names into a .jsonl.zst.
+    for (const candidate of path ? [path, `${path}.zst`] : []) {
+      if (await fileExists(candidate)) return candidate
+    }
+    const found = await findRollouts(codexHome, (name) =>
+      rolloutNameIds(name)?.threadId === threadId)
+    if (found.length === 1) return found[0]
+    throw new Error(found.length === 0
+      ? `no rollout for thread ${threadId}`
+      : `thread ${threadId} has ${found.length} rollout files and the app-server did not say which is current`)
+  }
+
   let started
   try {
-    if (resumeHandle) {
+    if (rebuildFrom) {
+      started = await rebuildThread(rebuildFrom)
+    } else if (resumeHandle) {
       try {
         started = await rpc.request('thread/resume', { threadId: resumeHandle, ...threadParams })
       } catch (err) {
@@ -963,6 +1085,7 @@ export async function createCodexDriver(s, spec, h) {
         // in-thread context; the platform transcript is kept control-plane side
         // and is unaffected.
         h.log(`codex: resume handle ${resumeHandle} did not resolve (${err?.message || err}); starting a fresh thread`)
+        threadScope = scope
         started = await rpc.request('thread/start', startParams())
       }
     } else {
@@ -986,18 +1109,25 @@ export async function createCodexDriver(s, spec, h) {
     e.status = 502
     throw e
   }
-  // Record this thread's connector set so a later session can judge THIS
-  // thread rather than whichever one happened to be created last. Bounded:
-  // workspaces are long-lived and a thread per session would grow unbounded.
+  // Record this thread's connector set and instructions scope so a later
+  // session can judge THIS thread rather than whichever one happened to be
+  // created last. Bounded: workspaces are long-lived and a thread per session
+  // would grow unbounded. A resumed thread keeps the scope it was created
+  // for, unknown included: this session's scope says nothing about the
+  // instructions an older thread carries.
   try {
     const records = await readRecords()
-    records[threadId] = fingerprint
+    // Re-inserted, so the bound below evicts the thread used least recently,
+    // not the one recorded first.
+    delete records[threadId]
+    records[threadId] = { tools: fingerprint, ...(threadScope !== undefined ? { scope: threadScope } : {}) }
     const keys = Object.keys(records)
     const MAX_RECORDS = 50
     for (const stale of keys.slice(0, Math.max(0, keys.length - MAX_RECORDS))) delete records[stale]
     await writeFile(fingerprintPath, JSON.stringify(records) + '\n', { mode: 0o600 })
   } catch (err) {
-    // A missing record reads as "unknown", which resumes — the safe direction.
+    // A missing record reads as "unknown": the thread resumes, unless the
+    // next session is a shared one, which rebuilds it (see above).
     h.log(`codex: could not record the thread connector set: ${err?.message || err}`)
   }
   s.sdkSessionId = threadId
@@ -1247,4 +1377,510 @@ async function usesCredentialStore(codexHome) {
   } catch {
     return false
   }
+}
+
+// threadRecord reads one entry of .zwrm-thread-tools.json: {tools, scope}
+// since #1832, a bare connector fingerprint before it (scope unknown).
+// Anything else reads as no record at all.
+function threadRecord(value) {
+  if (typeof value === 'string') return { tools: value, scope: undefined }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
+  return {
+    tools: typeof value.tools === 'string' ? value.tools : undefined,
+    scope: typeof value.scope === 'string' && value.scope ? value.scope : undefined,
+  }
+}
+
+async function readRolloutBytes(path) {
+  const raw = await readFile(path)
+  if (!path.endsWith('.zst')) return raw
+  if (typeof zlib.zstdDecompressSync !== 'function') {
+    throw new Error(`this node cannot read the compressed rollout ${path}`)
+  }
+  return zlib.zstdDecompressSync(raw)
+}
+
+// rolloutNameIds parses a rollout file name (rollout/src/rollout_file_name.rs):
+// rollout-<timestamp>-<thread id>.jsonl, or for a reverted thread's newer
+// rollout, rollout-<timestamp>-<thread id>_<rollout id>.jsonl; .zst when
+// compressed. A plain rollout's id is its thread's.
+function rolloutNameIds(name) {
+  const m = /^rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-([^_/]+?)(?:_([^_/]+))?\.jsonl(?:\.zst)?$/.exec(name)
+  return m ? { threadId: m[1], rolloutId: m[2] ?? m[1] } : null
+}
+
+// Rollout files under codex's sessions and archived_sessions directories
+// whose file name satisfies match.
+async function findRollouts(codexHome, match) {
+  const found = []
+  for (const dir of [`${codexHome}/sessions`, `${codexHome}/archived_sessions`]) {
+    let entries = []
+    try {
+      entries = await readdir(dir, { recursive: true })
+    } catch { /* no such directory: nothing in it */ }
+    for (const entry of entries) {
+      if (match(String(entry).split('/').pop())) found.push(`${dir}/${entry}`)
+    }
+  }
+  return found
+}
+
+// readCodexRolloutLineage returns a thread's rollout as codex replays it,
+// oldest segment first. A paginated thread that was reverted (thread/revert)
+// or forked by reference continues an immutable prefix of another rollout:
+// its session_meta.history_base names that rollout and the byte offset its
+// prefix ends at, and that prefix may continue another in turn
+// (thread-store/src/local/rollout_lineage.rs).
+export async function readCodexRolloutLineage(codexHome, path) {
+  const segments = []
+  const seen = new Set()
+  let text = (await readRolloutBytes(path)).toString('utf8')
+  for (;;) {
+    segments.unshift(text)
+    const base = rolloutSessionMeta(text)?.history_base
+    if (!base) return segments
+    const rolloutId = base.thread_id
+    if (typeof rolloutId !== 'string' || seen.has(rolloutId) || seen.size >= 64) {
+      throw new Error('the rollout lineage is malformed (a cycle, or deeper than 64)')
+    }
+    seen.add(rolloutId)
+    const found = await findRollouts(codexHome, (name) => rolloutNameIds(name)?.rolloutId === rolloutId)
+    if (found.length !== 1) throw new Error(`cannot find the single rollout ${rolloutId} the history continues`)
+    const bytes = await readRolloutBytes(found[0])
+    const end = Number(base.end_byte_offset)
+    if (!Number.isSafeInteger(end) || end < 0 || end > bytes.length) {
+      throw new Error(`rollout ${rolloutId} is shorter than the history that continues it`)
+    }
+    text = bytes.subarray(0, end).toString('utf8')
+  }
+}
+
+// The first session_meta of a rollout; codex writes it as the first line,
+// so the scan stops there rather than parsing the whole file.
+function rolloutSessionMeta(text) {
+  for (const line of String(text).split('\n')) {
+    const [record] = parseRolloutLines(line)
+    if (record?.type === 'session_meta') return record.payload
+  }
+  return undefined
+}
+
+// Rollout records; codex skips an unreadable line too (a write torn by a
+// crash), and a compacted line it cannot decode.
+function parseRolloutLines(text) {
+  const records = []
+  for (const line of String(text).split('\n')) {
+    if (!line.trim()) continue
+    let record
+    try {
+      record = JSON.parse(line)
+    } catch {
+      continue
+    }
+    if (!record || typeof record !== 'object' || typeof record.type !== 'string') continue
+    if (record.type === 'compacted' && !compactedLineReadable(record.payload)) continue
+    records.push(record)
+  }
+  return records
+}
+
+// ---- rollout reconstruction (#1832) -----------------------------------------
+//
+// codexRolloutHistory rebuilds a thread's model-visible history from its
+// rollout the way the pinned codex 0.160.0 does when it resumes the thread
+// (core/src/session/rollout_reconstruction.rs), and returns what a REBUILT
+// thread may carry of it: the conversation, without the instructions it ran
+// on. What codex does, mirrored:
+//   - response_item lines append to the history. Codex drops system messages
+//     and item types it does not know, and reads a code-mode "delivered
+//     assistant message" back as retained context, not history.
+//   - a compacted line's replacement_history REPLACES the history. The newest
+//     compaction bounds the replay when it carries window_number and
+//     resume_metadata (or the thread's history_mode is "paginated", as
+//     0.160.0 writes it); otherwise the newest compaction that no rollback
+//     undid does, found by replaying turn segments backwards.
+//   - thread_rolled_back drops the newest N user turns.
+//   - a paginated thread reverted (thread/revert) or forked by reference
+//     replays the prefix of the rollout it continues first
+//     (readCodexRolloutLineage hands those in as earlier segments).
+// What a rebuilt thread does NOT carry:
+//   - any developer-role item: the old developerInstructions with a member's
+//     memory index, codex's own permissions text and <skills_instructions>
+//     listing (private skills included), AGENTS.md, tool declarations. A
+//     mid-turn compaction writes that developer message into its
+//     replacement_history too, so it goes from there as well.
+//   - the user-role context codex writes itself (contextual_user_message.rs):
+//     <environment_context>, a selected skill's SKILL.md body, AGENTS.md,
+//     hook prompts and the like. The new thread writes its own.
+//   - anything encrypted (reasoning, an encrypted compaction, encrypted tool
+//     arguments and output) and item ids: see plainItem. A remote
+//     compaction's older turns come back as the plain messages it retained
+//     (checkpointHistory).
+// Kept in order: user and assistant messages, every tool call with its
+// output, a local compaction's summary. Codex pairs calls with outputs again
+// when it builds a request, as on any resume.
+//
+// Throws on what it cannot rebuild faithfully (no session_meta, another
+// thread's rollout, an unknown history mode, a legacy compaction without
+// replacement_history, multi-agent messages); the caller then starts fresh.
+export function codexRolloutHistory(rollout, threadId) {
+  // One rollout's text, or a lineage from readCodexRolloutLineage: oldest
+  // segment first, the thread's own rollout last.
+  const segments = Array.isArray(rollout) ? rollout : [rollout]
+  const own = parseRolloutLines(segments.at(-1) ?? '')
+  const meta = own.find((r) => r.type === 'session_meta')?.payload
+  if (!meta || typeof meta !== 'object') throw new Error('not a codex rollout (no session_meta)')
+  if (threadId && meta.id !== threadId) throw new Error(`the rollout is thread ${meta.id}'s, not ${threadId}'s`)
+  const historyMode = meta.history_mode ?? 'legacy'
+  if (historyMode !== 'legacy' && historyMode !== 'paginated') {
+    throw new Error(`unknown codex history mode "${historyMode}"`)
+  }
+  if (segments.length > 1 && historyMode !== 'paginated') throw new Error('a history base on a thread that is not paginated')
+  // Each segment's session_meta stays in place: reconstruction reads none.
+  const records = [...segments.slice(0, -1).flatMap(parseRolloutLines), ...own]
+
+  const checkpoint = replayCheckpoint(records, historyMode)
+  let history = checkpoint < 0 ? [] : checkpointHistory(records[checkpoint].payload)
+  for (const { type, payload, metadata } of records.slice(checkpoint + 1)) {
+    if (type === 'response_item') {
+      if (isHistoryItem(payload, metadata) && !isDeliveredAssistantMessage(payload, metadata)) {
+        history.push({ item: payload, metadata })
+      }
+    } else if (type === 'compacted') {
+      // One past the chosen compaction sits inside a rolled-back turn; codex
+      // keeps that turn's original items so the rollback can find it. Only
+      // a compaction from before replacement_history existed rewrites the
+      // history here, and no codex this platform has pinned writes one.
+      if (!Array.isArray(payload.replacement_history)) {
+        throw new Error('a legacy compaction without replacement_history')
+      }
+    } else if (type === 'event_msg' && payload?.type === 'thread_rolled_back') {
+      history = dropLastUserTurns(history, payload.num_turns)
+    } else if (type === 'inter_agent_communication') {
+      throw new Error('multi-agent messages, which this driver never starts')
+    }
+  }
+  return history.flatMap((e) => plainItem(e.item))
+}
+
+// Codex's SUMMARY_PREFIX (prompts/templates/compact/summary_prefix.md): a
+// local compaction records its summary as a user message beginning with it.
+const CODEX_SUMMARY_PREFIX = 'Another language model started to solve this problem and produced a summary ' +
+  'of its thinking process. You also have access to the state of the tools that were used by that language ' +
+  'model. Use this to build on the work that has already been done and avoid duplicating work. Here is the ' +
+  'summary produced by the other language model, use the information in this summary to assist with your ' +
+  'own analysis:'
+
+// The ResponseItem variants codex 0.160.0 keeps in history (protocol
+// models.rs, context_manager/history.rs is_api_message). Any other type
+// deserializes as `Other`, which codex drops.
+const HISTORY_ITEM_TYPES = new Set([
+  'message', 'agent_message', 'reasoning', 'local_shell_call', 'function_call', 'function_call_output',
+  'tool_search_call', 'tool_search_output', 'custom_tool_call', 'custom_tool_call_output', 'web_search_call',
+  'image_generation_call', 'compaction', 'compaction_summary', 'context_compaction', 'additional_tools',
+])
+
+// The marked user-role fragments codex writes itself
+// (context/contextual_user_message.rs CONTEXTUAL_USER_FRAGMENT_MATCHERS);
+// isCodexContextualUserText adds the ones matched by other rules.
+const CONTEXTUAL_USER_MARKERS = [
+  ['# AGENTS.md instructions', '</INSTRUCTIONS>'],
+  ['<environment_context>', '</environment_context>'],
+  ['<agent_message_board_notification>', '</agent_message_board_notification>'],
+  ['<skill>', '</skill>'],
+  ['<user_shell_command>', '</user_shell_command>'],
+  ['<turn_aborted>', '</turn_aborted>'],
+  ['<subagent_notification>', '</subagent_notification>'],
+  ['<recommended_plugins>', '</recommended_plugins>'],
+]
+
+// isCodexContextualUserText reports one input_text of a user message that
+// codex generated rather than the user wrote. A message with any such part
+// is context as a whole, as codex reads it.
+export function isCodexContextualUserText(text) {
+  if (typeof text !== 'string') return false
+  const t = text.trim()
+  // A hook's prompt (protocol items.rs parse_hook_prompt_fragment).
+  if (/^<hook_prompt\b[^>]*\bhook_run_id="[^"]*\S[^"]*"[^>]*>[\s\S]*<\/hook_prompt>$/.test(t)) return true
+  if (CONTEXTUAL_USER_MARKERS.some(([start, end]) => markedText(start, end, text))) return true
+  // <external_KEY>…</external_KEY> (AdditionalContextUserFragment).
+  const external = /^<external_([^>]*)>/.exec(t)
+  if (external && t.endsWith(`</external_${external[1]}>`)) return true
+  // InternalModelContextFragment, and the goal context it replaced.
+  if (t.startsWith('<goal_context>') && t.endsWith('</goal_context>')) return true
+  if (/^<codex_internal_context source="[a-z][a-z0-9_]*">/.test(t) && t.endsWith('</codex_internal_context>')) return true
+  // Warnings older codex versions recorded as user messages.
+  if (t.startsWith('Warning: apply_patch was requested via ') &&
+    t.endsWith('Use the apply_patch tool instead of exec_command.')) return true
+  return t.startsWith('Warning: Your account was flagged for potentially high-risk cyber activity') ||
+    t.startsWith('Warning: The maximum number of unified exec processes you can keep open is')
+}
+
+// fragment.rs matches_marked_text: both markers, ASCII case-insensitive,
+// around the text with its outer whitespace trimmed.
+function markedText(start, end, text) {
+  const head = text.trimStart()
+  const whole = head.trimEnd()
+  return head.slice(0, start.length).toLowerCase() === start.toLowerCase() &&
+    whole.length >= end.length && whole.slice(whole.length - end.length).toLowerCase() === end.toLowerCase()
+}
+
+function isContextualUserContent(content) {
+  return Array.isArray(content) && content.some((c) => c?.type === 'input_text' && isCodexContextualUserText(c.text))
+}
+
+// A compacted line codex can decode: replacement_history_metadata, when
+// present, pairs one-to-one with replacement_history (rollout_payload.rs).
+function compactedLineReadable(payload) {
+  if (!payload || typeof payload !== 'object') return false
+  const meta = payload.replacement_history_metadata
+  if (meta == null) return true
+  return Array.isArray(meta) && Array.isArray(payload.replacement_history) &&
+    meta.length === payload.replacement_history.length
+}
+
+// The history a compaction leaves, as a rebuilt thread may carry it. A
+// local compaction's replacement_history is plain text: the user messages
+// and a summary. A remote one (OpenAI's own provider, which production
+// uses) keeps the user messages whole and replaces everything else before
+// it with an encrypted compaction item: the server's encoding of that
+// window, the old developer message included. That item stays behind
+// (plainItem). Its retained_context keeps the assistant replies as plain
+// text, at most 8 of them and each cut to about 900 tokens, so those come
+// back, interleaved with the user messages by the order both carry
+// (user_input_order on a kept message, order on a retained one). The older
+// turns' tool calls are not kept.
+function checkpointHistory(compacted) {
+  const replaced = replacementHistory(compacted)
+  if (!replaced.some((e) => isEncryptedCompaction(e.item))) return replaced
+  const kept = replaced.filter((e) => !isEncryptedCompaction(e.item))
+  const retained = compacted.retained_context
+  const replies = retainedMessages(retained?.assistant_messages, 'assistant')
+  if (replies.length === 0) return kept
+  const userOrder = (e) => acceptanceOrder(e.metadata)
+  const isUser = (e) => e.item?.type === 'message' && e.item.role === 'user' && !isContextualUserContent(e.item.content)
+  if (kept.some((e) => isUser(e) && userOrder(e) == null)) {
+    // Nothing to interleave by: the plain messages retained_context kept,
+    // users and replies in their own order.
+    return [...retainedMessages(retained?.user_messages, 'user'), ...replies]
+      .sort((a, b) => a.order - b.order || (a.item.role === 'user' ? -1 : 1))
+  }
+  const out = []
+  let r = 0
+  for (const e of kept) {
+    const order = isUser(e) ? userOrder(e) : null
+    while (order != null && r < replies.length && replies[r].order < order) out.push(replies[r++])
+    out.push(e)
+  }
+  return [...out, ...replies.slice(r)]
+}
+
+// retainedMessages turns retained_context entries into plain messages, in
+// their order; an inherited entry (a forked thread's) or one without text or
+// order is left out.
+function retainedMessages(list, role) {
+  return (Array.isArray(list) ? list : [])
+    .filter((m) => typeof m?.text === 'string' && m.text !== '' && Number.isFinite(m.order) && !m.inherited)
+    .sort((a, b) => a.order - b.order)
+    .map((m) => ({
+      order: m.order,
+      item: {
+        type: 'message',
+        role,
+        content: [{ type: role === 'user' ? 'input_text' : 'output_text', text: m.text }],
+        ...(role === 'assistant' && typeof m.phase === 'string' && m.phase ? { phase: m.phase } : {}),
+      },
+      metadata: undefined,
+    }))
+}
+
+function isEncryptedCompaction(item) {
+  return item?.type === 'compaction' || item?.type === 'compaction_summary' || item?.type === 'context_compaction'
+}
+
+function replacementHistory(compacted) {
+  const meta = Array.isArray(compacted.replacement_history_metadata) ? compacted.replacement_history_metadata : []
+  return compacted.replacement_history.map((item, i) => ({ item, metadata: meta[i] ?? undefined }))
+}
+
+// The compaction whose replacement_history the replay starts from, or -1
+// (rollout_reconstruction.rs select_input_compaction and the reverse scan
+// after it).
+function replayCheckpoint(records, historyMode) {
+  let newest = -1
+  for (let i = records.length - 1; i >= 0 && newest < 0; i--) {
+    if (records[i].type === 'compacted') newest = i
+  }
+  if (newest < 0) return -1
+  const c = records[newest].payload
+  if (Array.isArray(c.replacement_history) && c.window_number != null &&
+    (c.resume_metadata != null || historyMode === 'paginated')) {
+    return newest
+  }
+  // Otherwise: the newest compaction no rollback undid. Read backwards, the
+  // rollout falls into turn segments, each closed by its task_started, and
+  // a rollback of N skips the next N segments that hold a user turn, along
+  // with any compaction inside them.
+  let rollbackTurns = 0
+  let found = -1
+  let segment = null
+  const open = () => (segment ??= { turnId: null, userTurn: false, checkpoint: -1 })
+  const close = () => {
+    const done = segment
+    segment = null
+    if (rollbackTurns > 0) {
+      if (done.userTurn) rollbackTurns--
+      return
+    }
+    if (found < 0 && done.checkpoint >= 0) found = done.checkpoint
+  }
+  for (let i = records.length - 1; i >= 0; i--) {
+    const { type, payload, metadata } = records[i]
+    if (type === 'compacted') {
+      open()
+      if (segment.checkpoint < 0 && Array.isArray(payload.replacement_history)) segment.checkpoint = i
+    } else if (type === 'turn_context') {
+      open()
+      if (segment.turnId == null) segment.turnId = payload?.turn_id ?? null
+    } else if (type === 'world_state') {
+      open()
+    } else if (type === 'response_item') {
+      if (isDeliveredAssistantMessage(payload, metadata)) continue
+      if (isUserTurnBoundary(payload)) open().userTurn = true
+      else open()
+    } else if (type === 'inter_agent_communication') {
+      open().userTurn = true
+    } else if (type === 'event_msg') {
+      const turnId = payload?.turn_id ?? null
+      switch (payload?.type) {
+        case 'thread_rolled_back':
+          rollbackTurns += Math.max(0, Number(payload.num_turns) || 0)
+          break
+        case 'task_complete':
+        case 'turn_complete':
+          open()
+          if (segment.turnId == null) segment.turnId = turnId
+          break
+        case 'turn_aborted':
+          if (segment) {
+            if (segment.turnId == null) segment.turnId = turnId
+          } else if (turnId != null) {
+            segment = { turnId, userTurn: false, checkpoint: -1 }
+          }
+          break
+        case 'user_message':
+          open().userTurn = true
+          break
+        case 'task_started':
+        case 'turn_started':
+          if (segment && (segment.turnId == null || turnId == null || segment.turnId === turnId)) close()
+          break
+      }
+    }
+  }
+  if (segment) close()
+  return found
+}
+
+// ContextManager::drop_last_n_user_turns. Its trimming of the context codex
+// wrote just above the cut is left out: plainItem drops all of it anyway.
+function dropLastUserTurns(history, n) {
+  const turns = Math.max(0, Number(n) || 0)
+  if (turns === 0) return history
+  const positions = []
+  history.forEach((e, i) => { if (isUserTurnBoundary(e.item)) positions.push(i) })
+  if (positions.length === 0) return history
+  const cut = turns >= positions.length ? positions[0] : positions[positions.length - turns]
+  // Replies and calls accepted after the first removed turn's input go with
+  // it, even where they were recorded before it.
+  const boundary = acceptanceOrder(history[cut].metadata)
+  return history.slice(0, cut).filter((e) => {
+    if (boundary == null) return true
+    const reply = (e.item?.type === 'message' && e.item.role === 'assistant') || e.item?.type === 'function_call'
+    const order = acceptanceOrder(e.metadata)
+    return !(reply && order != null && order >= boundary)
+  })
+}
+
+function acceptanceOrder(metadata) {
+  if (metadata?.inherited_user_message) return null
+  return Number.isFinite(metadata?.user_input_order) ? metadata.user_input_order : null
+}
+
+// context_manager/history.rs is_user_turn_boundary.
+function isUserTurnBoundary(item) {
+  if (item?.type === 'agent_message') return true
+  if (item?.type !== 'message') return false
+  const content = Array.isArray(item.content) ? item.content : []
+  if (item.role === 'user') {
+    return !isContextualUserContent(content) && !content.some((c) =>
+      c?.type === 'input_text' && typeof c.text === 'string' && c.text.startsWith(`${CODEX_SUMMARY_PREFIX}\n`))
+  }
+  return item.role === 'assistant' && isInterAgentContent(content)
+}
+
+// InterAgentCommunication::from_message_content: one text part holding the
+// serialized message.
+function isInterAgentContent(content) {
+  if (content.length !== 1) return false
+  const c = content[0]
+  if ((c?.type !== 'input_text' && c?.type !== 'output_text') || typeof c.text !== 'string') return false
+  try {
+    const v = JSON.parse(c.text)
+    return Boolean(v) && typeof v === 'object' && typeof v.author === 'string' &&
+      typeof v.recipient === 'string' && typeof v.content === 'string' && typeof v.trigger_turn === 'boolean'
+  } catch {
+    return false
+  }
+}
+
+function isHistoryItem(item, metadata) {
+  if (!item || typeof item !== 'object') return false
+  if (item.type === 'message') return item.role !== 'system'
+  if (item.type === 'configuration_update') return Boolean(metadata?.harness_authored_configuration)
+  return HISTORY_ITEM_TYPES.has(item.type)
+}
+
+// A code-mode "delivered assistant message": written as a response_item,
+// read back by codex as retained context rather than history
+// (history/src/rollout_payload.rs).
+function isDeliveredAssistantMessage(item, metadata) {
+  const marker = metadata?.delivered_assistant_message
+  return typeof marker === 'string' && metadata.user_input_order != null &&
+    (marker === 'codex:code-mode-delivery:v1:complete' || marker.startsWith('codex:code-mode-delivery:v1:incomplete:')) &&
+    item?.type === 'message' && item.role === 'assistant' && Array.isArray(item.content) &&
+    item.content.length === 1 && item.content[0]?.type === 'output_text' &&
+    item.internal_chat_message_metadata_passthrough?.turn_id != null
+}
+
+// plainItem is what a rebuilt thread carries of one history item: plain
+// conversation only, as a list of zero or one items.
+//   - Not the old instructions: no developer or system item, and none of the
+//     user-role context codex wrote itself.
+//   - Nothing encrypted. A reasoning item, an encrypted compaction and
+//     encrypted tool arguments or output are opaque to us, may encode the
+//     old instructions (a remote compaction does), and are bound to the
+//     account that made them: a thread rebuilt on another credential (a
+//     member's own key in their private chat, the org's once it's shared)
+//     would have every request refused for them.
+//   - No item ids: they name the old account's server-side items.
+// A reasoning-effort control (configuration_update) goes too: codex keeps
+// one only with its own provenance, so injected it would be dropped anyway.
+const WITHHELD_OUTPUT = '[This output was encrypted for another session and is not carried over.]'
+
+function plainItem(item) {
+  if (!item || typeof item !== 'object') return []
+  if (item.role === 'developer' || item.role === 'system') return []
+  if (item.type === 'message' && item.role === 'user' && isContextualUserContent(item.content)) return []
+  if (item.type === 'reasoning' || item.type === 'configuration_update' || item.type === 'agent_message' ||
+    isEncryptedCompaction(item)) return []
+  const { id: _id, encrypted_function_args: _args, ...plain } = item
+  if (Array.isArray(plain.content)) plain.content = plain.content.filter((c) => c?.type !== 'encrypted_content')
+  if (Array.isArray(plain.output)) {
+    const parts = plain.output.filter((c) => c?.type !== 'encrypted_content')
+    // A call's output that was all encrypted still answers the call, and
+    // says so, rather than reading as an empty result.
+    plain.output = parts.length === 0 && plain.output.length > 0 ? WITHHELD_OUTPUT : parts
+  }
+  return [plain]
 }
