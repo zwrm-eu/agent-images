@@ -286,3 +286,20 @@ test('session-instructions (#1832): advertised, so the CP resumes a chat shared 
   const capsLine = src.split('\n').find((l) => l.trimStart().startsWith('caps:'))
   assert.ok(capsLine.includes("'session-instructions'"), 'the session-instructions cap must be advertised')
 })
+
+test('a platform message sent again is dropped before it is queued, and the cap says so (#1910)', async () => {
+  const src = await readFile(SERVER, 'utf8')
+  const message = handlerBody(src, 'handleMessage')
+  // A known id answers at once, before anything is prepared or queued.
+  const drop = message.search(/if \(messageId && s\.messageIds\.has\(messageId\)\) return send\(res, 202, \{ queued: true, duplicate: true \}\)/)
+  const queue = message.indexOf('s.driver.queueMessage(')
+  const refused = message.indexOf("return send(res, 409, { error: 'session is not accepting messages'")
+  const remember = message.indexOf('s.messageIds.add(messageId)')
+  assert.ok(drop !== -1, 'a known id must return 202 duplicate at once')
+  assert.ok(queue !== -1 && refused !== -1 && remember !== -1, 'handleMessage must queue, refuse and remember')
+  assert.ok(drop < queue, 'a known id is dropped before queueing')
+  assert.ok(refused < remember, 'an id is remembered only after the refusal branch, once its message was taken')
+  assert.equal(message.split('s.messageIds.add(').length, 2, 'an id is remembered in one place only')
+  assert.match(message, /source: 'platform'/, 'the durable message marks a platform message')
+  assert.match(src, /'platform-messages'/, '/healthz must advertise the platform-messages cap')
+})

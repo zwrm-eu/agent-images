@@ -46,7 +46,7 @@ import { countBackgroundTasks, createTaskLedger } from './drivers/claude-tasks.m
 import { seedState, waitSeedClear, SEED_WAIT_MAX_MS, SEED_FAILED_MESSAGE } from './seedgate.mjs'
 import { EventPusher } from './event-pusher.mjs'
 import { decisionForRequest, permissionDecisionPayload } from './event-payloads.mjs'
-import { cleanAuthor, prepareMessage } from './message-context.mjs'
+import { RecentIds, cleanAuthor, cleanMessageId, prepareMessage } from './message-context.mjs'
 import { searchWorkspaceFiles } from './file-search.mjs'
 import { loadImageMCPServers, withImageServers } from './image-mcp.mjs'
 import { desktopStatus, loadDesktop, relayVNC, startDesktop, writeControl } from './desktop.mjs'
@@ -314,6 +314,9 @@ async function startSession(spec) {
     // to the next real user/command prompt so every harness sees the operator
     // injection in conversation context.
     pendingContexts: [],
+    // The control plane's message ids lately taken (#1910): one sent again
+    // after an unclear answer is dropped.
+    messageIds: new RecentIds(),
     // 'command' spans a synchronous slash-command turn; 'shell' spans the
     // immediate subprocess. Both exclude message/command/shell admission so
     // output and turn boundaries cannot interleave ambiguously.
@@ -927,16 +930,22 @@ async function handleCreate(req, res) {
 
 async function handleMessage(req, res, s) {
   const body = await readBody(req)
+  // A message the control plane sends itself (#1910) carries a kind and no
+  // author, and an id so that one sent again is taken once.
+  const platform = body.source === 'platform' ? (typeof body.platform_kind === 'string' && body.platform_kind.trim() ? body.platform_kind.trim() : 'message') : ''
+  const messageId = cleanMessageId(body.message_id)
+  if (messageId && s.messageIds.has(messageId)) return send(res, 202, { queued: true, duplicate: true })
   // Who is speaking (shared chats, #1784): stamped on the durable user
   // message for every viewer, and led into the prompt only when the control
   // plane asks (attribute_author), so a private chat's transcript stays plain.
-  const author = cleanAuthor(body.author)
+  const author = platform ? null : cleanAuthor(body.author)
   let prepared
   try {
     const attributed = body.attribute_author === true
     prepared = prepareMessage(body.text, body.attachments, {
       attributed,
       speaker: attributed ? author : null,
+      platform,
     })
   } catch (err) {
     throw badRequest(err.message)
@@ -950,7 +959,14 @@ async function handleMessage(req, res, s) {
     return send(res, 409, { error: 'session is not accepting messages', state: s.state })
   }
   if (pendingCount > 0) s.pendingContexts.splice(0, pendingCount)
-  const visibleMessage = { text: prepared.text, attachments: prepared.attachments, ...(author ? { author } : {}) }
+  s.messageIds.add(messageId)
+  const visibleMessage = {
+    text: prepared.text,
+    attachments: prepared.attachments,
+    ...(author ? { author } : {}),
+    ...(platform ? { source: 'platform', platform_kind: platform } : {}),
+    ...(messageId ? { message_id: messageId } : {}),
+  }
   if (s.state === 'starting') s.deferredMessages.push(visibleMessage)
   else emitUserMessage(s, visibleMessage)
   send(res, 202, { queued: true })
@@ -1356,7 +1372,7 @@ const server = createServer(async (req, res) => {
         // (claude: snapshot false; codex: a thread whose instructions_scope
         // changed is rebuilt without its old developer instructions). The
         // CP resumes a chat shared since its conversation began only here.
-        caps: ['mcp', 'escalation', 'files', 'file-search', 'message-context', 'bulk-attachments', 'park', 'reclaim', 'skillfetch', 'pi-multiprovider', 'pi-gateway', 'opencode-gateway', 'background-tasks', 'tool-policy', 'agent-identity', 'commands', 'shell', 'model-switch', 'compact', 'image-mcp', 'desktop', 'speaker-attribution', 'session-instructions', ...HARNESS_CAPS],
+        caps: ['mcp', 'escalation', 'files', 'file-search', 'message-context', 'bulk-attachments', 'park', 'reclaim', 'skillfetch', 'pi-multiprovider', 'pi-gateway', 'opencode-gateway', 'background-tasks', 'tool-policy', 'agent-identity', 'commands', 'shell', 'model-switch', 'compact', 'image-mcp', 'desktop', 'speaker-attribution', 'session-instructions', 'platform-messages', ...HARNESS_CAPS],
         active_session: session && !isDone(session) ? session.id : null,
         state: session?.state ?? null,
         // A session ended because its events could no longer reach the
