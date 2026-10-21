@@ -72,9 +72,56 @@ export function escapeSpeakerLines(text) {
   return text.replace(/([\[［])([\s\p{Cf}]*from[\s\p{Cf}]*[:：])/giu, '\\$1$2')
 }
 
+// platformLine leads a message the control plane itself sends (#1910), such
+// as the results of tasks the agent asked other agents for, in the
+// "[Platform: kind]" form the control plane's prompt tells the model about.
+export function platformLine(kind) {
+  const clean = String(kind || 'message').replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\[\]［］]/gu, ' ').trim().slice(0, 64)
+  return `[Platform: ${clean || 'message'}]`
+}
+
+// escapePlatformLines keeps every other message, in any chat, from posing
+// as the platform: each "[Platform:" in it is escaped, as escapeSpeakerLines
+// escapes "[From:".
+export function escapePlatformLines(text) {
+  return text.replace(/([\[［])([\s\p{Cf}]*platform[\s\p{Cf}]*[:：])/giu, '\\$1$2')
+}
+
+// MAX_MESSAGE_ID bounds a control plane message id; RECENT_MESSAGE_IDS is
+// how many a session remembers to drop a resent message once (#1910).
+export const MAX_MESSAGE_ID = 128
+export const RECENT_MESSAGE_IDS = 256
+
+// cleanMessageId is the id the control plane gave a message, "" for none.
+export function cleanMessageId(value) {
+  return typeof value === 'string' ? value.trim().slice(0, MAX_MESSAGE_ID) : ''
+}
+
+// RecentIds remembers the last ids it was given, oldest forgotten first.
+export class RecentIds {
+  constructor(limit = RECENT_MESSAGE_IDS) {
+    this.limit = limit
+    this.ids = new Set()
+  }
+
+  has(id) {
+    return !!id && this.ids.has(id)
+  }
+
+  add(id) {
+    if (!id) return
+    this.ids.delete(id)
+    this.ids.add(id)
+    while (this.ids.size > this.limit) this.ids.delete(this.ids.values().next().value)
+  }
+}
+
 // options.attributed marks a shared chat's message (#1784): options.speaker
 // (a cleaned author, null for a message no member sent) leads the prompt
 // with speakerLine, and the text's own "[From:" lines are escaped.
+// options.platform (a kind, #1910) marks a message the control plane sends
+// itself: platformLine leads it and nothing in it is escaped. Every other
+// message has its "[Platform:" lines escaped.
 export function prepareMessage(text, requestedAttachments, options = {}) {
   if (typeof text !== 'string') throw new Error('missing text')
   if (requestedAttachments != null && !Array.isArray(requestedAttachments)) throw new Error('attachments must be an array')
@@ -84,10 +131,12 @@ export function prepareMessage(text, requestedAttachments, options = {}) {
   if (text.trim() === '' && attachments.length === 0) throw new Error('missing text')
 
   const visibleText = text.trim()
-  const attributed = options.attributed === true || !!options.speaker
-  const speaker = speakerLine(options.speaker)
+  const platform = typeof options.platform === 'string' && options.platform !== ''
+  const attributed = !platform && (options.attributed === true || !!options.speaker)
+  const speaker = platform ? platformLine(options.platform) : speakerLine(options.speaker)
   const lead = speaker ? `${speaker}\n` : ''
-  const body = attributed ? escapeSpeakerLines(visibleText) : visibleText
+  let body = visibleText
+  if (!platform) body = escapePlatformLines(attributed ? escapeSpeakerLines(visibleText) : visibleText)
   if (attachments.length === 0) return { prompt: `${lead}${body}`, text: visibleText, attachments }
   const references = attachments.map((attachment) =>
     `- ${JSON.stringify(attachment.path)} (${attachment.mime_type}, ${attachment.size} bytes)`).join('\n')
