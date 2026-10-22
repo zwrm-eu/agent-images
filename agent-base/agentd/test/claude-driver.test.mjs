@@ -41,7 +41,10 @@ function fakeQuery() {
       },
       interrupt: async () => {},
       setModel: async () => {},
-      setPermissionMode: async () => {},
+      setPermissionMode: async () => {
+        if (fake.setModeGate) await fake.setModeGate
+        if (fake.setModeError) throw fake.setModeError
+      },
       supportedCommands: async () => [],
       getContextUsage: async () => ({}),
     }
@@ -112,7 +115,7 @@ function build(spec = {}) {
   })
   s.driver = driver
   driver.start()
-  return { s, driver, fake, events, hooks }
+  return { s, h, driver, fake, events, hooks }
 }
 
 async function until(events, pred, what, timeoutMS = 2000) {
@@ -490,4 +493,111 @@ test('every session, a resume included, runs on its own append, never a recorded
     assert.equal(fake.options.systemPrompt.append, spec.append_system_prompt)
     fake.end()
   }
+})
+
+// What the CLI asks in every mode (#1950): an rm it can't resolve.
+const rmCheck = {
+  toolName: 'Bash',
+  input: { command: 'cd ~/work/x && rm img/*' },
+  opts: { toolUseID: 'toolu_rm', decisionReason: 'Dangerous rm operation on statically-unresolvable target: /home/agent/work/x/img/*' },
+}
+const question = { questions: [{ question: 'Which file?', header: 'File', options: [{ label: 'a', description: '' }, { label: 'b', description: '' }], multiSelect: false }] }
+const requests = (events) => events.filter((e) => e.type === 'permission.request')
+
+test("full access allows the CLI's own rm check without asking anyone (#1950)", async () => {
+  for (const spec of [{}, { permission_mode: 'bypassPermissions' }, { interactive: false }]) {
+    const { s, fake, events } = build(spec)
+    const decision = await fake.options.canUseTool(rmCheck.toolName, rmCheck.input, rmCheck.opts)
+    assert.equal(decision.behavior, 'allow')
+    assert.equal(requests(events).length, 0)
+    assert.equal(s.pending.size, 0)
+    assert.notEqual(s.state, 'blocked')
+    fake.end()
+  }
+})
+
+test('full access still puts a question to the person (#1950)', async () => {
+  const { s, fake, events } = build()
+  fake.options.canUseTool('AskUserQuestion', question, { toolUseID: 'toolu_q' })
+  await until(events, (ev) => requests(ev).length === 1, 'the question')
+  assert.equal(requests(events)[0].payload.kind, 'question')
+  assert.equal(s.state, 'blocked')
+  assert.equal(s.pending.size, 1)
+  fake.end()
+})
+
+test('ask mode puts the rm check to the person, with its reason (#1950)', async () => {
+  const { s, fake, events } = build({ permission_mode: 'default' })
+  fake.options.canUseTool(rmCheck.toolName, rmCheck.input, rmCheck.opts)
+  await until(events, (ev) => requests(ev).length === 1, 'the request')
+  assert.equal(requests(events)[0].payload.decision_reason, rmCheck.opts.decisionReason)
+  assert.equal(s.state, 'blocked')
+  fake.end()
+})
+
+test('the check follows a mode switch either way (#1950)', async () => {
+  const { s, driver, fake, events } = build({ permission_mode: 'default' })
+  await driver.setPermissionMode('bypassPermissions')
+  assert.equal((await fake.options.canUseTool(rmCheck.toolName, rmCheck.input, rmCheck.opts)).behavior, 'allow')
+  assert.equal(requests(events).length, 0)
+  await driver.setPermissionMode('default')
+  fake.options.canUseTool(rmCheck.toolName, rmCheck.input, rmCheck.opts)
+  await until(events, (ev) => requests(ev).length === 1, 'the request after leaving full access')
+  assert.equal(s.pending.size, 1)
+  fake.end()
+})
+
+test('a run parks on a connector that asks first and allows the rm check (#1950)', async () => {
+  const { h, fake, events } = build({ interactive: false, permission_mode: 'default', auto_approve: true, escalate_servers: ['crm'] })
+  h.isEscalatedTool = (tool, servers) => servers.some((name) => tool.startsWith(`mcp__${name}__`))
+  assert.equal((await fake.options.canUseTool(rmCheck.toolName, rmCheck.input, rmCheck.opts)).behavior, 'allow')
+  assert.equal(requests(events).length, 0)
+  fake.options.canUseTool('mcp__crm__send_mail', { to: 'a@example.com' }, { toolUseID: 'toolu_mcp' })
+  await until(events, (ev) => requests(ev).length === 1, 'the connector request')
+  assert.equal(requests(events)[0].payload.tool_name, 'mcp__crm__send_mail')
+  fake.end()
+})
+
+test('full access still asks for a plan to approve and for a call an ask rule names (#1950)', async () => {
+  const { fake, events } = build()
+  fake.options.canUseTool('ExitPlanMode', { plan: 'do it' }, { toolUseID: 'toolu_plan' })
+  const rule = { source: 'projectSettings', toolName: 'Bash', ruleContent: 'rm:*' }
+  fake.options.canUseTool(rmCheck.toolName, rmCheck.input, { ...rmCheck.opts, matchedAskRule: rule })
+  await until(events, (ev) => requests(ev).length === 2, 'both requests')
+  assert.deepEqual(requests(events).map((e) => e.payload.tool_name), ['ExitPlanMode', 'Bash'])
+  fake.end()
+})
+
+test('the mode the CLI reports counts, plan mode it entered on its own included (#1950)', async () => {
+  const { fake, events } = build()
+  fake.send({ ...init, permissionMode: 'plan' })
+  await until(events, (ev) => ev.some(isInit), 'the init')
+  fake.options.canUseTool(rmCheck.toolName, rmCheck.input, rmCheck.opts)
+  await until(events, (ev) => requests(ev).length === 1, 'the request in plan mode')
+  fake.send({ type: 'system', subtype: 'status', status: null, permissionMode: 'bypassPermissions', session_id: 'cli-1' })
+  await until(events, (ev) => ev.some((e) => e.type === 'sdk.system' && e.payload.subtype === 'status'), 'the status')
+  assert.equal((await fake.options.canUseTool(rmCheck.toolName, rmCheck.input, rmCheck.opts)).behavior, 'allow')
+  fake.end()
+})
+
+test('leaving full access holds from the request on; a failed switch keeps the mode (#1950)', async () => {
+  const { s, driver, fake, events } = build()
+  let open
+  fake.setModeGate = new Promise((resolve) => { open = resolve })
+  const switching = driver.setPermissionMode('default')
+  // The CLI's report of the mode it is leaving doesn't undo the request.
+  fake.send({ ...init, permissionMode: 'bypassPermissions' })
+  await until(events, (ev) => ev.some(isInit), 'the init')
+  fake.options.canUseTool(rmCheck.toolName, rmCheck.input, rmCheck.opts)
+  await until(events, (ev) => requests(ev).length === 1, 'the request while the switch is in flight')
+  open()
+  await switching
+  fake.setModeGate = null
+  await driver.setPermissionMode('bypassPermissions')
+  fake.setModeError = new Error('mode refused')
+  await assert.rejects(driver.setPermissionMode('default'), /mode refused/)
+  assert.equal((await fake.options.canUseTool(rmCheck.toolName, rmCheck.input, rmCheck.opts)).behavior, 'allow')
+  assert.equal(requests(events).length, 1)
+  assert.equal(s.pending.size, 1)
+  fake.end()
 })

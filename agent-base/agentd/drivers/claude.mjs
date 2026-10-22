@@ -35,6 +35,10 @@ const COMPACT_RESULT_GRACE_MS = 5_000
 // idle backstop.
 const DRAIN_REEMIT_GRACE_MS = 5_000
 
+// Tools whose ask a person answers in every mode (#1950): a question, and
+// the plan the model asks to go ahead with.
+const PERSON_TOOLS = new Set(['AskUserQuestion', 'ExitPlanMode'])
+
 const CLOSED = Symbol('closed')
 
 // Feeds the SDK's AsyncIterable prompt: HTTP message posts push, the input
@@ -296,6 +300,12 @@ export function createClaudeDriver(s, spec, h, { startQuery = query, drainGraceM
   // change, or a secret overriding CLAUDE_SESSION_ENV) empties the todo list
   // without an error, so the first init that lacks it is logged.
   let todoToolChecked = false
+  // The mode the CLI runs in: the spec's, then what setPermissionMode asks
+  // for and what the CLI reports (it moves itself into and out of plan mode).
+  let permissionMode = spec.permission_mode || 'bypassPermissions'
+  // setPermissionMode calls in flight; meanwhile the CLI may still report the
+  // mode it is leaving.
+  let modeChanges = 0
 
   const canUseTool = async (toolName, input, opts = {}) => {
     // After /end, the in-flight turn may still reach for another tool; a new
@@ -304,11 +314,22 @@ export function createClaudeDriver(s, spec, h, { startQuery = query, drainGraceM
     if (s.ending) {
       return { behavior: 'deny', message: 'session ended', interrupt: false }
     }
+    // Full access asks nobody. The CLI still calls this in bypassPermissions
+    // for the checks it lets no mode or rule skip: an rm whose target it
+    // can't resolve, one on the working directory or a parent of it, a
+    // shell -c script that runs rm (decisionReason says which). Parked, they
+    // stop a run nobody watches and a chat whose client shows no such prompt
+    // (kaizen renders questions only). Still for the person: a question, a
+    // plan to approve, and a call someone's permissions.ask rule names.
+    if (permissionMode === 'bypassPermissions' && !PERSON_TOOLS.has(toolName) && !opts.matchedAskRule) {
+      h.log(`full access: allowing ${toolName}${typeof opts.decisionReason === 'string' ? ` (${opts.decisionReason})` : ''}`)
+      return { behavior: 'allow' }
+    }
     // Autonomous runs (#731) execute unattended: auto-approve every tool
     // except the connectors the agent's policy marks for escalation. Interactive
     // sessions fall through and prompt for everything (a human is watching the
     // timeline). When nothing escalates, the CP keeps permissionMode
-    // 'bypassPermissions' and this callback is never invoked at all.
+    // 'bypassPermissions' and only the checks above reach this callback.
     if (spec.auto_approve && !h.isEscalatedTool(toolName, spec.escalate_servers)) {
       return { behavior: 'allow' }
     }
@@ -364,7 +385,7 @@ export function createClaudeDriver(s, spec, h, { startQuery = query, drainGraceM
     env: { ...CLAUDE_SESSION_ENV, ...process.env, ...(spec.env || {}) },
     pathToClaudeCodeExecutable: claudeExecutable,
     includePartialMessages: true,
-    permissionMode: spec.permission_mode || 'bypassPermissions',
+    permissionMode,
     // The Agent SDK refuses both an initial bypass mode and a later
     // setPermissionMode('bypassPermissions') unless this construction-time
     // opt-in is present. Setting it does not itself bypass anything — the
@@ -666,6 +687,9 @@ export function createClaudeDriver(s, spec, h, { startQuery = query, drainGraceM
             }
             if (msg.subtype === 'compact_boundary') onCompactBoundary(msg)
             if (msg.subtype === 'status') onCompactStatus(msg)
+            if ((msg.subtype === 'init' || msg.subtype === 'status') && typeof msg.permissionMode === 'string' && modeChanges === 0) {
+              permissionMode = msg.permissionMode
+            }
             applyTaskLedger(msg)
             s.pusher.emit('sdk.system', msg)
             break
@@ -877,7 +901,20 @@ export function createClaudeDriver(s, spec, h, { startQuery = query, drainGraceM
     },
 
     async setPermissionMode(mode) {
-      await q.setPermissionMode(mode)
+      // Leaving full access holds from the request on, entering it once the
+      // CLI is in it: an ask in between goes to the person either way.
+      const previous = permissionMode
+      if (mode !== 'bypassPermissions') permissionMode = mode
+      modeChanges++
+      try {
+        await q.setPermissionMode(mode)
+      } catch (err) {
+        permissionMode = previous
+        throw err
+      } finally {
+        modeChanges--
+      }
+      permissionMode = mode
     },
 
     // Persistent model switch (#1552): the SDK query runs in streaming-input
