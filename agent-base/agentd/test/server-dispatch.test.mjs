@@ -303,3 +303,12 @@ test('a platform message sent again is dropped before it is queued, and the cap 
   assert.match(message, /source: 'platform'/, 'the durable message marks a platform message')
   assert.match(src, /'platform-messages'/, '/healthz must advertise the platform-messages cap')
 })
+
+test('claude never auto-approves a question, and keeps the tool for delegate runs (#1912)', async () => {
+  const src = await readFile(CLAUDE_DRIVER, 'utf8')
+  const isQuestion = src.indexOf("const isQuestion = toolName === 'AskUserQuestion'")
+  const autoApprove = src.indexOf('if (!isQuestion && spec.auto_approve')
+  assert.ok(isQuestion !== -1 && autoApprove > isQuestion, 'the question check must precede run auto-approve')
+  assert.match(src, /asksQuestions\(spec\) \? \{\} : \{ disallowedTools: \['AskUserQuestion'\] \}/)
+  assert.match(await readFile(SERVER, 'utf8'), /'task-questions'/)
+})

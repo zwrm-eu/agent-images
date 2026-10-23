@@ -11,7 +11,7 @@ import { query, tool, createSdkMcpServer } from '@anthropic-ai/claude-agent-sdk'
 import { z } from 'zod'
 import { applyTaskMessage, clearTaskLedger, countBackgroundTasks, createTaskLedger } from './claude-tasks.mjs'
 import { createTodoTracker } from './todos.mjs'
-import { claudeQuestionDecision, claudeQuestionInput } from './questions.mjs'
+import { asksQuestions, claudeQuestionDecision, claudeQuestionInput } from './questions.mjs'
 import { permissionDecisionPayload, contextUsagePayload, contextTokensFromUsage } from '../event-payloads.mjs'
 import { commandPrompt, normalizeCommandList, resolveCommand, pendingWithTimeout } from '../session-control.mjs'
 import { SLEEP_DESCRIPTION, SLEEP_UNTIL_DESCRIPTION, runSleep, runSleepUntil, mapOutcome } from './run-tools.mjs'
@@ -330,15 +330,16 @@ export function createClaudeDriver(s, spec, h, { startQuery = query, drainGraceM
     // sessions fall through and prompt for everything (a human is watching the
     // timeline). When nothing escalates, the CP keeps permissionMode
     // 'bypassPermissions' and only the checks above reach this callback.
-    if (spec.auto_approve && !h.isEscalatedTool(toolName, spec.escalate_servers)) {
-      return { behavior: 'allow' }
-    }
-    const requestId = randomUUID()
     // A question rides the permission channel in the one platform shape
     // (#1559): positional ids on the way out, answers keyed by them on the
     // way back and re-keyed by question text for the SDK. kind: question is
-    // the harness-neutral discriminator (#1555).
+    // the harness-neutral discriminator (#1555). Run auto-approve must never
+    // answer one (#1912): an allow without answers is fabricated certainty.
     const isQuestion = toolName === 'AskUserQuestion'
+    if (!isQuestion && spec.auto_approve && !h.isEscalatedTool(toolName, spec.escalate_servers)) {
+      return { behavior: 'allow' }
+    }
+    const requestId = randomUUID()
     const platformInput = isQuestion ? claudeQuestionInput(input) : input
     s.pusher.emit('permission.request', {
       request_id: requestId,
@@ -398,7 +399,8 @@ export function createClaudeDriver(s, spec, h, { startQuery = query, drainGraceM
     // name in disallowedTools removes the tool from the model's context
     // entirely. Interactive sessions keep it: it surfaces through the
     // permission flow, which carries answers via updated_input.
-    ...(spec.interactive ? {} : { disallowedTools: ['AskUserQuestion'] }),
+    // A delegate's run (#1912) keeps it: the agent that asked answers.
+    ...(asksQuestions(spec) ? {} : { disallowedTools: ['AskUserQuestion'] }),
     // The Agent SDK defaults to an EMPTY system prompt and no settings files.
     // Interactive sessions want stock Claude Code behavior: the claude_code
     // preset plus the seeded ~/.claude/CLAUDE.md platform instructions ('user')

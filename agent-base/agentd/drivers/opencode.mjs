@@ -47,7 +47,7 @@ import {
   toolUsePayload,
 } from './opencode-translate.mjs'
 import { normalizeTodos } from './todos.mjs'
-import { opencodeQuestionInput, opencodeQuestionReply } from './questions.mjs'
+import { asksQuestions, opencodeQuestionInput, opencodeQuestionReply } from './questions.mjs'
 import { commandPrompt, normalizeCommandList, resolveCommand, pendingWithTimeout } from '../session-control.mjs'
 
 // Bounded teardown (the codex rule): a wedged server must not hang
@@ -167,6 +167,7 @@ export async function createOpenCodeDriver(s, spec, h) {
     platform: platformCfg,
     mcpServers: spec.mcp_servers,
     interactive: !!spec.interactive,
+    questions: !!spec.questions,
     instructionsPath,
     // The org's live ext/ catalog (#1446); both absent on a CP that predates it.
     models: spec.opencode_models,
@@ -475,7 +476,7 @@ export async function createOpenCodeDriver(s, spec, h) {
   async function onQuestion(req) {
     const questionId = req?.id
     if (!questionId) return
-    if (s.ending || !spec.interactive) {
+    if (s.ending || !asksQuestions(spec)) {
       h.log(`opencode: rejecting question ${questionId} (${s.ending ? 'session ending' : 'unattended session'})`)
       return rejectQuestion(questionId)
     }

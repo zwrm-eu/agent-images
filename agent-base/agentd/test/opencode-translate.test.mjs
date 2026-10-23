@@ -242,3 +242,10 @@ test('session config: a live catalog replaces the seeded ext/ entries; without t
 })
 
 
+
+test('a delegate run keeps the question tool (#1912)', () => {
+  const run = buildSessionConfig({ platform: null, mcpServers: {}, interactive: false, questions: true })
+  assert.equal(run.tools.question, true)
+  const unattended = buildSessionConfig({ platform: null, mcpServers: {}, interactive: false })
+  assert.equal(unattended.tools.question, false)
+})

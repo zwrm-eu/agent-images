@@ -269,7 +269,7 @@ export const GATED_PERMISSIONS = { bash: 'ask', edit: 'ask', webfetch: 'ask', we
 //    developerInstructions rule: add, never replace.
 //
 // MCP URLs point at agentd's session proxy; serialized harness config holds no bearer.
-export function buildSessionConfig({ platform, mcpServers, interactive, instructionsPath, models, catalogLive }) {
+export function buildSessionConfig({ platform, mcpServers, interactive, questions, instructionsPath, models, catalogLive }) {
   const cfg = { ...(platform && typeof platform === 'object' ? platform : {}) }
 
   // Live external-provider models (#1446). The boot seed is written once per
@@ -344,7 +344,8 @@ export function buildSessionConfig({ platform, mcpServers, interactive, instruct
   // (deterministic repro) to a connector MCP call that never returns when its
   // upstream dies — NOT the subagent, which was only incidental. The real fix
   // is the MCP timeout below, so task no longer needs disabling.
-  cfg.tools = { ...(cfg.tools || {}), question: !!interactive }
+  // A delegate's run (#1912) keeps it too: the agent that asked answers.
+  cfg.tools = { ...(cfg.tools || {}), question: !!(interactive || questions) }
   // Bound every MCP call so a dead connector upstream can't wedge the session
   // (#1388) — see MCP_TOOL_TIMEOUT_MS.
   cfg.experimental = { ...(cfg.experimental || {}), mcp_timeout: MCP_TOOL_TIMEOUT_MS }
