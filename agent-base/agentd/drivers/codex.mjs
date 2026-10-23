@@ -49,7 +49,7 @@ import {
   toolUsePayload,
   usagePayload,
 } from './codex-translate.mjs'
-import { codexQuestionInput, codexQuestionReply } from './questions.mjs'
+import { asksQuestions, codexQuestionInput, codexQuestionReply } from './questions.mjs'
 // Pure naming/dispatch helpers — no MCP SDK import, so they load unconditionally.
 import {
   buildCodexRunTools,
@@ -493,7 +493,7 @@ export async function createCodexDriver(s, spec, h) {
         // answer, and replying with empty answers would let the model
         // continue on fabricated certainty (the claude-code #30983 failure
         // mode) — so refuse outright and let codex proceed without it.
-        if (!spec.interactive) {
+        if (!asksQuestions(spec)) {
           throw new Error('this session is unattended; ask no questions and proceed with your best judgement')
         }
         // The platform shape on the way out (#1559), codex's

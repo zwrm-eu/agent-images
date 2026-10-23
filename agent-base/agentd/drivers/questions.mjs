@@ -16,6 +16,13 @@
 // the harness saw refused.
 
 // platformQuestion renders one harness question in the platform shape.
+// asksQuestions says whether a session may put a question to whoever drives
+// it: an interactive chat, where a person answers, or a run whose spec sets
+// questions (#1912), a delegate's run, which the agent that asked answers.
+export function asksQuestions(spec) {
+  return !!(spec?.interactive || spec?.questions)
+}
+
 export function platformQuestion(q, id, multiSelect = false) {
   return {
     id,

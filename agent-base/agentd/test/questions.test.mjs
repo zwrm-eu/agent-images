@@ -4,6 +4,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
   answerList,
+  asksQuestions,
   answeredQuestions,
   claudeQuestionDecision,
   claudeQuestionInput,
@@ -101,4 +102,11 @@ test('opencode: positional ids, multiple → multiSelect, custom dropped; ordere
   assert.deepEqual(opencodeQuestionReply(input, { q3: ['', 'z', 7] }), [[], [], ['z']])
   assert.equal(opencodeQuestionReply(input, { 'B?': ['y'] }), null)
   assert.equal(opencodeQuestionReply(input, undefined), null)
+})
+
+test('a delegate run asks questions as a chat does (#1912)', () => {
+  assert.equal(asksQuestions({ interactive: true }), true)
+  assert.equal(asksQuestions({ questions: true }), true)
+  assert.equal(asksQuestions({}), false)
+  assert.equal(asksQuestions(undefined), false)
 })
