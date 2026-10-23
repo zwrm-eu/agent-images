@@ -49,6 +49,7 @@ import {
 import { normalizeTodos } from './todos.mjs'
 import { asksQuestions, opencodeQuestionInput, opencodeQuestionReply } from './questions.mjs'
 import { commandPrompt, normalizeCommandList, resolveCommand, pendingWithTimeout } from '../session-control.mjs'
+import { platformToolNames } from './run-tools.mjs'
 
 // Bounded teardown (the codex rule): a wedged server must not hang
 // /interrupt or SIGTERM shutdown; turn-carrying calls stay unbounded.
@@ -69,15 +70,28 @@ export const SUPPORTED_PERMISSION_MODES = new Set(['default', 'bypassPermissions
 
 // The ROOT-OWNED config root the image bakes (#1392): the boot config's
 // apply step writes the platform config file here, and run/ carries the
-// baked sleep/sleep_until file tools. OPENCODE_CONFIG_DIR points at one of
-// these so the model user's ~/.config/opencode never enters the trust path;
-// interactive sessions use the tools-free root.
+// baked sleep/sleep_until/wait_for_task file tools. OPENCODE_CONFIG_DIR
+// points at one of these so the model user's ~/.config/opencode never
+// enters the trust path; interactive sessions use the tools-free root, or
+// session-tasks/ when they may wait for tasks.
 const PLATFORM_CONFIG_PATH = '/etc/opencode/opencode.json'
 // session/ is the EMPTY subtree: driver sessions must read neither the
 // terminal AGENTS.md (instructions arrive via the session config; both would
 // double the prompt) nor the run tools.
-const CONFIG_DIR_INTERACTIVE = '/etc/opencode/session'
-const CONFIG_DIR_RUN = '/etc/opencode/run'
+export const CONFIG_DIR_INTERACTIVE = '/etc/opencode/session'
+// session-tasks/ is session/ plus the one platform tool a chat may have,
+// wait_for_task (#1911), and the vendored plugin its file imports.
+export const CONFIG_DIR_TASKS = '/etc/opencode/session-tasks'
+export const CONFIG_DIR_RUN = '/etc/opencode/run'
+
+// openCodeConfigDir picks the config root by spec, i.e. which file tools
+// the session can see: a run gets every run tool (buildSessionConfig turns
+// wait_for_task off without task_waits), a chat with task_waits only
+// wait_for_task, any other chat none.
+export function openCodeConfigDir(spec) {
+  if (!spec?.interactive) return CONFIG_DIR_RUN
+  return spec.task_waits === true ? CONFIG_DIR_TASKS : CONFIG_DIR_INTERACTIVE
+}
 
 export async function createOpenCodeDriver(s, spec, h) {
   const home = process.env.HOME || '/home/agent'
@@ -115,7 +129,7 @@ export async function createOpenCodeDriver(s, spec, h) {
   // opencode.json / .opencode/{tool,plugin} must never configure the harness
   // (probed: without this flag the server reads the project's opencode.json).
   childEnv.OPENCODE_DISABLE_PROJECT_CONFIG = '1'
-  childEnv.OPENCODE_CONFIG_DIR = spec.interactive ? CONFIG_DIR_INTERACTIVE : CONFIG_DIR_RUN
+  childEnv.OPENCODE_CONFIG_DIR = openCodeConfigDir(spec)
 
   // The platform half of the config, rendered by the control plane
   // (build.OpenCodeConfigJSON) and written by the boot-config apply step.
@@ -168,6 +182,7 @@ export async function createOpenCodeDriver(s, spec, h) {
     mcpServers: spec.mcp_servers,
     interactive: !!spec.interactive,
     questions: !!spec.questions,
+    taskWaits: spec.task_waits === true,
     instructionsPath,
     // The org's live ext/ catalog (#1446); both absent on a CP that predates it.
     models: spec.opencode_models,
@@ -177,8 +192,10 @@ export async function createOpenCodeDriver(s, spec, h) {
   // Run tools (#1392): the baked file tools long-poll the daemon's
   // /v1/platform-tools endpoint; the per-session bearer keeps other VM
   // processes from parking or waking the turn. ZWRM_AGENTD_PORT is exported
-  // by server.mjs at listen time.
-  if (!spec.interactive) {
+  // by server.mjs at listen time. Any session with a platform tool needs
+  // it: runs, and chats with task_waits (#1911).
+  const platformTools = new Set(platformToolNames(spec))
+  if (platformTools.size > 0) {
     s.platformToolsToken = randomBytes(16).toString('hex')
     childEnv.ZWRM_PLATFORM_TOOLS_URL =
       `http://127.0.0.1:${process.env.ZWRM_AGENTD_PORT || '9924'}/v1/platform-tools`
@@ -447,6 +464,9 @@ export async function createOpenCodeDriver(s, spec, h) {
     // ask arrives under OpenCode's wire name (`<slug>_<tool>`), and
     // mcp__<slug>__<tool> is what every harness's policy speaks (#731).
     const canonical = canonicalOpenCodeToolName(ask.permission ?? '', mcpSlugs)
+    // The session config allows the platform tools; should OpenCode ask
+    // anyway, no person is asked to approve one (#1911).
+    if (platformTools.has(canonical)) return reply('once')
     // Run policy: auto-approve everything except escalated connector tools.
     if (spec.auto_approve && !h.isEscalatedTool(canonical, spec.escalate_servers)) {
       return reply('once')

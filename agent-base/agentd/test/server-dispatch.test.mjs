@@ -312,3 +312,55 @@ test('claude never auto-approves a question, and keeps the tool for delegate run
   assert.match(src, /asksQuestions\(spec\) \? \{\} : \{ disallowedTools: \['AskUserQuestion'\] \}/)
   assert.match(await readFile(SERVER, 'utf8'), /'task-questions'/)
 })
+
+// ---- wait_for_task (#1911) ---------------------------------------------------
+
+const PI_DRIVER = join(dirname(fileURLToPath(import.meta.url)), '..', 'drivers', 'pi.mjs')
+
+test('task-waits (#1911): advertised next to the other caps', async () => {
+  const src = await readFile(SERVER, 'utf8')
+  const capsLine = src.split('\n').find((l) => l.trimStart().startsWith('caps:'))
+  assert.ok(capsLine.includes("'task-waits'"), 'the task-waits cap must be advertised')
+  assert.match(src, /\/\/ 'task-waits' \(#1911\)/, 'and explained like the others')
+})
+
+test('a member\'s message ends a task wait once it is taken; a platform message does not (#1911)', async () => {
+  const src = await readFile(SERVER, 'utf8')
+  const message = handlerBody(src, 'handleMessage')
+  const cancel = message.indexOf('if (!platform) cancelPendingParks(s, NEW_MESSAGE, NEW_MESSAGE_CANCELS)')
+  assert.ok(cancel !== -1, 'handleMessage must cancel task parks for a member\'s message, guarded on the platform source')
+  const queue = message.indexOf('s.driver.queueMessage(')
+  const refused = message.indexOf("return send(res, 409, { error: 'session is not accepting messages'")
+  const emitted = message.indexOf('emitUserMessage(s, visibleMessage)')
+  const accepted = message.lastIndexOf('send(res, 202, { queued: true })')
+  assert.ok(queue < cancel && refused < cancel && emitted < cancel, 'only once the message is taken and on the timeline')
+  assert.ok(cancel < accepted, 'before the 202')
+  assert.equal(message.split('cancelPendingParks(').length, 2, 'one cancel in handleMessage')
+  assert.match(src, /import \{[^}]*\bNEW_MESSAGE\b[^}]*\bNEW_MESSAGE_CANCELS\b[^}]*\} from '\.\/drivers\/run-tools\.mjs'/)
+})
+
+test('park cancellation passes bare reasons and leaves the wording to each park kind (#1911)', async () => {
+  const src = await readFile(SERVER, 'utf8')
+  // The wording lives in run-tools' parkCancellation, whose tests pin the
+  // sleep text byte for byte for exactly these reasons.
+  assert.doesNotMatch(src, /sleep aborted|Sleep aborted/, 'server.mjs must not phrase a cancellation itself')
+  const reasons = [...src.matchAll(/cancelPendingParks\(s, '([^']*)'\)/g)].map((m) => m[1]).sort()
+  assert.deepEqual(reasons, ['daemon shutting down', 'interrupted', 'session ended', 'session event delivery stopped'])
+  const start = src.indexOf('\nfunction cancelPendingParks(')
+  assert.ok(start !== -1)
+  const body = src.slice(start, src.indexOf('\nfunction ', start + 1))
+  assert.match(body, /parkCancellations\(s\.parks, reason, kinds\)/)
+  assert.match(body, /resolvePark\(s, c\.parkId, c\.resolution, c\.text\)/)
+})
+
+test('pi never asks a person to approve a platform tool, and builds them by the spec gate (#1911)', async () => {
+  // Source-text pin: the gate lives inside createPiDriver, which needs the
+  // pi SDK and a model to construct.
+  const src = await readFile(PI_DRIVER, 'utf8')
+  assert.match(src, /const platformTools = new Set\(platformToolNames\(spec\)\)/)
+  const policy = src.indexOf('if (spec.tool_policy) {')
+  const allow = src.indexOf('if (platformTools.has(ev.toolName) && !forceConfirm) return undefined')
+  const ask = src.indexOf("s.pusher.emit('permission.request'")
+  assert.ok(policy !== -1 && allow > policy && ask > allow, 'after the tool policy, before any permission request')
+  assert.match(src, /\.\.\.buildRunTools\(s, h, spec\)\]/, 'the tools come from the shared spec gate, not an interactive check')
+})

@@ -118,32 +118,41 @@ RUN curl -fsSL https://registry.npmjs.org/opencode-linux-x64/-/opencode-linux-x6
 # global AGENTS.md source — review caught the terminal path having neither).
 RUN printf 'export OPENCODE_DISABLE_AUTOUPDATE=1\nexport OPENCODE_DISABLE_MODELS_FETCH=1\nexport OPENCODE_DISABLE_LSP_DOWNLOAD=1\nexport OPENCODE_CONFIG_DIR=/etc/opencode\n' > /etc/profile.d/opencode-env.sh
 # /etc/opencode is the ROOT-OWNED opencode config root (#1392): the boot
-# config's apply step writes opencode.json here, and the run/ subtree carries
-# the platform's baked file tools (sleep, sleep_until — filename = tool name).
-# The agentd driver points OPENCODE_CONFIG_DIR at /etc/opencode for
-# interactive sessions and /etc/opencode/run for unattended runs, which is
-# what keeps the model user out of the config trust path and the sleep tools
-# out of interactive sessions.
-# session/ stays EMPTY: driver sessions point OPENCODE_CONFIG_DIR here so
-# they read neither the terminal AGENTS.md (their instructions arrive via the
-# session config's instructions file — reading both would double the prompt)
-# nor the run tools.
+# config's apply step writes opencode.json here, and login shells (the TUI
+# over SSH) use it as their config dir. The agentd driver points
+# OPENCODE_CONFIG_DIR at one of three subtrees instead, by session spec
+# (drivers/opencode.mjs openCodeConfigDir), which is what keeps the model
+# user out of the config trust path and each platform file tool out of the
+# sessions that must not have it (filename = tool name):
+#   run/            unattended runs: sleep, sleep_until, wait_for_task (the
+#                   session config turns wait_for_task off for a run without
+#                   task_waits)
+#   session-tasks/  chats that may wait for tasks (#1911): wait_for_task only
+#   session/        every other chat: EMPTY
+# Driver sessions read neither the terminal AGENTS.md (their instructions
+# arrive via the session config's instructions file — reading both would
+# double the prompt) nor a platform tool they were not given.
 COPY opencode-tools/ /etc/opencode/run/tool/
-# The run tools `import { tool } from "@opencode-ai/plugin"`. OpenCode resolves
-# a custom tool's imports with Bun's node_modules walk from the tool FILE up —
-# /etc/opencode/run/tool → /etc/opencode/run → … — never reaching the model
-# user's ~/.config/opencode where opencode self-installs the package. Vendor it
-# at /etc/opencode/run/node_modules, pinned to the binary's version (the plugin
-# API travels with opencode). Without this a RUN turn throws "Cannot find
-# module '@opencode-ai/plugin'" at tool-resolve time (SessionPrompt.run) and
-# completes empty — no assistant output, the model never reached. Interactive
-# sessions use the tools-free /etc/opencode/session dir and never import it.
-RUN mkdir -p /etc/opencode/session /etc/opencode/run \
+COPY opencode-tools/wait_for_task.ts /etc/opencode/session-tasks/tool/
+# The file tools `import { tool } from "@opencode-ai/plugin"`. OpenCode
+# resolves a custom tool's imports with Bun's node_modules walk from the tool
+# FILE up — /etc/opencode/run/tool → /etc/opencode/run → … — never reaching
+# the model user's ~/.config/opencode where opencode self-installs the
+# package. Vendor it next to each tool root (run/ and session-tasks/), pinned
+# to the binary's version (the plugin API travels with opencode). Without
+# this a turn throws "Cannot find module '@opencode-ai/plugin'" at
+# tool-resolve time (SessionPrompt.run) and completes empty — no assistant
+# output, the model never reached. session/ has no tools and never imports it.
+RUN mkdir -p /etc/opencode/session /etc/opencode/run /etc/opencode/session-tasks \
     && npm install --prefix /etc/opencode/run @opencode-ai/plugin@1.18.34 \
+    && npm install --prefix /etc/opencode/session-tasks @opencode-ai/plugin@1.18.34 \
     && npm cache clean --force \
     && chmod 755 /etc/opencode /etc/opencode/run /etc/opencode/run/tool /etc/opencode/session \
-    && chmod 644 /etc/opencode/run/tool/*.ts \
-    && test -d /etc/opencode/run/node_modules/@opencode-ai/plugin
+        /etc/opencode/session-tasks /etc/opencode/session-tasks/tool \
+    && chmod 644 /etc/opencode/run/tool/*.ts /etc/opencode/session-tasks/tool/*.ts \
+    && test -d /etc/opencode/run/node_modules/@opencode-ai/plugin \
+    && test -d /etc/opencode/session-tasks/node_modules/@opencode-ai/plugin \
+    && test "$(ls /etc/opencode/session-tasks/tool)" = wait_for_task.ts
 
 # -- zwrm CLI (from official releases) ----------------------------------------
 # Baseline only: this resolves "latest" when the layer is BUILT and the cached

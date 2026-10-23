@@ -62,6 +62,7 @@ import {
 } from './codex-tools.mjs'
 import { permissionDecisionPayload, contextUsagePayload } from '../event-payloads.mjs'
 import { todosFromCodexItem } from './todos.mjs'
+import { platformToolNames } from './run-tools.mjs'
 
 export function isStaleCodexTurnCompletion(doneId, currentTurnId, turnActive) {
   if (!doneId) return false
@@ -332,6 +333,10 @@ export async function createCodexDriver(s, spec, h) {
   // Codex request id -> platform permission request id, so a withdrawn
   // approval (serverRequest/resolved) can release the human waiting on it.
   const gateByCodexRequest = new Map()
+  // The platform tools this session declares (#803, #1911), by canonical
+  // name: they park the turn and run nothing, so no person is ever asked to
+  // approve one, in any mode.
+  const platformTools = new Set(platformToolNames(spec, 'mcp__platform__'))
   // Exactly one result per turn: a turn that both errors and completes must
   // not emit twice. A flag rather than an id comparison, because a turn whose
   // id we never learned would compare equal (null === null) to the next one.
@@ -529,7 +534,9 @@ export async function createCodexDriver(s, spec, h) {
         // wire name differs, but escalation policy must not.
         const canonical = canonicalToolName(wire)
         const args = params?.arguments ?? {}
-        const d = await gate(canonical, args, params?.callId, codexRequestId)
+        const d = platformTools.has(canonical)
+          ? { allow: true }
+          : await gate(canonical, args, params?.callId, codexRequestId)
         if (!d.allow) {
           return toolCallResponse(d.message || 'denied by user', false)
         }
@@ -864,11 +871,11 @@ export async function createCodexDriver(s, spec, h) {
       }
     }
   }
-  if (!spec.interactive) {
-    for (const rt of buildCodexRunTools(s, h)) {
-      toolSpecs.push(rt.spec)
-      toolHandlers.set(rt.spec.name, rt.run)
-    }
+  // The platform tools follow the shared spec gate: sleep/sleep_until on
+  // unattended runs, wait_for_task when spec.task_waits (#1911).
+  for (const rt of buildCodexRunTools(s, h, spec)) {
+    toolSpecs.push(rt.spec)
+    toolHandlers.set(rt.spec.name, rt.run)
   }
 
   // Point codex's own skills loader at the directory the platform seeds

@@ -59,6 +59,7 @@ function fakeQuery() {
 function newHarness() {
   const events = []
   const hooks = []
+  const parks = []
   let n = 0
   const turns = new TurnEventContext(() => `turn-${++n}`)
   const emit = (type, payload, opts = {}) => {
@@ -99,23 +100,29 @@ function newHarness() {
     isTurnDraining: () => turns.drainingTurnId !== null,
     resumeIfUnblocked: () => {},
     isEscalatedTool: () => false,
+    textResult: (text, isError = false) => ({ content: [{ type: 'text', text }], ...(isError ? { isError: true } : {}) }),
+    // Records each park and resolves it at once as a deadline wake would.
+    parkTurn: async (_sess, kind, payload, deadline, resultText) => {
+      parks.push({ kind, payload, deadline })
+      return { content: [{ type: 'text', text: resultText('') }] }
+    },
     VERSION: '0.0.0-test',
     MAX_SLEEP_SECONDS: 3600,
   }
-  return { s, h, events, hooks }
+  return { s, h, events, hooks, parks }
 }
 
 function build(spec = {}) {
   process.env.ZWRM_CLAUDE_BIN = process.execPath
   const fake = fakeQuery()
-  const { s, h, events, hooks } = newHarness()
+  const { s, h, events, hooks, parks } = newHarness()
   const driver = createClaudeDriver(s, { interactive: true, cwd: process.cwd(), ...spec }, h, {
     startQuery: fake.startQuery,
     drainGraceMs: GRACE_MS,
   })
   s.driver = driver
   driver.start()
-  return { s, h, driver, fake, events, hooks }
+  return { s, h, driver, fake, events, hooks, parks }
 }
 
 async function until(events, pred, what, timeoutMS = 2000) {
@@ -516,6 +523,32 @@ test("full access allows the CLI's own rm check without asking anyone (#1950)", 
   }
 })
 
+// ---- platform tools (#803, #1911) --------------------------------------------
+
+// platformTools reads the in-process platform server the driver mounted:
+// its tool names, or null when there is none.
+function platformTools(options) {
+  const server = options.mcpServers?.platform
+  if (!server) return null
+  assert.equal(server.type, 'sdk', 'the platform server is the in-process one')
+  return Object.keys(server.instance._registeredTools).sort()
+}
+
+test('the platform server follows the spec gate: runs sleep, task_waits waits, plain chats get none', async () => {
+  for (const [spec, want] of [
+    [{ interactive: false }, ['sleep', 'sleep_until']],
+    [{ interactive: false, task_waits: true }, ['sleep', 'sleep_until', 'wait_for_task']],
+    [{ interactive: true, task_waits: true }, ['wait_for_task']],
+    [{ interactive: true }, null],
+  ]) {
+    const { fake } = build(spec)
+    assert.deepEqual(platformTools(fake.options), want, JSON.stringify(spec))
+    // The CLI is told never to ask about them.
+    assert.deepEqual(fake.options.allowedTools, want ? want.map((n) => `mcp__platform__${n}`) : undefined, JSON.stringify(spec))
+    fake.end()
+  }
+})
+
 test('full access still puts a question to the person (#1950)', async () => {
   const { s, fake, events } = build()
   fake.options.canUseTool('AskUserQuestion', question, { toolUseID: 'toolu_q' })
@@ -599,5 +632,48 @@ test('leaving full access holds from the request on; a failed switch keeps the m
   assert.equal((await fake.options.canUseTool(rmCheck.toolName, rmCheck.input, rmCheck.opts)).behavior, 'allow')
   assert.equal(requests(events).length, 1)
   assert.equal(s.pending.size, 1)
+  fake.end()
+})
+
+test('canUseTool waves wait_for_task through in Ask mode and still asks about connector tools', async () => {
+  const { s, fake, events } = build({ interactive: true, task_waits: true, permission_mode: 'default' })
+  const allowed = await fake.options.canUseTool('mcp__platform__wait_for_task', { id: 'task_abc' }, {})
+  assert.deepEqual(allowed, { behavior: 'allow' })
+  assert.equal(events.filter((e) => e.type === 'permission.request').length, 0, 'no person is asked to approve a wait')
+
+  // A connector tool still asks.
+  const asked = fake.options.canUseTool('mcp__github__create_issue', {}, {})
+  await until(events, (ev) => ev.some((e) => e.type === 'permission.request'), 'the connector ask')
+  const [[id, p]] = [...s.pending.entries()]
+  s.pending.delete(id)
+  p.resolve({ behavior: 'deny', message: 'no' })
+  assert.equal((await asked).behavior, 'deny')
+  fake.end()
+})
+
+test('a chat without task_waits does not get wait_for_task waved through', async () => {
+  const { s, fake, events } = build({ interactive: true, permission_mode: 'default' })
+  const decided = fake.options.canUseTool('mcp__platform__wait_for_task', { id: 'task_abc' }, {})
+  await until(events, (ev) => ev.some((e) => e.type === 'permission.request'), 'the ask')
+  const [[id, p]] = [...s.pending.entries()]
+  s.pending.delete(id)
+  p.resolve({ behavior: 'deny', message: 'no' })
+  assert.equal((await decided).behavior, 'deny')
+  fake.end()
+})
+
+test('the platform server runs wait_for_task through the shared dispatcher', async () => {
+  const { fake, parks } = build({ interactive: true, task_waits: true })
+  const registered = fake.options.mcpServers.platform.instance._registeredTools.wait_for_task
+  const handler = registered.handler ?? registered.callback
+  assert.equal(typeof handler, 'function')
+  const r = await handler({ id: 'task_abc', timeout_seconds: 30 }, {})
+  assert.match(r.content[0].text, /^Stopped waiting after 30s: the task is still running\./)
+  // Absent timeout: the cap (this harness's 3600).
+  await handler({ id: 'task_abc' }, {})
+  assert.deepEqual(parks.map((p) => [p.kind, p.payload]), [
+    ['task', { task_id: 'task_abc', seconds: 30 }],
+    ['task', { task_id: 'task_abc', seconds: 3600 }],
+  ])
   fake.end()
 })

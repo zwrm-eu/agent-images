@@ -54,6 +54,7 @@ import {
 } from './pi-translate.mjs'
 import { buildBridgedTools } from './mcp-bridge.mjs'
 import { buildRunTools } from './pi-run-tools.mjs'
+import { platformToolNames } from './run-tools.mjs'
 import { evaluateToolPolicy } from './tool-policy.mjs'
 import { providerForModel } from './pi-provider.mjs'
 
@@ -183,6 +184,10 @@ export async function createPiDriver(s, spec, h) {
   }
   if (resolved.warning) h.log(`pi model resolution: ${resolved.warning}`)
 
+  // The platform tools this session has (#803, #1911): they park the turn
+  // and run nothing, so no person is ever asked to approve one, in any mode.
+  const platformTools = new Set(platformToolNames(spec))
+
   // The gate extension is registered unconditionally and consults `mode` at
   // call time, so a mid-session mode switch applies to the next tool call —
   // matching the claude driver's setPermissionMode semantics.
@@ -207,6 +212,7 @@ export async function createPiDriver(s, spec, h) {
           if (verdict.block) return { block: true, reason: verdict.reason }
           forceConfirm = Boolean(verdict.confirm)
         }
+        if (platformTools.has(ev.toolName) && !forceConfirm) return undefined
         if (mode === 'bypassPermissions' && !forceConfirm) return undefined
         if (spec.auto_approve && !forceConfirm && !h.isEscalatedTool(ev.toolName, spec.escalate_servers)) {
           return undefined
@@ -262,12 +268,14 @@ export async function createPiDriver(s, spec, h) {
 
   // The MCP → pi tools bridge (#1065): connectors + the reserved zwrm
   // session server surface as `mcp__<slug>__<tool>` custom tools, so the
-  // gate's escalation matching works unchanged. Unattended runs also get the
-  // native sleep/park tools (the claude driver's `platform` server analog).
+  // gate's escalation matching works unchanged. The native platform tools
+  // (the claude driver's `platform` server analog) follow the shared spec
+  // gate: sleep/sleep_until on unattended runs, wait_for_task when
+  // spec.task_waits (#1911), on runs and chats alike.
   // Built LAST among the fallible construction steps so an earlier throw
   // (resume jail, model resolution, loader) can't leak connected clients.
   const bridge = await buildBridgedTools(spec.mcp_servers, h.log, { cwd })
-  const customTools = [...bridge.tools, ...(spec.interactive ? [] : buildRunTools(s, h))]
+  const customTools = [...bridge.tools, ...buildRunTools(s, h, spec)]
 
   let session
   try {

@@ -33,6 +33,7 @@
 //    turn continue. Source: packages/opencode/src/question at the pinned tag.
 
 import { RUN_TOOL_NAMES } from './opencode-run-tools.mjs'
+import { WAIT_FOR_TASK, platformToolNames } from './run-tools.mjs'
 
 // OPENCODE_PROVIDER_ID is the provider key the platform's seeded opencode
 // config uses for the gateway (#1392). The driver names it on every prompt;
@@ -261,15 +262,18 @@ export const GATED_PERMISSIONS = { bash: 'ask', edit: 'ask', webfetch: 'ask', we
 //    call inside the platform gate — no bridge process.
 //  - permission: the gated native set, plus `<slug>_*: ask` for every MCP
 //    server so connector calls surface to the gate in Ask mode and to the
-//    escalation policy on runs — and run tools 'allow' (platform tools are
-//    never gated, matching every other harness).
+//    escalation policy on runs — and the session's platform tools 'allow'
+//    (platform tools are never gated, matching every other harness).
+//  - tools: wait_for_task off on a run without taskWaits (#1911). The run
+//    root bakes its file for every run; only a session the control plane
+//    gave task_waits may wait for a task.
 //  - instructions: the session's append_system_prompt (platform
 //    instructions + memory + run preamble), delivered as a file path because
 //    OpenCode's `instructions` APPEND to the system prompt — the codex
 //    developerInstructions rule: add, never replace.
 //
 // MCP URLs point at agentd's session proxy; serialized harness config holds no bearer.
-export function buildSessionConfig({ platform, mcpServers, interactive, questions, instructionsPath, models, catalogLive }) {
+export function buildSessionConfig({ platform, mcpServers, interactive, questions, taskWaits, instructionsPath, models, catalogLive }) {
   const cfg = { ...(platform && typeof platform === 'object' ? platform : {}) }
 
   // Live external-provider models (#1446). The boot seed is written once per
@@ -326,10 +330,8 @@ export function buildSessionConfig({ platform, mcpServers, interactive, question
     permission[`${slug}_*`] = 'ask'
   }
   if (Object.keys(mcp).length > 0) cfg.mcp = { ...(cfg.mcp || {}), ...mcp }
-  if (!interactive) {
-    permission.sleep = 'allow'
-    permission.sleep_until = 'allow'
-  }
+  const platformTools = platformToolNames({ interactive, task_waits: taskWaits === true })
+  for (const name of platformTools) permission[name] = 'allow'
   cfg.permission = { ...(cfg.permission || {}), ...permission }
   // The question tool (#1555) rides the platform permission channel: the
   // driver turns `question.asked` into a permission.request {kind: question}
@@ -345,7 +347,13 @@ export function buildSessionConfig({ platform, mcpServers, interactive, question
   // upstream dies — NOT the subagent, which was only incidental. The real fix
   // is the MCP timeout below, so task no longer needs disabling.
   // A delegate's run (#1912) keeps it too: the agent that asked answers.
-  cfg.tools = { ...(cfg.tools || {}), question: !!(interactive || questions) }
+  cfg.tools = {
+    ...(cfg.tools || {}),
+    question: !!(interactive || questions),
+    // A chat's root carries wait_for_task only when it has task_waits (the
+    // driver picks the root), so only a run needs it switched off.
+    ...(!interactive && !platformTools.includes(WAIT_FOR_TASK) ? { [WAIT_FOR_TASK]: false } : {}),
+  }
   // Bound every MCP call so a dead connector upstream can't wedge the session
   // (#1388) — see MCP_TOOL_TIMEOUT_MS.
   cfg.experimental = { ...(cfg.experimental || {}), mcp_timeout: MCP_TOOL_TIMEOUT_MS }
