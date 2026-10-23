@@ -83,8 +83,9 @@ function evaluatePlatform(toolName, input) {
   // Bridged platform tools (connectors + the zwrm session server) are the
   // assistant's intended surface; the gateway scopes what they reach.
   if (toolName.startsWith('mcp__')) return { allow: true }
-  // The platform's own turn-parking tools (unattended runs).
-  if (toolName === 'sleep' || toolName === 'sleep_until') return { allow: true }
+  // The platform's own turn-parking tools: sleep/sleep_until (unattended
+  // runs) and wait_for_task (#1911, runs and chats). They run nothing.
+  if (toolName === 'sleep' || toolName === 'sleep_until' || toolName === 'wait_for_task') return { allow: true }
   if (toolName === 'bash') return evaluateBash(input)
   return {
     block: true,

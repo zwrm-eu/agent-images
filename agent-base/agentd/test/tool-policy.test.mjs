@@ -25,6 +25,10 @@ test('mcp tools are allowed', () => {
 test('platform park tools are allowed', () => {
   assert.equal(evaluateToolPolicy('platform', 'sleep', {}).allow, true)
   assert.equal(evaluateToolPolicy('platform', 'sleep_until', {}).allow, true)
+  // wait_for_task (#1911) runs nothing: allowed in chats and runs alike.
+  for (const interactive of [true, false]) {
+    assert.deepEqual(evaluateToolPolicy('platform', 'wait_for_task', { id: 'task_abc' }, { interactive }), { allow: true })
+  }
 })
 
 test('native non-bash tools are blocked with a reason naming the policy', () => {

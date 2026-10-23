@@ -14,7 +14,24 @@ import { createTodoTracker } from './todos.mjs'
 import { asksQuestions, claudeQuestionDecision, claudeQuestionInput } from './questions.mjs'
 import { permissionDecisionPayload, contextUsagePayload, contextTokensFromUsage } from '../event-payloads.mjs'
 import { commandPrompt, normalizeCommandList, resolveCommand, pendingWithTimeout } from '../session-control.mjs'
-import { SLEEP_DESCRIPTION, SLEEP_UNTIL_DESCRIPTION, runSleep, runSleepUntil, mapOutcome } from './run-tools.mjs'
+import {
+  SLEEP,
+  SLEEP_UNTIL,
+  WAIT_FOR_TASK,
+  SLEEP_DESCRIPTION,
+  SLEEP_UNTIL_DESCRIPTION,
+  WAIT_FOR_TASK_DESCRIPTION,
+  TASK_ID_PATTERN,
+  runSleep,
+  runSleepUntil,
+  runWaitForTask,
+  mapOutcome,
+  platformToolNames,
+} from './run-tools.mjs'
+
+// The claude names of the platform tools: the in-process server is mounted
+// as 'platform', and the CP refuses connectors slugged so.
+const PLATFORM_PREFIX = 'mcp__platform__'
 
 // A compaction is one model call over the whole context (#1553); generous
 // so a long transcript on a slow model completes, bounded so a CLI that
@@ -209,27 +226,41 @@ function readOOMEvidence() {
 // buildPlatformServer exposes the in-process platform tools (#803) to the SDK
 // session. These are lifecycle-coupled (they block the turn and survive a VM
 // snapshot), which is exactly why they live here and not on the MCP gateway.
-// Unattended runs only: an interactive session (spec.interactive) has a live
-// consumer on the event stream — replies are delivered directly and sleeping
-// would park the VM mid-conversation — so it gets no platform server at all.
-function buildPlatformServer(s, h) {
+// names is the shared spec gate (platformToolNames): the sleep tools on
+// unattended runs only — an interactive session (spec.interactive) has a
+// live consumer on the event stream, replies are delivered directly and
+// sleeping would park the VM mid-conversation — and wait_for_task (#1911)
+// on either when spec.task_waits. A session with none gets no platform
+// server at all.
+function buildPlatformServer(s, h, names) {
+  const all = {
+    [SLEEP]: () => tool(
+      SLEEP,
+      SLEEP_DESCRIPTION(h.MAX_SLEEP_SECONDS),
+      { seconds: z.number().int().min(1).max(h.MAX_SLEEP_SECONDS).describe('How long to sleep, in seconds') },
+      ({ seconds }) => claudeOutcome(h, runSleep(s, h, { seconds })),
+    ),
+    [SLEEP_UNTIL]: () => tool(
+      SLEEP_UNTIL,
+      SLEEP_UNTIL_DESCRIPTION(h.MAX_SLEEP_SECONDS),
+      { timestamp: z.iso.datetime({ offset: true }).describe('ISO-8601 timestamp with a timezone, e.g. 2026-07-10T18:00:00Z') },
+      ({ timestamp }) => claudeOutcome(h, runSleepUntil(s, h, { timestamp })),
+    ),
+    [WAIT_FOR_TASK]: () => tool(
+      WAIT_FOR_TASK,
+      WAIT_FOR_TASK_DESCRIPTION(h.MAX_SLEEP_SECONDS),
+      {
+        id: z.string().regex(new RegExp(TASK_ID_PATTERN)).describe('The task id delegate returned, like task_<uuid>'),
+        timeout_seconds: z.number().int().min(1).max(h.MAX_SLEEP_SECONDS).optional()
+          .describe(`How long to wait at most, in seconds (default and max ${h.MAX_SLEEP_SECONDS})`),
+      },
+      ({ id, timeout_seconds }) => claudeOutcome(h, runWaitForTask(s, h, { id, timeout_seconds })),
+    ),
+  }
   return createSdkMcpServer({
     name: 'platform',
     version: h.VERSION,
-    tools: [
-      tool(
-        'sleep',
-        SLEEP_DESCRIPTION(h.MAX_SLEEP_SECONDS),
-        { seconds: z.number().int().min(1).max(h.MAX_SLEEP_SECONDS).describe('How long to sleep, in seconds') },
-        ({ seconds }) => claudeOutcome(h, runSleep(s, h, { seconds })),
-      ),
-      tool(
-        'sleep_until',
-        SLEEP_UNTIL_DESCRIPTION(h.MAX_SLEEP_SECONDS),
-        { timestamp: z.iso.datetime({ offset: true }).describe('ISO-8601 timestamp with a timezone, e.g. 2026-07-10T18:00:00Z') },
-        ({ timestamp }) => claudeOutcome(h, runSleepUntil(s, h, { timestamp })),
-      ),
-    ],
+    tools: names.map((name) => all[name]()),
   })
 }
 
@@ -307,6 +338,13 @@ export function createClaudeDriver(s, spec, h, { startQuery = query, drainGraceM
   // mode it is leaving.
   let modeChanges = 0
 
+  // The platform tools this session gets (#803, #1911), and their claude
+  // names. They park the turn and run nothing, so no person is ever asked to
+  // approve one, in any mode: allowedTools tells the CLI so, and canUseTool
+  // allows them should it ask anyway.
+  const platformTools = platformToolNames(spec)
+  const platformToolIds = new Set(platformTools.map((n) => PLATFORM_PREFIX + n))
+
   const canUseTool = async (toolName, input, opts = {}) => {
     // After /end, the in-flight turn may still reach for another tool; a new
     // pending prompt would wedge the wind-down forever, so deny immediately
@@ -314,6 +352,7 @@ export function createClaudeDriver(s, spec, h, { startQuery = query, drainGraceM
     if (s.ending) {
       return { behavior: 'deny', message: 'session ended', interrupt: false }
     }
+    if (platformToolIds.has(toolName)) return { behavior: 'allow' }
     // Full access asks nobody. The CLI still calls this in bypassPermissions
     // for the checks it lets no mode or rule skip: an rm whose target it
     // can't resolve, one on the working directory or a parent of it, a
@@ -401,6 +440,7 @@ export function createClaudeDriver(s, spec, h, { startQuery = query, drainGraceM
     // permission flow, which carries answers via updated_input.
     // A delegate's run (#1912) keeps it: the agent that asked answers.
     ...(asksQuestions(spec) ? {} : { disallowedTools: ['AskUserQuestion'] }),
+    ...(platformToolIds.size > 0 ? { allowedTools: [...platformToolIds] } : {}),
     // The Agent SDK defaults to an EMPTY system prompt and no settings files.
     // Interactive sessions want stock Claude Code behavior: the claude_code
     // preset plus the seeded ~/.claude/CLAUDE.md platform instructions ('user')
@@ -432,16 +472,15 @@ export function createClaudeDriver(s, spec, h, { startQuery = query, drainGraceM
     // Connector tools (#730): the CP passes SDK mcpServers entries verbatim —
     // typically one http entry (gateway endpoint + platform bearer token).
     // Tool calls surface as mcp__{server}__{tool} through canUseTool. The
-    // in-process 'platform' server (#803) is mounted for unattended runs
-    // only; the name stays reserved either way (the CP refuses connectors
-    // slugged 'platform').
+    // in-process 'platform' server (#803) is mounted when the session has a
+    // platform tool (unattended runs, and chats with task_waits, #1911); the
+    // name stays reserved either way (the CP refuses connectors slugged
+    // 'platform').
     mcpServers: (() => {
       const servers = { ...(spec.mcp_servers || {}) }
-      // Platform tools are unattended-run machinery; interactive sessions
-      // (spec.interactive, see buildPlatformServer) don't get them.
-      if (!spec.interactive) {
+      if (platformTools.length > 0) {
         if (servers.platform) h.log(`warning: connector server 'platform' is shadowed by the platform tools`)
-        servers.platform = buildPlatformServer(s, h)
+        servers.platform = buildPlatformServer(s, h, platformTools)
       }
       return servers
     })(),

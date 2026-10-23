@@ -6,6 +6,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
   CODEX_TOOL_PREFIX,
+  buildCodexRunTools,
   canonicalToolName,
   codexToolName,
   codexToolSpec,
@@ -37,6 +38,7 @@ test('the wire name canonicalizes back to the platform name', () => {
   assert.equal(canonicalToolName('zwrm__a__b__c'), 'mcp__a__b__c')
   // Platform run tools are not connector tools and are left alone.
   assert.equal(canonicalToolName('zwrm__platform__sleep'), 'mcp__platform__sleep')
+  assert.equal(canonicalToolName('zwrm__platform__wait_for_task'), 'mcp__platform__wait_for_task')
   // Anything without the prefix passes through untouched.
   assert.equal(canonicalToolName('shell'), 'shell')
   assert.equal(canonicalToolName(''), '')
@@ -97,4 +99,17 @@ test('the fingerprint tracks the CONNECTOR set only', () => {
   // fingerprint made chat and runs on one workspace disagree forever — every
   // alternation between them discarded the conversation.
   assert.equal(connectorFingerprint({ zwrm: {} }), connectorFingerprint({ zwrm: {} }))
+})
+
+test('wait_for_task rides the platform wire name and follows the spec gate (#1911)', () => {
+  const h = { MAX_SLEEP_SECONDS: 21600, parkTurn: async () => ({ content: [] }) }
+  const names = (spec) => buildCodexRunTools({ ending: false }, h, spec).map((t) => t.spec.name)
+  assert.deepEqual(names({ interactive: true, task_waits: true }), ['zwrm__platform__wait_for_task'])
+  assert.deepEqual(names({ interactive: true }), [])
+  assert.deepEqual(names({ interactive: false }), ['zwrm__platform__sleep', 'zwrm__platform__sleep_until'])
+  assert.deepEqual(names({ interactive: false, task_waits: true }),
+    ['zwrm__platform__sleep', 'zwrm__platform__sleep_until', 'zwrm__platform__wait_for_task'])
+  const [wait] = buildCodexRunTools({ ending: false }, h, { interactive: true, task_waits: true })
+  assert.deepEqual(wait.spec.inputSchema.required, ['id'])
+  assert.equal(wait.spec.inputSchema.properties.timeout_seconds.maximum, 21600)
 })

@@ -3,11 +3,85 @@
 // long-poll → park) was probed against the real binary with a 65s hold.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { readdirSync, readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
+import { dirname, join } from 'node:path'
 import { RUN_TOOL_NAMES, handlePlatformTool } from '../drivers/opencode-run-tools.mjs'
+import { SLEEP_DESCRIPTION, SLEEP_UNTIL_DESCRIPTION, TASK_ID_PATTERN, WAIT_FOR_TASK_DESCRIPTION } from '../drivers/run-tools.mjs'
 import { fakeHelpers as deps } from './fake-park.mjs'
 
+const TOOLS_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'opencode-tools')
+const DOCKERFILE = join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'Dockerfile')
+
 test('the tool names double as the baked filenames', () => {
-  assert.deepEqual(RUN_TOOL_NAMES, ['sleep', 'sleep_until'])
+  assert.deepEqual(RUN_TOOL_NAMES, ['sleep', 'sleep_until', 'wait_for_task'])
+  // Every name has its file and every file is a name: a tool the daemon
+  // cannot dispatch, or a dispatch with no file behind it, fails here.
+  const files = readdirSync(TOOLS_DIR).filter((f) => f.endsWith('.ts')).map((f) => f.slice(0, -3)).sort()
+  assert.deepEqual(files, [...RUN_TOOL_NAMES].sort())
+})
+
+test('each baked file tool tells the model what the other harnesses do, and calls its own endpoint', () => {
+  // The file tools run in OpenCode's Bun runtime and cannot import the
+  // shared text, so it is pinned here: at the 6-hour cap the daemon ships.
+  const want = {
+    sleep: SLEEP_DESCRIPTION(21600),
+    sleep_until: SLEEP_UNTIL_DESCRIPTION(21600),
+    wait_for_task: WAIT_FOR_TASK_DESCRIPTION(21600),
+  }
+  for (const [name, description] of Object.entries(want)) {
+    const src = readFileSync(join(TOOLS_DIR, `${name}.ts`), 'utf8')
+    const m = src.match(/description:\s*"([^"]*)"/)
+    assert.ok(m, `${name}.ts has no description`)
+    assert.equal(m[1], description, `${name}.ts`)
+    assert.ok(src.includes(`\${process.env.ZWRM_PLATFORM_TOOLS_URL}/${name}\``), `${name}.ts must call /${name}`)
+  }
+  // The id check is the shared one, so OpenCode's own schema refuses what
+  // the daemon would.
+  const wait = readFileSync(join(TOOLS_DIR, 'wait_for_task.ts'), 'utf8')
+  assert.ok(wait.includes(`.regex(/${TASK_ID_PATTERN}/)`), 'wait_for_task.ts must check the id with TASK_ID_PATTERN')
+  assert.match(wait, /\.max\(21600\)\s*\.optional\(\)/, 'timeout_seconds is optional and capped')
+})
+
+test('the image bakes wait_for_task alone into the chat tasks root, with the plugin it imports', () => {
+  const src = readFileSync(DOCKERFILE, 'utf8')
+  assert.match(src, /^COPY opencode-tools\/ \/etc\/opencode\/run\/tool\/$/m, 'every tool goes to the run root')
+  assert.match(src, /^COPY opencode-tools\/wait_for_task\.ts \/etc\/opencode\/session-tasks\/tool\/$/m,
+    'only wait_for_task goes to the session-tasks root')
+  assert.match(src, /npm install --prefix \/etc\/opencode\/session-tasks @opencode-ai\/plugin@/)
+  assert.match(src, /test -d \/etc\/opencode\/session-tasks\/node_modules\/@opencode-ai\/plugin/)
+  // The session-tasks plugin pin is the run root's.
+  const pins = [...src.matchAll(/npm install --prefix \/etc\/opencode\/(\S+) @opencode-ai\/plugin@(\S+)/g)]
+  assert.deepEqual(pins.map((m) => m[1]).sort(), ['run', 'session-tasks'])
+  assert.equal(new Set(pins.map((m) => m[2])).size, 1, 'one plugin version for both roots')
+})
+
+test('wait_for_task parks a task park and returns the resolution or the still-running text', async () => {
+  const s = { ending: false, spec: { interactive: true, task_waits: true } }
+  const parks = []
+  const r = await handlePlatformTool(s, deps(parks), 'wait_for_task', { id: 'task_abc', timeout_seconds: 60 })
+  assert.equal(r.status, 200)
+  assert.match(r.body.text, /^Stopped waiting after 60s: the task is still running\./)
+  assert.equal(parks.length, 1)
+  assert.equal(parks[0].kind, 'task')
+  assert.deepEqual(parks[0].payload, { task_id: 'task_abc', seconds: 60 })
+
+  const told = await handlePlatformTool(s, deps([], 21600, 'Task task_abc finished: done.'), 'wait_for_task', { id: 'task_abc' })
+  assert.deepEqual(told, { status: 200, body: { text: 'Task task_abc finished: done.' } })
+
+  for (const bad of [{}, { id: 'abc' }, { id: 'task_abc', timeout_seconds: 0 }, { id: 'task_abc', timeout_seconds: '60' }, { id: 'task_abc', timeout_seconds: 21601 }]) {
+    assert.equal((await handlePlatformTool(s, deps([]), 'wait_for_task', bad)).status, 400, JSON.stringify(bad))
+  }
+  assert.equal((await handlePlatformTool({ ...s, ending: true }, deps([]), 'wait_for_task', { id: 'task_abc' })).status, 409)
+})
+
+test('the endpoint serves only the tools the session spec gives it', async () => {
+  const run = { interactive: false }
+  const chatTasks = { interactive: true, task_waits: true }
+  assert.equal((await handlePlatformTool({ ending: false, spec: run }, deps([]), 'wait_for_task', { id: 'task_abc' })).status, 404)
+  assert.equal((await handlePlatformTool({ ending: false, spec: chatTasks }, deps([]), 'sleep', { seconds: 5 })).status, 404)
+  assert.equal((await handlePlatformTool({ ending: false, spec: { interactive: true } }, deps([]), 'wait_for_task', { id: 'task_abc' })).status, 404)
+  assert.equal((await handlePlatformTool({ ending: false, spec: { ...run, task_waits: true } }, deps([]), 'wait_for_task', { id: 'task_abc' })).status, 200)
 })
 
 test('sleep validates, parks with a deadline, and returns the wake text', async () => {
@@ -61,7 +135,8 @@ test('baked run tools import only the vendored module set (#1392)', async () => 
   const { dirname, join } = await import('node:path')
   const toolsDir = join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'opencode-tools')
   // Kept in lockstep with the Dockerfile's `npm install --prefix
-  // /etc/opencode/run`. Extend BOTH together when a tool needs a new import.
+  // /etc/opencode/run` (and /etc/opencode/session-tasks, for wait_for_task).
+  // Extend them together when a tool needs a new import.
   const VENDORED = new Set(['@opencode-ai/plugin'])
   const files = readdirSync(toolsDir).filter((f) => f.endsWith('.ts'))
   assert.ok(files.length > 0, 'no run tools found to check')

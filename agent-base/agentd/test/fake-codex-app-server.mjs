@@ -170,6 +170,16 @@ async function runTurn(turnId) {
     })
   }
 
+  if (scenario === 'wait-for-task') {
+    // The model waits for a task it asked for (#1911): a platform tool the
+    // daemon runs without asking anyone, in any permission mode.
+    const reply = await ask('item/tool/call', {
+      threadId: THREAD_ID, turnId, callId: 'call-w', namespace: null,
+      tool: 'zwrm__platform__wait_for_task', arguments: { id: 'task_abc', timeout_seconds: 60 },
+    })
+    trace('__toolReply', reply)
+  }
+
   if (scenario === 'unknown-tool') {
     const reply = await ask('item/tool/call', {
       threadId: THREAD_ID, turnId, callId: 'call-2', namespace: null,

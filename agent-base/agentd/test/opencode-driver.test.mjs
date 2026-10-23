@@ -6,7 +6,7 @@
 // pre-#1392 connector refusal.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { createOpenCodeDriver } from '../drivers/opencode.mjs'
+import { CONFIG_DIR_INTERACTIVE, CONFIG_DIR_RUN, CONFIG_DIR_TASKS, createOpenCodeDriver, openCodeConfigDir } from '../drivers/opencode.mjs'
 import { startFakeOpenCode } from './fake-opencode-server.mjs'
 
 function newHarness({ spec = {} } = {}) {
@@ -988,6 +988,80 @@ test('interrupt rejects an open question exactly once, via the cancelled pending
     assert.deepEqual(fake.state.questionReplies, [{ questionID: 'que_i', rejected: true }])
     assert.equal(s.pending.size, 0)
     assert.equal(fake.state.aborts, 1)
+    fake.assertNoViolations(assert)
+  } finally {
+    await fake.close()
+  }
+})
+
+// ---- wait_for_task (#1911) ---------------------------------------------------
+
+test('the config root follows the spec: run tools, a chat\'s wait_for_task alone, or none', () => {
+  // The roots the Dockerfile bakes (opencode-run-tools tests pin that side).
+  assert.equal(CONFIG_DIR_RUN, '/etc/opencode/run')
+  assert.equal(CONFIG_DIR_TASKS, '/etc/opencode/session-tasks')
+  assert.equal(CONFIG_DIR_INTERACTIVE, '/etc/opencode/session')
+  assert.equal(openCodeConfigDir({ interactive: false }), CONFIG_DIR_RUN)
+  assert.equal(openCodeConfigDir({ interactive: false, task_waits: true }), CONFIG_DIR_RUN)
+  assert.equal(openCodeConfigDir({ interactive: true }), CONFIG_DIR_INTERACTIVE)
+  assert.equal(openCodeConfigDir({ interactive: true, task_waits: true }), CONFIG_DIR_TASKS)
+})
+
+test('a session with a platform tool gets the platform-tools bearer; a plain chat does not', async () => {
+  for (const [spec, wants] of [
+    [{ interactive: false }, true],
+    [{ interactive: false, task_waits: true }, true],
+    [{ interactive: true, task_waits: true }, true],
+    [{ interactive: true }, false],
+  ]) {
+    const fake = await startFakeOpenCode()
+    try {
+      const { s, driver } = await build(fake, newHarness({ spec }))
+      assert.equal(typeof s.platformToolsToken === 'string' && s.platformToolsToken.length > 0, wants, JSON.stringify(spec))
+      await driver.shutdownStop()
+    } finally {
+      await fake.close()
+    }
+  }
+})
+
+test('Ask mode never asks a person about wait_for_task; other tools still ask', async () => {
+  const fake = await startFakeOpenCode()
+  try {
+    const { s, driver, events } = await build(fake, newHarness({ spec: { interactive: true, task_waits: true, permission_mode: 'default' } }))
+    driver.start()
+    driver.queueMessage('go')
+    await until(events, () => fake.state.prompts.length === 1, 'prompt')
+    const sid = s.sdkSessionId
+
+    fake.emit('permission.asked', { id: 'per_w', sessionID: sid, permission: 'wait_for_task', metadata: {}, tool: { callID: 'c1' } })
+    await until([], () => fake.state.replies.length === 1, 'the allow')
+    assert.deepEqual(fake.state.replies[0], { permissionID: 'per_w', response: 'once' })
+    assert.equal(ofType(events, 'permission.request').length, 0)
+
+    fake.emit('permission.asked', { id: 'per_b', sessionID: sid, permission: 'bash', metadata: {}, tool: { callID: 'c2' } })
+    await until(events, (ev) => ofType(ev, 'permission.request').length === 1, 'the bash ask')
+    s.pending.get('per_b').resolve({ behavior: 'deny', message: 'no' })
+    s.pending.delete('per_b')
+    await until([], () => fake.state.replies.length === 2, 'the reject')
+    fake.assertNoViolations(assert)
+  } finally {
+    await fake.close()
+  }
+})
+
+test('a chat without task_waits does not get wait_for_task waved through', async () => {
+  const fake = await startFakeOpenCode()
+  try {
+    const { s, driver, events } = await build(fake, newHarness({ spec: { interactive: true, permission_mode: 'default' } }))
+    driver.start()
+    driver.queueMessage('go')
+    await until(events, () => fake.state.prompts.length === 1, 'prompt')
+    fake.emit('permission.asked', { id: 'per_w', sessionID: s.sdkSessionId, permission: 'wait_for_task', metadata: {}, tool: { callID: 'c1' } })
+    await until(events, (ev) => ofType(ev, 'permission.request').length === 1, 'the ask')
+    s.pending.get('per_w').resolve({ behavior: 'deny', message: 'no' })
+    s.pending.delete('per_w')
+    await until([], () => fake.state.replies.length === 1, 'the reject')
     fake.assertNoViolations(assert)
   } finally {
     await fake.close()

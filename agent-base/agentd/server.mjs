@@ -40,7 +40,7 @@ import { promisify } from 'node:util'
 import { DRIVERS, HARNESSES, HARNESS_CAPS, unsupportedPermissionMode } from './drivers/registry.mjs'
 import { handlePlatformTool } from './drivers/opencode-run-tools.mjs'
 import { answeredQuestions } from './drivers/questions.mjs'
-import { parkDeadlineError } from './drivers/run-tools.mjs'
+import { NEW_MESSAGE, NEW_MESSAGE_CANCELS, parkCancellations, parkDeadlineError } from './drivers/run-tools.mjs'
 import { TOOL_POLICIES } from './drivers/tool-policy.mjs'
 import { countBackgroundTasks, createTaskLedger } from './drivers/claude-tasks.mjs'
 import { seedState, waitSeedClear, SEED_WAIT_MAX_MS, SEED_FAILED_MESSAGE } from './seedgate.mjs'
@@ -240,11 +240,13 @@ function resumeIfUnblocked(s) {
 
 // ---- platform tool parks (#803) ---------------------------------------------
 //
-// A platform tool (sleep, sleep_until) blocks its turn on a promise and emits
-// a typed park.request; the control plane records it, the VM idle-suspends
-// (the snapshot preserves this promise), and the park-wake sweep resolves it
-// at the deadline via POST /parks/{id}/resolve. resultText renders the tool
-// result the blocked call returns on wake.
+// A platform tool (sleep, sleep_until, wait_for_task) blocks its turn on a
+// promise and emits a typed park.request; the control plane records it, the
+// VM idle-suspends (the snapshot preserves this promise), and the control
+// plane resolves it via POST /parks/{id}/resolve: the park-wake sweep at the
+// deadline, and for a task park (#1911) also when its task finishes or asks
+// a question. resultText renders the tool result the blocked call returns
+// on wake.
 
 function parkTurn(s, kind, payload, deadline, resultText) {
   // The run tools validate before parking; this is the mechanism's own
@@ -274,16 +276,17 @@ function resolvePark(s, parkId, message, finalText) {
   return true
 }
 
-// Resolve every outstanding park with an ABORT result. Mirrors
-// cancelPendingPermissions: an ended/interrupted session must never leave the
-// SDK waiting on a promise nobody will resolve — but unlike a normal wake,
-// the returned text must tell the model to wrap up, not to continue: in
+// Resolve every outstanding park (or only those of kinds) with an ABORT
+// result. Mirrors cancelPendingPermissions: an ended/interrupted session must
+// never leave the SDK waiting on a promise nobody will resolve — but unlike a
+// normal wake, the returned text says why it ended, in each kind's words
+// (parkCancellation): a sleep is told to wrap up, not to continue, since in
 // bypassPermissions nothing else stops the resumed turn from doing more work
-// after the end was requested.
-function cancelPendingParks(s, message) {
-  for (const parkId of [...s.parks.keys()]) {
-    resolvePark(s, parkId, message,
-      `Sleep aborted: ${message}. Do not start new work — stop now, with at most a one-line note of where you left off.`)
+// after the end was requested; a task wait is told its task goes on and the
+// result comes later. reason is bare ('interrupted', 'session ended', …).
+function cancelPendingParks(s, reason, kinds = null) {
+  for (const c of parkCancellations(s.parks, reason, kinds)) {
+    resolvePark(s, c.parkId, c.resolution, c.text)
   }
 }
 
@@ -969,6 +972,12 @@ async function handleMessage(req, res, s) {
   }
   if (s.state === 'starting') s.deferredMessages.push(visibleMessage)
   else emitUserMessage(s, visibleMessage)
+  // A member spoke while the turn waits for a task (#1911): the wait ends
+  // so the turn can answer them, and the task's result comes later as a
+  // platform message. Only once the message is taken, and never for the
+  // control plane's own messages (a task result is one); a sleep is the
+  // run's own plan and stays.
+  if (!platform) cancelPendingParks(s, NEW_MESSAGE, NEW_MESSAGE_CANCELS)
   send(res, 202, { queued: true })
 }
 
@@ -1072,7 +1081,7 @@ function emitUserMessage(s, message) {
 async function handleInterrupt(res, s) {
   // Parks have no SDK abort signal (unlike canUseTool promises): resolve them
   // before interrupting so the aborted turn is never left waiting on one.
-  cancelPendingParks(s, 'interrupted; sleep aborted')
+  cancelPendingParks(s, 'interrupted')
   // Close immediately so a message accepted while the driver interrupt is
   // awaiting can open a distinct canonical turn instead of being mislabeled
   // as steering the cancelled one.
@@ -1209,7 +1218,7 @@ async function handleMode(req, res, s) {
 function handleEnd(res, s) {
   s.ending = true
   cancelPendingPermissions(s, 'session ended')
-  cancelPendingParks(s, 'session ended; sleep aborted')
+  cancelPendingParks(s, 'session ended')
   s.driver.beginEnd()
   send(res, 202, { ending: true })
 }
@@ -1229,7 +1238,7 @@ function endUndeliverable(s, reason) {
   log(`session ${s.id}: event delivery stopped (${reason}); ending the session`)
   s.ending = true
   cancelPendingPermissions(s, 'session event delivery stopped')
-  cancelPendingParks(s, 'session event delivery stopped; sleep aborted')
+  cancelPendingParks(s, 'session event delivery stopped')
   s.driver?.beginEnd()
   // A turn in flight would run on unseen, spending tokens and running tools
   // (claude's model credential is not brokered): interrupt it, as the
@@ -1292,7 +1301,8 @@ const server = createServer(async (req, res) => {
     // opencode child's file tools with the PER-SESSION bearer, not the
     // daemon token — so this dispatches BEFORE the global token gate (which
     // would 401 it; caught in review) and does its own constant-time check.
-    // parkTurn blocks the response until the wake.
+    // parkTurn blocks the response until the wake. Chats with task_waits
+    // (#1911) call it too, for wait_for_task.
     if (req.method === 'POST' && url.pathname.startsWith('/v1/platform-tools/')) {
       const s = session
       if (!s || !platformToolsTokenMatches(s, token)) return send(res, 401, { error: 'unauthorized' })
@@ -1372,7 +1382,13 @@ const server = createServer(async (req, res) => {
         // (claude: snapshot false; codex: a thread whose instructions_scope
         // changed is rebuilt without its old developer instructions). The
         // CP resumes a chat shared since its conversation began only here.
-        caps: ['mcp', 'escalation', 'files', 'file-search', 'message-context', 'bulk-attachments', 'park', 'reclaim', 'skillfetch', 'pi-multiprovider', 'pi-gateway', 'opencode-gateway', 'background-tasks', 'tool-policy', 'agent-identity', 'commands', 'shell', 'model-switch', 'compact', 'image-mcp', 'desktop', 'speaker-attribution', 'session-instructions', 'platform-messages', 'task-questions', ...HARNESS_CAPS],
+        // 'task-waits' (#1911): a spec's task_waits gives the session the
+        // wait_for_task platform tool on every harness, in runs and chats
+        // alike, which parks the turn on a task (park kind 'task') until the
+        // CP resolves it with the task's result or question, or the deadline
+        // passes; a member's message ends the wait. The CP sets task_waits
+        // only on a daemon with it.
+        caps: ['mcp', 'escalation', 'files', 'file-search', 'message-context', 'bulk-attachments', 'park', 'reclaim', 'skillfetch', 'pi-multiprovider', 'pi-gateway', 'opencode-gateway', 'background-tasks', 'tool-policy', 'agent-identity', 'commands', 'shell', 'model-switch', 'compact', 'image-mcp', 'desktop', 'speaker-attribution', 'session-instructions', 'platform-messages', 'task-questions', 'task-waits', ...HARNESS_CAPS],
         active_session: session && !isDone(session) ? session.id : null,
         state: session?.state ?? null,
         // A session ended because its events could no longer reach the
@@ -1513,7 +1529,7 @@ async function shutdown(sig) {
   const s = session
   if (s && !isDone(s)) {
     cancelPendingPermissions(s, 'daemon shutting down')
-    cancelPendingParks(s, 'daemon shutting down; sleep aborted')
+    cancelPendingParks(s, 'daemon shutting down')
     await s.driver.shutdownStop()
     // Let the driver finish and emit its terminal events BEFORE draining —
     // drain() stops the pusher, after which nothing more can be sent.

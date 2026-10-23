@@ -168,10 +168,38 @@ test('session config for runs allows the platform run tools', () => {
   assert.equal(cfg.instructions, undefined)
 })
 
+test('session config: wait_for_task is allowed exactly where task_waits gives it (#1911)', () => {
+  // A chat that may wait for tasks: wait_for_task allowed (never asked about
+  // in Ask mode), and no sleep tools.
+  const chat = buildSessionConfig({ platform: null, mcpServers: {}, interactive: true, taskWaits: true })
+  assert.equal(chat.permission.wait_for_task, 'allow')
+  assert.equal(chat.permission.sleep, undefined)
+  assert.equal(chat.permission.sleep_until, undefined)
+  // Its root carries no other platform file, so nothing needs switching off.
+  assert.deepEqual(chat.tools, { question: true })
+
+  const plainChat = buildSessionConfig({ platform: null, mcpServers: {}, interactive: true })
+  assert.equal(plainChat.permission.wait_for_task, undefined)
+  assert.deepEqual(plainChat.tools, { question: true })
+
+  // A run's root bakes wait_for_task's file for every run: switched off
+  // without task_waits, allowed with it.
+  const run = buildSessionConfig({ platform: null, mcpServers: {}, interactive: false })
+  assert.equal(run.permission.wait_for_task, undefined)
+  assert.equal(run.tools.wait_for_task, false)
+  const runTasks = buildSessionConfig({ platform: null, mcpServers: {}, interactive: false, taskWaits: true })
+  assert.equal(runTasks.permission.wait_for_task, 'allow')
+  assert.equal(runTasks.permission.sleep, 'allow')
+  assert.equal(runTasks.tools.wait_for_task, undefined)
+  // Only a real true opens it.
+  assert.equal(buildSessionConfig({ platform: null, mcpServers: {}, interactive: false, taskWaits: 'yes' }).tools.wait_for_task, false)
+})
+
 test('run-tool wire names never canonicalize, even under a colliding slug', () => {
   // A connector slugged 'sleep' must not rewrite the platform run tools.
   assert.equal(canonicalOpenCodeToolName('sleep_until', ['sleep']), 'sleep_until')
   assert.equal(canonicalOpenCodeToolName('sleep', ['sleep']), 'sleep')
+  assert.equal(canonicalOpenCodeToolName('wait_for_task', ['wait', 'wait_for']), 'wait_for_task')
   // Its own genuine tools still canonicalize.
   assert.equal(canonicalOpenCodeToolName('sleep_check_alarm', ['sleep']), 'mcp__sleep__check_alarm')
 })

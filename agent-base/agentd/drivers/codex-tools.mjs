@@ -1,4 +1,19 @@
-import { SLEEP_DESCRIPTION, SLEEP_UNTIL_DESCRIPTION, sleepInputSchema, sleepUntilInputSchema, runSleep, runSleepUntil, mapOutcome } from './run-tools.mjs'
+import {
+  SLEEP,
+  SLEEP_UNTIL,
+  WAIT_FOR_TASK,
+  SLEEP_DESCRIPTION,
+  SLEEP_UNTIL_DESCRIPTION,
+  WAIT_FOR_TASK_DESCRIPTION,
+  sleepInputSchema,
+  sleepUntilInputSchema,
+  waitForTaskInputSchema,
+  runSleep,
+  runSleepUntil,
+  runWaitForTask,
+  mapOutcome,
+  platformToolNames,
+} from './run-tools.mjs'
 
 // Codex dynamic-tool layer (#1090): renders the session's tools as codex
 // `DynamicToolSpec`s and dispatches the `item/tool/call` server requests they
@@ -90,7 +105,7 @@ export function mcpResultToCodex(result) {
 // It fingerprints the configured connector SLUGS, deliberately, not the
 // discovered tool list:
 //   - the run tools are NOT connectors and differ by session kind (a run
-//     declares sleep/sleep_until, a chat declares none). Including them would
+//     declares sleep/sleep_until, a chat at most wait_for_task). Including them would
 //     make chat and runs on the same workspace disagree forever, so every
 //     alternation between them would throw the conversation away — which is
 //     the normal usage pattern, not an edge case;
@@ -109,32 +124,48 @@ export function connectorFingerprint(mcpServers) {
   return Object.keys(mcpServers || {}).sort().join(',')
 }
 
-// buildCodexRunTools renders the platform run tools (#803) as dynamic tools:
-// the same semantics and model-facing text as the claude driver's in-process
-// `platform` MCP server and pi's native ones, dispatched through the shared
-// run-tools module (#1493) so validation is identical. Unattended runs only —
-// an interactive session has a human on the stream.
-export function buildCodexRunTools(s, h) {
-  return [
-    {
+// buildCodexRunTools renders the platform run tools (#803, #1911) as dynamic
+// tools: the same semantics and model-facing text as the claude driver's
+// in-process `platform` MCP server and pi's native ones, dispatched through
+// the shared run-tools module (#1493) so validation is identical. Which
+// tools is the shared spec gate (platformToolNames): sleep/sleep_until on
+// unattended runs only (an interactive session has a human on the stream),
+// wait_for_task on either when sessionSpec.task_waits.
+//
+// Codex declares dynamic tools on thread/start only and re-offers the
+// thread's own set on resume (connectorFingerprint), so a thread created
+// without wait_for_task never gains it; a fresh thread does.
+export function buildCodexRunTools(s, h, sessionSpec) {
+  const all = {
+    [SLEEP]: {
       spec: {
         type: 'function',
-        name: 'zwrm__platform__sleep',
+        name: codexToolName('platform', SLEEP),
         description: SLEEP_DESCRIPTION(h.MAX_SLEEP_SECONDS),
         inputSchema: sleepInputSchema(h.MAX_SLEEP_SECONDS),
       },
       run: (args) => codexOutcome(runSleep(s, h, args)),
     },
-    {
+    [SLEEP_UNTIL]: {
       spec: {
         type: 'function',
-        name: 'zwrm__platform__sleep_until',
+        name: codexToolName('platform', SLEEP_UNTIL),
         description: SLEEP_UNTIL_DESCRIPTION(h.MAX_SLEEP_SECONDS),
         inputSchema: sleepUntilInputSchema(),
       },
       run: (args) => codexOutcome(runSleepUntil(s, h, args)),
     },
-  ]
+    [WAIT_FOR_TASK]: {
+      spec: {
+        type: 'function',
+        name: codexToolName('platform', WAIT_FOR_TASK),
+        description: WAIT_FOR_TASK_DESCRIPTION(h.MAX_SLEEP_SECONDS),
+        inputSchema: waitForTaskInputSchema(h.MAX_SLEEP_SECONDS),
+      },
+      run: (args) => codexOutcome(runWaitForTask(s, h, args)),
+    },
+  }
+  return platformToolNames(sessionSpec).map((name) => all[name])
 }
 
 // codexOutcome maps a run-tools outcome onto codex's envelope: a rejection

@@ -994,6 +994,50 @@ test('an interactive session declares no run tools', async () => {
   await ctx.driver.shutdownStop()
 })
 
+test('task_waits adds wait_for_task to runs and gives chats it alone (#1911)', async () => {
+  for (const [spec, want] of [
+    [{ interactive: false, task_waits: true }, [...RUN_TOOLS, 'zwrm__platform__wait_for_task'].sort()],
+    [{ interactive: true, task_waits: true }, ['zwrm__platform__wait_for_task']],
+  ]) {
+    const ctx = await build(newHarness({ spec }))
+    const declared = (sentCalls(ctx.tracePath, 'thread/start')[0].dynamicTools || []).map((t) => t.name)
+    assert.deepEqual(declared.sort(), want, JSON.stringify(spec))
+    await ctx.driver.shutdownStop()
+  }
+})
+
+test('a chat waits for a task without anyone being asked, even in Ask mode (#1911)', async () => {
+  const ctx = newHarness({ scenario: 'wait-for-task', spec: { interactive: true, task_waits: true, permission_mode: 'default' } })
+  const parks = []
+  ctx.h.parkTurn = async (_s, kind, payload, deadline, resultText) => {
+    parks.push({ kind, payload, deadline })
+    return { content: [{ type: 'text', text: resultText('') }] }
+  }
+  const built = await build(ctx)
+  built.driver.start()
+  built.driver.queueMessage('go')
+  await until(built.events, () => sentCalls(built.tracePath, '__toolReply').length > 0, 'the tool reply')
+  const reply = sentCalls(built.tracePath, '__toolReply')[0]
+  assert.equal(reply.success, true, JSON.stringify(reply))
+  assert.match(reply.contentItems[0].text, /^Stopped waiting after 60s: the task is still running\./)
+  assert.deepEqual(parks.map((p) => [p.kind, p.payload]), [['task', { task_id: 'task_abc', seconds: 60 }]])
+  assert.equal(ofType(built.events, 'permission.request').length, 0, 'no person is asked to approve a wait')
+  await built.driver.shutdownStop()
+})
+
+test('a chat without task_waits cannot call wait_for_task', async () => {
+  // Reachable on a thread a task_waits session created: codex re-offers its
+  // frozen tool set, but this session has no handler behind the offer.
+  const ctx = await build(newHarness({ scenario: 'wait-for-task', spec: { interactive: true, permission_mode: 'default' } }))
+  ctx.driver.start()
+  ctx.driver.queueMessage('go')
+  await until(ctx.events, () => sentCalls(ctx.tracePath, '__toolReply').length > 0, 'the tool reply')
+  const reply = sentCalls(ctx.tracePath, '__toolReply')[0]
+  assert.equal(reply.success, false)
+  assert.match(reply.contentItems[0].text, /no longer available/)
+  await ctx.driver.shutdownStop()
+})
+
 test('a thread that fails to start surfaces as a bad gateway, not a silent session', async () => {
   await assert.rejects(
     () => build(newHarness({ scenario: 'start-fails' })),
