@@ -364,3 +364,127 @@ test('pi never asks a person to approve a platform tool, and builds them by the 
   assert.ok(policy !== -1 && allow > policy && ask > allow, 'after the tool policy, before any permission request')
   assert.match(src, /\.\.\.buildRunTools\(s, h, spec\)\]/, 'the tools come from the shared spec gate, not an interactive check')
 })
+
+// ---- live set-up change (#2004) ---------------------------------------------
+// The swap needs a booted daemon; these pin the wiring the CP relies on.
+
+test("the set-up routes exist and the daemon advertises them as 'session-setup' (#2004)", async () => {
+  const src = await readFile(SERVER, 'utf8')
+  const capsLine = src.split('\n').find((l) => l.trimStart().startsWith('caps:'))
+  assert.match(capsLine, /'session-setup'/)
+  assert.match(src, /action === 'setup' && parts\.length === 4\) return await handleSetup\(req, res, s\)/)
+  assert.match(src, /action === 'setup' && parts\.length === 5 && parts\[4\] === 'apply'\) return await handleSetupApply\(req, res, s\)/)
+})
+
+test('a message during a set-up change is held, never handed to the old harness (#2004)', async () => {
+  const src = await readFile(SERVER, 'utf8')
+  const message = handlerBody(src, 'handleMessage')
+  const held = message.indexOf('if (inputHeld(s)) return holdMessage(res, s, input)')
+  assert.ok(held !== -1, 'handleMessage must hold input while a set-up is pending or swapping')
+  assert.ok(held < message.indexOf('requireNotBusy(s)'), 'before the busy gate: the swap holds the control reservation')
+  assert.ok(held < message.indexOf('s.driver.queueMessage('), 'before the driver sees it')
+})
+
+test('commands, the shell, model switches and compactions refuse during a set-up change (#2004)', async () => {
+  const src = await readFile(SERVER, 'utf8')
+  for (const name of ['handleCommand', 'handleShell', 'handleModel', 'handleCompact']) {
+    const body = handlerBody(src, name)
+    const refuse = body.indexOf('refuseWhileSwitching(s)')
+    assert.ok(refuse !== -1 && refuse < body.indexOf('requireIdle(s, '), `${name} must refuse while switching, before its idle gate`)
+  }
+})
+
+test('a swap resumes the conversation in the same session and announces itself (#2004)', async () => {
+  const src = await readFile(SERVER, 'utf8')
+  const swap = handlerBody(src, 'applySetup')
+  assert.match(swap, /await retireDriver\(s, retireGrace\(background\)\)/)
+  assert.match(swap, /return await abandonDaemon\(s, setup\)/, 'an old harness not confirmed gone never gets a successor')
+  assert.match(swap, /constructDriver\(s, spec, s\.helpers\)/)
+  assert.match(swap, /'session\.setup_applied'/)
+  assert.doesNotMatch(swap, /session\.started/, 'a swap is not a new session')
+  assert.ok(swap.indexOf('retireDriver(') < swap.indexOf('constructDriver('), 'the old harness is gone before the new one starts')
+})
+
+test('every driver can retire quietly (#2004)', async () => {
+  const dir = join(dirname(fileURLToPath(import.meta.url)), '..', 'drivers')
+  for (const h of Object.keys(DRIVERS)) {
+    const src = await readFile(join(dir, `${h}.mjs`), 'utf8')
+    assert.match(src, /async retire\(\) \{/, `the ${h} driver must implement retire()`)
+    assert.match(src, /\n    forceStop\(\) \{/, `the ${h} driver must implement forceStop()`)
+    if (h !== 'claude') {
+      assert.equal(src.split('if (retiring) return retiring.resolve()').length, 3,
+        `the ${h} driver's finish and fail must both resolve a retire instead of ending the session`)
+    }
+  }
+})
+
+test('every wait in a retire is bounded, and one that fails exits the daemon (#2004)', async () => {
+  const src = await readFile(SERVER, 'utf8')
+  const retire = handlerBody(src, 'retireDriver')
+  assert.doesNotMatch(retire, /await d\.(shutdownStop|forceStop)\(\)/, 'the stop must be bounded too')
+  assert.equal(retire.split('settledWithin(').length, 4, 'grace, the stop, and the wait after it')
+  const abandon = handlerBody(src, 'abandonDaemon')
+  assert.ok(abandon.indexOf("'session.error'") < abandon.indexOf('s.pusher.drain(') &&
+    abandon.indexOf('s.pusher.drain(') < abandon.indexOf('process.exit(1)'), 'the error reaches the CP before the daemon exits')
+})
+
+test('a mode change waits while the chat\'s sharing changes (#2004)', async () => {
+  const src = await readFile(SERVER, 'utf8')
+  const mode = handlerBody(src, 'handleMode')
+  const refuse = mode.indexOf('if (inputHeld(s)) throw switchingConflict(s)')
+  assert.ok(refuse !== -1 && refuse < mode.indexOf('s.driver.setPermissionMode('))
+  assert.doesNotMatch(mode, /refuseWhileSwitching|requireIdle/, 'mode changes stay outside the idle gate')
+  assert.match(mode, /s\.spec\.permission_mode = body\.mode/, 'the swap copies the live mode')
+})
+
+test('only the member a turn was set up for explains a refusal while a set-up waits (#2004)', async () => {
+  const src = await readFile(SERVER, 'utf8')
+  const permission = handlerBody(src, 'handlePermission')
+  assert.match(permission, /if \(s\.answersFrom && cleanAuthor\(body\.decided_by\)\?\.id !== s\.answersFrom\) delete body\.message/)
+  const setup = handlerBody(src, 'handleSetup')
+  assert.match(setup, /s\.answersFrom = setup\.answersFrom \|\| \(inputHeld\(s\) \? s\.answersFrom : ''\)/, 'a later set-up never lifts it')
+  assert.ok(setup.indexOf('s.answersFrom =') < setup.indexOf('s.setup = setup'), 'judged before the new set-up counts as held input')
+})
+
+test('a set-up never applies without the control plane, and a stale one ends the session (#2004)', async () => {
+  const src = await readFile(SERVER, 'utf8')
+  const maybe = src.slice(src.indexOf('\nfunction maybeApplySetup('), src.indexOf('\nasync function applySetup('))
+  const expired = maybe.indexOf('if (setupExpired(setup)) {')
+  assert.ok(expired !== -1 && maybe.indexOf('return endSession(s)') > expired)
+  assert.match(maybe, /!setupSignaled\(setup\)\) return/)
+  assert.doesNotMatch(src, /setupStartingSession|s\.state === 'starting'\) \{\n\s*setupStarting/, 'a seeding session takes a set-up like a live one')
+})
+
+test('replayed held input is marked held, and dropped input forgotten (#2004, #1837)', async () => {
+  const src = await readFile(SERVER, 'utf8')
+  const replay = src.slice(src.indexOf('\nfunction replayHeld('), src.indexOf('\nfunction failSetup('))
+  assert.match(replay, /emitUserMessage\(s, heldMessage\(item\.visible\)\)/)
+  assert.match(replay, /forgetHeld\(s, items\.slice\(i\)\)/)
+  for (const name of ['dropHeld', 'dropHeldFrom']) {
+    const body = src.slice(src.indexOf(`\nfunction ${name}(`), src.indexOf('\n}\n', src.indexOf(`\nfunction ${name}(`)))
+    assert.match(body, /forgetHeld\(s, /, `${name} must forget the ids it drops`)
+  }
+})
+
+test("a chat taken back keeps refusing everyone else's messages for the rest of its session (#2004)", async () => {
+  const src = await readFile(SERVER, 'utf8')
+  const message = handlerBody(src, 'handleMessage')
+  const filter = message.indexOf('if (!keepsInput(s.authorFilter, input)) return send(res, 409, { error: UNDELIVERED_MESSAGE')
+  assert.ok(filter !== -1, 'handleMessage must refuse other authors once a set-up named keep_held_from')
+  assert.ok(filter < message.indexOf('if (inputHeld(s))'), 'whether or not a set-up is pending')
+  assert.ok(filter < message.indexOf('s.driver.queueMessage('))
+  const setup = handlerBody(src, 'handleSetup')
+  assert.match(setup, /s\.authorFilter = setup\.keepHeldFrom/, 'the latest set-up decides, an empty one clears it')
+  const swap = handlerBody(src, 'applySetup')
+  assert.doesNotMatch(swap, /authorFilter/, 'applying the set-up never lifts it')
+})
+
+test('while a sharing change is in flight only its owner allows what the old turn asks (#2004)', async () => {
+  const src = await readFile(SERVER, 'utf8')
+  const perm = handlerBody(src, 'handlePermission')
+  const gate = perm.indexOf('if (!mayDecide(s.answersFrom, body.behavior, cleanAuthor(body.decided_by))) {')
+  assert.ok(gate !== -1 && gate < perm.indexOf('s.pending.delete(requestId)'), 'refused before the request is consumed')
+  assert.match(perm, /error: OWNER_ANSWERS_MESSAGE/)
+  assert.match(handlerBody(src, 'handleSetup'), /s\.answersFrom = setup\.answersFrom/)
+  assert.match(handlerBody(src, 'applySetup'), /s\.answersFrom = ''/, 'cleared once the swap completes')
+})

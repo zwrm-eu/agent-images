@@ -114,6 +114,12 @@ export class RecentIds {
     this.ids.add(id)
     while (this.ids.size > this.limit) this.ids.delete(this.ids.values().next().value)
   }
+
+  // delete forgets a message that was held and then dropped (#2004), so the
+  // control plane sending it again is not answered as a duplicate.
+  delete(id) {
+    if (id) this.ids.delete(id)
+  }
 }
 
 // options.attributed marks a shared chat's message (#1784): options.speaker

@@ -128,3 +128,13 @@ test('a message id is taken once, and the oldest forgotten first', () => {
   ids.add('')
   assert.equal(ids.has(''), false)
 })
+
+test('a held message that was dropped is forgotten, so a resend is taken (#2004)', () => {
+  const ids = new RecentIds(4)
+  ids.add('m1')
+  ids.add('m2')
+  ids.delete('m1')
+  ids.delete('')
+  assert.equal(ids.has('m1'), false)
+  assert.equal(ids.has('m2'), true)
+})

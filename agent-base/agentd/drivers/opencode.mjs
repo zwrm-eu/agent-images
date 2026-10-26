@@ -204,6 +204,9 @@ export async function createOpenCodeDriver(s, spec, h) {
 
   let closed = false
   let finished = false
+  // Set while the daemon retires this harness for a set-up change (#2004):
+  // the wind-down then resolves it instead of ending the session.
+  let retiring = null
   // abortGen invalidates in-flight work: a turn started before an interrupt
   // must not emit a result (claude parity).
   let abortGen = 0
@@ -394,6 +397,7 @@ export async function createOpenCodeDriver(s, spec, h) {
     server.close()
     await cleanupInstr()
     await h.syncToDisk()
+    if (retiring) return retiring.resolve()
     s.state = 'ended'
     s.pusher.emit('session.ended', { sdk_session_id: s.sdkSessionId, last_result: s.lastResult })
   }
@@ -407,6 +411,8 @@ export async function createOpenCodeDriver(s, spec, h) {
     h.log(`opencode session ${s.id} failed: ${err?.stack || err}`)
     const c = classifyOpenCodeError(err)
     await h.syncToDisk()
+    // Failing on its way out of a set-up change, it is out all the same.
+    if (retiring) return retiring.resolve()
     s.state = 'error'
     s.pusher.emit('session.error', { message: c.message, cause: c.cause, detail: c.detail })
   }
@@ -1015,6 +1021,33 @@ export async function createOpenCodeDriver(s, spec, h) {
       closed = true
       if (!turnActive) chain(finish)
       // else the turn's result emit finishes the wind-down.
+    },
+
+    // A set-up change (#2004), between turns: the server winds down as on
+    // End, but the session carries on — no terminal state or event. Resolves
+    // once `opencode serve` has exited, so its successor never shares the
+    // session with it.
+    async retire() {
+      const done = new Promise((resolve) => { retiring = { resolve } })
+      closed = true
+      if (finished) retiring.resolve()
+      else if (!turnActive) chain(finish)
+      await done
+      if (!(await server.waitGone(TEARDOWN_TIMEOUT_MS) ?? true)) throw new Error('the opencode server did not exit')
+    },
+
+    // A retire that won't finish (#2004): kill the server outright, without
+    // waiting on the chain a stuck reaction may be holding. retire still
+    // waits for the exit.
+    forceStop() {
+      closed = true
+      abortGen++
+      server.kill()
+      if (!finished) {
+        finished = true
+        void cleanupInstr()
+      }
+      retiring?.resolve()
     },
 
     async shutdownStop() {

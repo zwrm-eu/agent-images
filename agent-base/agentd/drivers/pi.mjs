@@ -307,6 +307,11 @@ export async function createPiDriver(s, spec, h) {
   // ---- lifecycle ------------------------------------------------------------
   let closed = false
   let finished = false
+  // Set while the daemon retires this harness for a set-up change (#2004):
+  // the wind-down then resolves it instead of ending the session.
+  let retiring = null
+  // The bridged MCP servers' close, which a retire waits out (#2004).
+  let bridgeClosed = Promise.resolve()
   // abortGen invalidates in-flight work: an agent cycle started before an
   // interrupt must not emit a result (claude parity: an interrupted turn
   // produces no sdk.result), and a prompt rejection from the abort must not
@@ -369,9 +374,10 @@ export async function createPiDriver(s, spec, h) {
     if (finished) return
     finished = true
     unsubscribe()
-    bridge.close()
+    bridgeClosed = bridge.close()
     try { session.dispose() } catch {}
     await h.syncToDisk()
+    if (retiring) return retiring.resolve()
     s.state = 'ended'
     s.pusher.emit('session.ended', { sdk_session_id: s.sdkSessionId, last_result: s.lastResult })
   }
@@ -380,11 +386,13 @@ export async function createPiDriver(s, spec, h) {
     if (finished) return
     finished = true
     unsubscribe()
-    bridge.close()
+    bridgeClosed = bridge.close()
     try { session.dispose() } catch {}
     h.log(`pi session ${s.id} failed: ${err?.stack || err}`)
     const c = classifyPiError(err, piProvider)
     await h.syncToDisk()
+    // Failing on its way out of a set-up change, it is out all the same.
+    if (retiring) return retiring.resolve()
     s.state = 'error'
     s.pusher.emit('session.error', { message: c.message, cause: c.cause, detail: c.detail })
   }
@@ -570,6 +578,35 @@ export async function createPiDriver(s, spec, h) {
       closed = true
       if (session.isIdle) chain(finish)
       // else agent_settled finishes the wind-down.
+    },
+
+    // A set-up change (#2004), between turns: the SDK session is disposed as
+    // on End, but the daemon's session carries on — no terminal state or
+    // event. Resolves once the session file is synced and the bridged
+    // servers are gone.
+    async retire() {
+      const done = new Promise((resolve) => { retiring = { resolve } })
+      closed = true
+      if (finished) retiring.resolve()
+      else if (session.isIdle) chain(finish)
+      await done
+      await bridgeClosed
+    },
+
+    // A retire that won't finish (#2004): pi runs in-process, so stopping it
+    // is aborting and disposing its session, without waiting on the chain a
+    // stuck reaction may be holding.
+    forceStop() {
+      closed = true
+      abortGen++
+      if (!finished) {
+        finished = true
+        unsubscribe()
+        bridgeClosed = bridge.close()
+        Promise.resolve().then(() => session.abort()).catch(() => {})
+        try { session.dispose() } catch {}
+      }
+      retiring?.resolve()
     },
 
     async shutdownStop() {

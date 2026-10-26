@@ -47,6 +47,9 @@ export class CodexRPC {
     this.nextId = 1
     this.pending = new Map() // id -> {resolve, reject}
     this.exited = null // {code, signal} once the child is gone
+    // Settles when the child is gone, for a wind-down that must not overlap
+    // a successor on the same thread (#2004).
+    this.gone = new Promise((resolve) => { this.markGone = resolve })
 
     this.child = spawn(command, args, { env, cwd, stdio: ['pipe', 'pipe', 'pipe'] })
 
@@ -73,6 +76,7 @@ export class CodexRPC {
   #handleExit(code, signal, err) {
     if (this.exited) return
     this.exited = { code, signal, err }
+    this.markGone()
     const detail = err
       ? String(err.message || err)
       : `codex app-server exited (${signal ? `signal ${signal}` : `code ${code}`})`
@@ -204,4 +208,25 @@ export class CodexRPC {
     try { this.child.stdin?.end() } catch { /* best-effort */ }
     try { this.child.kill() } catch { /* best-effort */ }
   }
+
+  // kill stops the child outright (#2004: a retire that won't finish).
+  kill() {
+    if (this.exited) return
+    try { this.child.kill('SIGKILL') } catch { /* already gone */ }
+  }
+
+  // waitGone resolves once the child has exited after close(): one that
+  // outlives ms is killed outright, and gets as long again to go.
+  async waitGone(ms) {
+    if (this.exited) return true
+    if (await settles(this.gone, ms)) return true
+    try { this.child.kill('SIGKILL') } catch { /* already gone */ }
+    return await settles(this.gone, ms)
+  }
+}
+
+function settles(promise, ms) {
+  let timer
+  const late = new Promise((resolve) => { timer = setTimeout(() => resolve(false), ms) })
+  return Promise.race([promise.then(() => true), late]).finally(() => clearTimeout(timer))
 }

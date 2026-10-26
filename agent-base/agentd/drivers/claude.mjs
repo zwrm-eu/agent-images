@@ -323,6 +323,13 @@ export function createClaudeDriver(s, spec, h, { startQuery = query, drainGraceM
   // a turn of its own right after the result, so the result's idle counts
   // them as live work until the next turn starts or the grace passes.
   let owedNotifications = 0
+  // The run loop, and whether it is being retired for a set-up change
+  // (#2004): the CLI then winds down without ending the session.
+  let loop = null
+  let retiring = false
+  // Kills the CLI when a retire won't finish (#2004): the SDK stops the
+  // query and its child on abort.
+  const abortController = new AbortController()
 
   // Task-list ledger (#1424): TodoWrite calls become durable todo.updated
   // events once their tool_result confirms the list was actually adopted.
@@ -425,6 +432,7 @@ export function createClaudeDriver(s, spec, h, { startQuery = query, drainGraceM
     env: { ...CLAUDE_SESSION_ENV, ...process.env, ...(spec.env || {}) },
     pathToClaudeCodeExecutable: claudeExecutable,
     includePartialMessages: true,
+    abortController,
     permissionMode,
     // The Agent SDK refuses both an initial bypass mode and a later
     // setPermissionMode('bypassPermissions') unless this construction-time
@@ -566,6 +574,8 @@ export function createClaudeDriver(s, spec, h, { startQuery = query, drainGraceM
   // interrupt-raced result re-emit below).
   function armDrainReemit() {
     clearTimeout(drainReemit)
+    // A retired CLI's count is not the session's anymore (#2004).
+    if (retiring) return
     drainReemit = setTimeout(() => {
       drainReemit = null
       if (s.state === 'idle' && countBackgroundTasks(s.backgroundTasks) === 0) {
@@ -845,6 +855,8 @@ export function createClaudeDriver(s, spec, h, { startQuery = query, drainGraceM
       // terminal event is queued.
       rejectPendingCompact('session ended', 409)
       await h.syncToDisk()
+      // Retired (#2004): the session goes on, on the CLI that replaces this one.
+      if (retiring) return
       s.state = 'ended'
       clearTaskLedger(s.backgroundTasks) // the SDK process is winding down; its tasks die with it
       s.pusher.emit('session.ended', { sdk_session_id: s.sdkSessionId, last_result: s.lastResult })
@@ -857,6 +869,9 @@ export function createClaudeDriver(s, spec, h, { startQuery = query, drainGraceM
       // and whatever transcript exists is worth keeping resumable. Synced
       // before the state flip for the same isDone invariant as above.
       await h.syncToDisk()
+      // A CLI failing on its way out of a set-up change (#2004) is still out:
+      // the replacement resumes the transcript.
+      if (retiring) return
       s.state = 'error'
       clearTaskLedger(s.backgroundTasks)
       s.pusher.emit('session.error', { message: c.message, cause: c.cause, detail: c.detail })
@@ -867,7 +882,7 @@ export function createClaudeDriver(s, spec, h, { startQuery = query, drainGraceM
     harness: 'claude',
 
     start() {
-      runLoop()
+      loop = runLoop()
     },
 
     // queueMessage returns false when the session no longer accepts input
@@ -1036,6 +1051,30 @@ export function createClaudeDriver(s, spec, h, { startQuery = query, drainGraceM
     beginEnd() {
       rejectPendingCompact('session ended', 409)
       inputQueue.close()
+    },
+
+    // A set-up change (#2004): the daemon calls this between turns. The CLI
+    // exits as on End, but the session carries on — no terminal state or
+    // event — and nothing of this CLI's may touch the session afterwards.
+    // Resolves once the CLI is gone and its transcript synced.
+    async retire() {
+      retiring = true
+      rejectPendingCompact('the session is restarting on a new set-up', 409)
+      clearTimeout(drainReemit)
+      drainReemit = null
+      inputQueue.close()
+      await loop
+      clearTimeout(drainReemit)
+      drainReemit = null
+    },
+
+    // A retire that won't finish (#2004): a CLI keeps its input open until
+    // its background agents exit, or may not answer at all. Aborting kills
+    // it, and the run loop ends.
+    forceStop() {
+      retiring = true
+      inputQueue.close()
+      abortController.abort()
     },
 
     // Daemon shutdown: stop input, abort the in-flight turn. The caller
