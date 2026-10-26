@@ -1067,3 +1067,24 @@ test('a chat without task_waits does not get wait_for_task waved through', async
     await fake.close()
   }
 })
+
+test('retire winds the server down without ending the session (#2004)', async () => {
+  const fake = await startFakeOpenCode()
+  try {
+    const { s, driver, events } = await build(fake)
+    driver.start()
+    driver.queueMessage('go')
+    await until(events, () => fake.state.prompts.length === 1, 'prompt')
+    fake.emit('session.idle', { sessionID: s.sdkSessionId })
+    await until(events, (ev) => ofType(ev, 'sdk.result').length === 1 && s.state === 'idle', 'the turn to settle')
+    const mark = events.length
+    await driver.retire()
+    assert.equal(s.state, 'idle', 'the session stays as it was')
+    assert.deepEqual(events.slice(mark).filter((e) => e.type !== '__sync').map((e) => e.type), [],
+      'no session.ended, no session.error')
+    assert.equal(driver.queueMessage('too late'), false, 'a retired harness takes no input')
+    fake.assertNoViolations(assert)
+  } finally {
+    await fake.close()
+  }
+})

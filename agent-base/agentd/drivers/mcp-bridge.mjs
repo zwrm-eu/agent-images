@@ -23,6 +23,10 @@ import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { ErrorCode } from '@modelcontextprotocol/sdk/types.js'
 
+// How long close() waits for the bridged servers to go (#2004); the stdio
+// transport's own SIGTERM-then-SIGKILL escalation fits inside it.
+const BRIDGE_CLOSE_MS = 5000
+
 // isConnectionError separates transport death (safe to reconnect + retry —
 // the request never reached, or never returned from, a live server we can
 // reason about) from timeouts and server-side errors (retrying could
@@ -219,12 +223,20 @@ export async function connectServers(servers, log, opts = {}) {
 
   return {
     entries,
+    // Resolves once every client has closed (a stdio server's process
+    // gone), or after BRIDGE_CLOSE_MS: a harness retired for a set-up change
+    // (#2004) waits for it, so its successor never starts the same image
+    // servers beside them (a browser's profile lock). Others ignore it.
     close() {
       closed = true
+      const closing = []
       for (const { client } of clients.values()) {
-        try { client.close?.() } catch {}
+        try { closing.push(Promise.resolve(client.close?.()).catch(() => {})) } catch {}
       }
       clients.clear()
+      let timer
+      const late = new Promise((resolve) => { timer = setTimeout(resolve, BRIDGE_CLOSE_MS) })
+      return Promise.race([Promise.all(closing), late]).finally(() => clearTimeout(timer))
     },
   }
 }

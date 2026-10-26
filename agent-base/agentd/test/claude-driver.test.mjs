@@ -677,3 +677,64 @@ test('the platform server runs wait_for_task through the shared dispatcher', asy
   ])
   fake.end()
 })
+
+// A set-up change (#2004) restarts the harness in place: the old CLI goes
+// quietly, the session does not.
+test('retire winds the CLI down without ending the session (#2004)', async () => {
+  const { s, driver, fake, events } = build()
+  driver.queueMessage('hello')
+  fake.send(init)
+  fake.send(assistant('hi'))
+  fake.send(result)
+  await until(events, (ev) => ev.some((e) => e.type === 'turn.completed'), 'the turn to end')
+  const mark = events.length
+
+  let retired = false
+  const done = driver.retire().then(() => { retired = true })
+  await sleep(20)
+  assert.equal(retired, false, 'retire waits for the CLI to exit')
+  assert.equal(driver.queueMessage('too late'), false, 'a retiring CLI takes no more input')
+  fake.end()
+  await done
+  assert.equal(s.state, 'idle', 'the session stays as it was')
+  assert.deepEqual(events.slice(mark).map((e) => e.type), [], 'no session.ended, no status flip')
+})
+
+test('retire drops a drain re-emit the old CLI armed (#2004)', async () => {
+  const { s, driver, fake, events } = build()
+  await turnLeavingBackgroundTask(driver, fake, events)
+  fake.send({ type: 'system', subtype: 'task_notification', task_id: 'bg-1', status: 'completed' })
+  await until(events, (ev) => ev.some(isNotification), 'the settle')
+  const mark = events.length
+  const done = driver.retire()
+  fake.end()
+  await done
+  await sleep(GRACE_MS * 3)
+  assert.deepEqual(events.slice(mark).map((e) => e.type), [],
+    "the old CLI's zero must not reach the session the new one runs")
+  assert.equal(s.state, 'idle')
+})
+
+test('beginEnd still ends the session: retire is the only quiet wind-down (#2004)', async () => {
+  const { s, driver, fake, events } = build()
+  driver.beginEnd()
+  fake.end()
+  await until(events, (ev) => ev.some((e) => e.type === 'session.ended'), 'session.ended')
+  assert.equal(s.state, 'ended')
+})
+
+test('forceStop kills a CLI that will not leave, through the abort the SDK honours (#2004)', async () => {
+  const { s, driver, fake, events } = build()
+  assert.ok(fake.options.abortController instanceof AbortController, 'the query gets an abortController')
+  const mark = events.length
+  let retired = false
+  const done = driver.retire().then(() => { retired = true })
+  await sleep(20)
+  assert.equal(retired, false, 'a CLI holding its input open for background agents keeps the retire waiting')
+  driver.forceStop()
+  assert.equal(fake.options.abortController.signal.aborted, true)
+  fake.end() // the SDK ends the query once its child is gone
+  await done
+  assert.equal(s.state, 'idle')
+  assert.deepEqual(events.slice(mark).map((e) => e.type), [], 'still no session.ended or session.error')
+})

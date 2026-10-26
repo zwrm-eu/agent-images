@@ -1658,3 +1658,37 @@ test('the context codex writes is told from what the user wrote (#1832)', () => 
     `${SUMMARY_PREFIX}\nsummary`,
   ]) assert.equal(isCodexContextualUserText(text), false, text)
 })
+
+// ---- set-up change (#2004) --------------------------------------------------
+
+test('retire stops the app-server quietly and a successor resumes the same thread (#2004)', async () => {
+  const ctx = await build(newHarness())
+  ctx.driver.start()
+  ctx.driver.queueMessage('go')
+  await until(ctx.events, (e) => ofType(e, 'sdk.result').length > 0 && ctx.s.state === 'idle', 'the turn to settle')
+  const mark = ctx.events.length
+  await ctx.driver.retire()
+  assert.equal(ctx.s.state, 'idle', 'the session stays as it was')
+  assert.deepEqual(ctx.events.slice(mark).filter((e) => e.type !== '__sync').map((e) => e.type), [],
+    'no session.ended, no session.error')
+  assert.equal(ctx.driver.queueMessage('too late'), false, 'a retired harness takes no input')
+
+  const next = await build({ ...ctx, spec: { ...ctx.spec, resume_sdk_session_id: ctx.s.sdkSessionId } })
+  const resumed = sentCalls(ctx.tracePath, 'thread/resume')
+  assert.equal(resumed.at(-1)?.threadId, 'thread-abc', 'the successor resumes the conversation')
+  next.driver.start()
+  await next.driver.shutdownStop()
+  assert.equal(ofType(ctx.events, 'session.ended').length, 1, 'only the successor ends the session')
+})
+
+test('forceStop kills the app-server and the retire still waits for its exit (#2004)', async () => {
+  const ctx = await build(newHarness())
+  ctx.driver.start()
+  const mark = ctx.events.length
+  const done = ctx.driver.retire()
+  ctx.driver.forceStop()
+  await done
+  assert.deepEqual(ctx.events.slice(mark).filter((e) => e.type !== '__sync').map((e) => e.type), [],
+    'no session.ended, no session.error')
+  assert.equal(ctx.driver.queueMessage('too late'), false)
+})

@@ -37,6 +37,10 @@ export class OpenCodeServer {
     this.password = randomBytes(16).toString('hex')
     this.closed = false
     this.sseAbort = null
+    // Settles once the spawned server is gone (at once in attach mode, where
+    // there is none), for a wind-down that must not overlap a successor on
+    // the same session (#2004).
+    this.gone = new Promise((resolve) => { this.markGone = resolve })
     // Resolves the first time the /event stream is connected server-side, so
     // the driver can gate the first prompt on it: opencode's /event has NO
     // replay, and a completion that finishes before the subscription attaches
@@ -61,23 +65,28 @@ export class OpenCodeServer {
     if (attach) {
       this.baseURL = attach.replace(/\/$/, '')
       this.password = this.opts.env?.OPENCODE_SERVER_PASSWORD || 'test'
+      this.markGone()
       return
     }
     // --port 0 lets the kernel pick a free port; the listen line names it.
     // The password locks the server to this daemon: without it, any process
     // in the VM (i.e. the model, via bash) could drive the session API —
     // including answering its own permission asks.
+    this.started = true
     const child = spawn(this.opts.bin, ['serve', '--hostname', '127.0.0.1', '--port', '0'], {
       cwd: this.opts.cwd,
       env: { ...this.opts.env, OPENCODE_SERVER_PASSWORD: this.password },
       stdio: ['ignore', 'pipe', 'pipe'],
     })
     this.child = child
+    // Kept past close(), which drops this.child, for kill().
+    this.proc = child
     let stderrTail = ''
     child.stderr.on('data', (d) => {
       stderrTail = (stderrTail + d.toString()).slice(-2000)
     })
     child.on('exit', (code, signal) => {
+      this.markGone()
       if (this.closed) return
       this.closed = true
       this.sseAbort?.abort()
@@ -240,5 +249,20 @@ export class OpenCodeServer {
       }, 5000).unref()
       this.child = null
     }
+  }
+
+  // kill stops the server outright (#2004: a retire that won't finish).
+  kill() {
+    try { this.proc?.kill('SIGKILL') } catch { /* already gone */ }
+  }
+
+  // waitGone resolves true once the server has exited after close(), false
+  // if it outlives ms (close() SIGKILLs it 5s in regardless). A server
+  // never spawned is gone already.
+  async waitGone(ms) {
+    if (!this.started) return true
+    let timer
+    const late = new Promise((resolve) => { timer = setTimeout(() => resolve(false), ms) })
+    return await Promise.race([this.gone.then(() => true), late]).finally(() => clearTimeout(timer))
   }
 }

@@ -277,6 +277,11 @@ export async function createCodexDriver(s, spec, h) {
 
   let closed = false
   let finished = false
+  // Set while the daemon retires this harness for a set-up change (#2004):
+  // the wind-down then resolves it instead of ending the session.
+  let retiring = null
+  // The bridged MCP servers' close, which a retire waits out (#2004).
+  let bridgeClosed = Promise.resolve()
   let rpc = null
   // abortGen invalidates in-flight work: a turn started before an interrupt
   // must not emit a result (claude parity), and a request rejection caused by
@@ -385,8 +390,9 @@ export async function createCodexDriver(s, spec, h) {
     if (finished) return
     finished = true
     rpc?.close()
-    closeBridge()
+    bridgeClosed = Promise.resolve(closeBridge())
     await h.syncToDisk()
+    if (retiring) return retiring.resolve()
     s.state = 'ended'
     s.pusher.emit('session.ended', { sdk_session_id: s.sdkSessionId, last_result: s.lastResult })
   }
@@ -395,10 +401,12 @@ export async function createCodexDriver(s, spec, h) {
     if (finished) return
     finished = true
     rpc?.close()
-    closeBridge()
+    bridgeClosed = Promise.resolve(closeBridge())
     h.log(`codex session ${s.id} failed: ${err?.stack || err}`)
     const c = classifyCodexError(err)
     await h.syncToDisk()
+    // Failing on its way out of a set-up change, it is out all the same.
+    if (retiring) return retiring.resolve()
     s.state = 'error'
     s.pusher.emit('session.error', { message: c.message, cause: c.cause, detail: c.detail })
   }
@@ -1344,6 +1352,34 @@ export async function createCodexDriver(s, spec, h) {
       closed = true
       if (!turnActive) chain(finish)
       // else the turn's result emit finishes the wind-down.
+    },
+
+    // A set-up change (#2004), between turns: the app-server winds down as
+    // on End, but the session carries on — no terminal state or event.
+    // Resolves once the app-server has exited, so its successor never shares
+    // the thread with it.
+    async retire() {
+      const done = new Promise((resolve) => { retiring = { resolve } })
+      closed = true
+      if (finished) retiring.resolve()
+      else if (!turnActive) chain(finish)
+      await done
+      if (!(await rpc?.waitGone(TEARDOWN_TIMEOUT_MS) ?? true)) throw new Error('the codex app-server did not exit')
+      await bridgeClosed
+    },
+
+    // A retire that won't finish (#2004): kill the app-server outright,
+    // without waiting on the chain a stuck reaction may be holding. retire
+    // still waits for the exit.
+    forceStop() {
+      closed = true
+      abortGen++
+      rpc?.kill()
+      if (!finished) {
+        finished = true
+        bridgeClosed = Promise.resolve(closeBridge())
+      }
+      retiring?.resolve()
     },
 
     async shutdownStop() {

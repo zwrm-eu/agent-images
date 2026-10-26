@@ -42,12 +42,31 @@ import { handlePlatformTool } from './drivers/opencode-run-tools.mjs'
 import { answeredQuestions } from './drivers/questions.mjs'
 import { NEW_MESSAGE, NEW_MESSAGE_CANCELS, parkCancellations, parkDeadlineError } from './drivers/run-tools.mjs'
 import { TOOL_POLICIES } from './drivers/tool-policy.mjs'
-import { countBackgroundTasks, createTaskLedger } from './drivers/claude-tasks.mjs'
+import { clearTaskLedger, countBackgroundTasks, createTaskLedger } from './drivers/claude-tasks.mjs'
 import { seedState, waitSeedClear, SEED_WAIT_MAX_MS, SEED_FAILED_MESSAGE } from './seedgate.mjs'
 import { EventPusher } from './event-pusher.mjs'
 import { decisionForRequest, permissionDecisionPayload } from './event-payloads.mjs'
 import { RecentIds, cleanAuthor, cleanMessageId, prepareMessage } from './message-context.mjs'
 import { searchWorkspaceFiles } from './file-search.mjs'
+import {
+  filterHeld,
+  heldMessage,
+  keepsInput,
+  mayDecide,
+  OWNER_ANSWERS_MESSAGE,
+  parseSetup,
+  readyToSwap,
+  RETIRE_ABORT_MS,
+  retireGrace,
+  settledWithin,
+  SETUP_APPLY_FALLBACK_MS,
+  SETUP_POLL_MS,
+  setupExpired,
+  setupSignaled,
+  setupSpec,
+  SWITCHING_MESSAGE,
+  UNDELIVERED_MESSAGE,
+} from './session-setup.mjs'
 import { loadImageMCPServers, withImageServers } from './image-mcp.mjs'
 import { desktopStatus, loadDesktop, relayVNC, startDesktop, writeControl } from './desktop.mjs'
 import { byteRange, UploadCounter, uploadBudget, volumeFullError } from './workspace-files.mjs'
@@ -192,6 +211,7 @@ function setState(s, state, extra = {}) {
   if (state === 'idle' && s.pusher.turns.activeTurnId) s.pusher.completeTurn('completed')
   if (s.state === state) return
   s.state = state
+  if (state === 'idle') s.idleSince = Date.now()
   s.pusher.emit('session.status', { state, ...extra })
 }
 
@@ -330,6 +350,25 @@ async function startSession(spec) {
     driver: null,
     // Retained for model changes and seed-deferred driver construction.
     spec,
+    // A live set-up change (#2004): the one pending, the input held for it,
+    // and whose input it still takes (keep_held_from). swapping spans the
+    // harness restart; helpers rebuild the driver then.
+    setup: null,
+    swapping: false,
+    swappingSetupId: null,
+    appliedSetupId: null,
+    setupTimer: null,
+    held: [],
+    // The member a set-up's keep_held_from named: the chat taken back is
+    // theirs alone from then on, so no one else's message reaches it for the
+    // rest of the session (a later set-up replaces it). answersFrom is who
+    // alone allows what the old set-up's turn asks while a swap is in flight.
+    authorFilter: '',
+    answersFrom: '',
+    helpers: null,
+    // When the session last went idle: a swap waiting on background work
+    // lets the idle settle first (#2004, #1613).
+    idleSince: 0,
   }
 
   // The shared machinery drivers reach back into. Passed explicitly so the
@@ -349,6 +388,7 @@ async function startSession(spec) {
     VERSION,
     MAX_SLEEP_SECONDS,
   }
+  s.helpers = helpers
 
   // Seed gate (#1136): a harness must never construct against a half-seeded
   // $HOME — construction already reads it (the pi SDK loads ~/.pi settings)
@@ -391,6 +431,7 @@ async function startSession(spec) {
   }
   session = s
   s.state = 'idle'
+  s.idleSince = Date.now()
   emitStarted(s, spec)
 
   s.driver.start()
@@ -537,6 +578,9 @@ function snapshot(s) {
     last_result: s.lastResult,
     background_tasks: countBackgroundTasks(s.backgroundTasks),
     active_turn_id: s.pusher.turns.activeTurnId,
+    // A set-up change in flight (#2004), and the input held for it.
+    setup_pending: inputHeld(s),
+    held_messages: s.held.length,
   }
 }
 
@@ -953,6 +997,20 @@ async function handleMessage(req, res, s) {
   } catch (err) {
     throw badRequest(err.message)
   }
+  const visibleMessage = {
+    text: prepared.text,
+    attachments: prepared.attachments,
+    ...(author ? { author } : {}),
+    ...(platform ? { source: 'platform', platform_kind: platform } : {}),
+    ...(messageId ? { message_id: messageId } : {}),
+  }
+  const input = { prompt: prepared.prompt, visible: visibleMessage, authorId: author?.id || '', platform: Boolean(platform), messageId }
+  // A chat taken back is its member's alone (#2004): a message the control
+  // plane authorized just before goes nowhere, pending set-up or not.
+  if (!keepsInput(s.authorFilter, input)) return send(res, 409, { error: UNDELIVERED_MESSAGE, state: s.state })
+  // The chat's sharing is changing (#2004): what is said now is for the
+  // harness on the new set-up, not the one still running.
+  if (inputHeld(s)) return holdMessage(res, s, input)
   requireNotBusy(s)
   const pendingCount = s.pendingContexts.length
   const prompt = pendingCount > 0
@@ -963,13 +1021,6 @@ async function handleMessage(req, res, s) {
   }
   if (pendingCount > 0) s.pendingContexts.splice(0, pendingCount)
   s.messageIds.add(messageId)
-  const visibleMessage = {
-    text: prepared.text,
-    attachments: prepared.attachments,
-    ...(author ? { author } : {}),
-    ...(platform ? { source: 'platform', platform_kind: platform } : {}),
-    ...(messageId ? { message_id: messageId } : {}),
-  }
   if (s.state === 'starting') s.deferredMessages.push(visibleMessage)
   else emitUserMessage(s, visibleMessage)
   // A member spoke while the turn waits for a task (#1911): the wait ends
@@ -1006,6 +1057,7 @@ async function handleCommand(req, res, s) {
     throw badRequest('model must be a string')
   }
   const model = body.model?.trim() || ''
+  refuseWhileSwitching(s)
   requireIdle(s, 'invoking a command')
   if (!supportsCommandDriver(s.driver)) {
     throw badRequest(`commands are not supported by the ${s.harness} harness`)
@@ -1044,6 +1096,7 @@ async function handleShell(req, res, s) {
   if (body.command.includes('\0')) throw badRequest('command contains a NUL byte')
   // Deliberate policy for #1429: never interleave an operator subprocess with
   // a live model turn (or another control call). Clients retry once idle.
+  refuseWhileSwitching(s)
   requireIdle(s, 'running a shell command')
   // Shell output waits for the next real turn. Bound that deferred prompt so
   // repeated automation cannot build an unbounded in-memory/model input while
@@ -1108,6 +1161,14 @@ async function handlePermission(req, res, s, requestId) {
   if (body.behavior === 'allow' && p.kind === 'question' && !answeredQuestions(p.input, body.updated_input?.answers)) {
     throw badRequest('a question needs answers: updated_input.answers keyed by question id (a string, or an array of labels for multiSelect)')
   }
+  // The turn asking still runs on the old set-up while a sharing change is
+  // in flight (#2004): only the member it was set up for allows or answers.
+  if (!mayDecide(s.answersFrom, body.behavior, cleanAuthor(body.decided_by))) {
+    return send(res, 409, { error: OWNER_ANSWERS_MESSAGE, state: s.state })
+  }
+  // Anyone may refuse, but only that member says why: a refusal's message
+  // reaches the model like an answer.
+  if (s.answersFrom && cleanAuthor(body.decided_by)?.id !== s.answersFrom) delete body.message
   s.pending.delete(requestId)
   // Whose answer or approval it was (#1784): the other members of a shared
   // chat see it on the decision, so a resolved prompt is not a mystery to
@@ -1151,6 +1212,7 @@ async function handleModel(req, res, s) {
   const model = (body.model ?? '').trim()
   const effort = (body.effort ?? '').trim()
   if (!model && !effort) throw badRequest('missing model or effort')
+  refuseWhileSwitching(s)
   requireIdle(s, 'switching the model')
   if (!supportsModelSwitchDriver(s.driver)) {
     throw badRequest(`model switching is not supported by the ${s.harness} harness`)
@@ -1187,6 +1249,7 @@ async function handleCompact(req, res, s) {
   if (body.instructions != null && typeof body.instructions !== 'string') throw badRequest('instructions must be a string')
   const instructions = (body.instructions ?? '').trim()
   if (instructions.length > MAX_COMPACT_INSTRUCTIONS) throw badRequest(`instructions are too long (max ${MAX_COMPACT_INSTRUCTIONS} characters)`)
+  refuseWhileSwitching(s)
   requireIdle(s, 'compacting the context')
   if (!supportsCompactDriver(s.driver)) {
     throw badRequest(`context compaction is not supported by the ${s.harness} harness`)
@@ -1207,7 +1270,14 @@ async function handleMode(req, res, s) {
   const body = await readBody(req)
   if (!PERMISSION_MODES.has(body.mode)) throw badRequest(`invalid mode ${body.mode}`)
   if (isDone(s)) return send(res, 409, { error: 'session is finished', state: s.state })
+  // While the chat's sharing changes (#2004) the mode waits: mid-swap it
+  // would reach neither harness, and before it a switch to skip approvals
+  // would approve, for anyone, what the turn still on the old set-up asks.
+  if (inputHeld(s)) throw switchingConflict(s)
   await s.driver.setPermissionMode(body.mode)
+  // A harness rebuilt for a set-up change (#2004) starts in the mode the
+  // session is in, not the one it was created with.
+  s.spec.permission_mode = body.mode
   s.pusher.emit('session.status', { permission_mode: body.mode })
   send(res, 200, { mode: body.mode })
 }
@@ -1216,11 +1286,288 @@ async function handleMode(req, res, s) {
 // is for), but nothing may block on a human anymore — pending approvals are
 // denied and later tool prompts auto-deny via s.ending.
 function handleEnd(res, s) {
+  endSession(s)
+  send(res, 202, { ending: true })
+}
+
+function endSession(s) {
   s.ending = true
   cancelPendingPermissions(s, 'session ended')
   cancelPendingParks(s, 'session ended')
+  abandonSetup(s, 'session ended')
   s.driver.beginEnd()
-  send(res, 202, { ending: true })
+}
+
+// ---- Live set-up change (#2004) ------------------------------------------------------
+//
+// A chat's sharing changed while its session runs: the harness restarts in
+// place on the new set-up at the next turn boundary, resuming the
+// conversation, under the same session id and event stream. From the set-up's
+// arrival until the swap is done, new input is held for the new harness (a
+// member's message must never reach a model set up for its owner alone), and
+// what was said meanwhile reaches the new harness first. The pure rules are in
+// session-setup.mjs.
+
+function inputHeld(s) {
+  return Boolean(s.setup || s.swapping)
+}
+
+async function handleSetup(req, res, s) {
+  const body = await readBody(req)
+  let setup
+  try {
+    setup = parseSetup(body)
+  } catch (err) {
+    throw badRequest(err.message)
+  }
+  if (isDone(s) || s.ending) return send(res, 409, { error: 'session is finished', state: s.state })
+  const at = { setup_id: setup.id, state: s.state, background_tasks: countBackgroundTasks(s.backgroundTasks) }
+  // The same set-up sent again (an answer the control plane lost) is the one
+  // it already is: never a second restart. A session still seeding takes a
+  // set-up like a live one — held input, then a swap once its first harness
+  // is up and idle — since that harness may already be reading the old spec.
+  if (setup.id === s.setup?.id || setup.id === s.swappingSetupId || setup.id === s.appliedSetupId) return send(res, 202, at)
+  if (s.setup) log(`session ${s.id}: set-up ${s.setup.id} replaced by ${setup.id} before it applied`)
+  // The turn still on the old set-up keeps whoever alone may answer it
+  // until a swap replaces that set-up: a later set-up can't lift it.
+  s.answersFrom = setup.answersFrom || (inputHeld(s) ? s.answersFrom : '')
+  s.setup = setup
+  s.authorFilter = setup.keepHeldFrom
+  dropHeldFrom(s, setup.keepHeldFrom)
+  log(`session ${s.id}: set-up ${setup.id} pending (scope ${setup.fields.instructions_scope || '(none)'}, background ${setup.background}); holding input`)
+  armSetupTimer(s)
+  maybeApplySetup(s)
+  send(res, 202, at)
+}
+
+// The control plane re-seeded the workspace for the set-up: it may apply.
+async function handleSetupApply(req, res, s) {
+  const body = await readBody(req)
+  const id = typeof body?.setup_id === 'string' ? body.setup_id : ''
+  if (!id) throw badRequest('missing setup_id')
+  if (s.setup?.id === id) {
+    s.setup.signaled = true
+    maybeApplySetup(s)
+    return send(res, 200, { applied: false, pending: true })
+  }
+  if (s.swappingSetupId === id) return send(res, 200, { applied: false, pending: true })
+  if (s.appliedSetupId === id) return send(res, 200, { applied: true, pending: false })
+  send(res, 409, { error: 'no such set-up pending', state: s.state })
+}
+
+function holdMessage(res, s, item) {
+  if (isDone(s) || s.ending) return send(res, 409, { error: 'session is not accepting messages', state: s.state })
+  s.held.push(item)
+  s.messageIds.add(item.messageId)
+  // As for a message taken at once: a member speaking ends a task wait, so
+  // the turn can finish and the swap can run.
+  if (!item.platform) cancelPendingParks(s, NEW_MESSAGE, NEW_MESSAGE_CANCELS)
+  maybeApplySetup(s)
+  send(res, 202, { queued: true, held: true })
+}
+
+function dropHeldFrom(s, keepFrom) {
+  const { kept, dropped } = filterHeld(s.held, keepFrom)
+  if (dropped === 0) return
+  forgetHeld(s, s.held.filter((item) => !kept.includes(item)))
+  s.held = kept
+  log(`session ${s.id}: dropped ${dropped} held message(s) the chat's new sharing no longer takes`)
+}
+
+function dropHeld(s, reason) {
+  if (s.held.length > 0) log(`session ${s.id}: dropped ${s.held.length} held message(s): ${reason}`)
+  forgetHeld(s, s.held)
+  s.held = []
+}
+
+// A dropped message was never delivered: one the control plane sends again
+// must not be answered as a duplicate.
+function forgetHeld(s, items) {
+  for (const item of items) s.messageIds.delete(item.messageId)
+}
+
+// A command, the shell, a model switch or a compaction can't run on a harness
+// about to be replaced; the caller is waiting, so the swap stops waiting for
+// background tasks.
+function refuseWhileSwitching(s) {
+  if (!inputHeld(s)) return
+  if (s.setup) {
+    s.setup.urgent = true
+    maybeApplySetup(s)
+  }
+  throw switchingConflict(s)
+}
+
+function switchingConflict(s) {
+  const e = new Error(SWITCHING_MESSAGE)
+  e.status = 409
+  e.fields = { state: s.state }
+  return e
+}
+
+function armSetupTimer(s) {
+  if (s.setupTimer) return
+  s.setupTimer = setInterval(() => maybeApplySetup(s), SETUP_POLL_MS)
+  s.setupTimer.unref?.()
+}
+
+function stopSetupTimer(s) {
+  clearInterval(s.setupTimer)
+  s.setupTimer = null
+}
+
+function abandonSetup(s, reason) {
+  if (s.setup) log(`session ${s.id}: set-up ${s.setup.id} abandoned: ${reason}`)
+  s.setup = null
+  s.answersFrom = ''
+  stopSetupTimer(s)
+  dropHeld(s, reason)
+}
+
+function maybeApplySetup(s) {
+  const setup = s.setup
+  if (!setup) return stopSetupTimer(s)
+  if (session !== s || isDone(s) || s.ending) return abandonSetup(s, 'session ended')
+  if (setupExpired(setup)) {
+    // The control plane re-seeds before it signals and ends the session when
+    // that fails: no signal means it died or gave up, and the set-up may be
+    // one it never meant to run. End, as /end does; the next session is set
+    // up afresh.
+    log(`session ${s.id}: set-up ${setup.id} got no apply in ${SETUP_APPLY_FALLBACK_MS / 1000}s; ending the session`)
+    return endSession(s)
+  }
+  if (s.swapping || !setupSignaled(setup)) return
+  // The seed stub has no harness to retire; its session is never idle.
+  if (typeof s.driver?.retire !== 'function') return
+  if (!readyToSwap(s, setup, countBackgroundTasks(s.backgroundTasks))) return
+  void applySetup(s)
+}
+
+// applySetup swaps the harness: the old one winds down quietly (no
+// session.ended), a new one starts on the new spec resuming the conversation,
+// and the input held meanwhile goes to it. The control reservation keeps
+// commands, the shell and the like out throughout.
+async function applySetup(s) {
+  const setup = s.setup
+  s.setup = null
+  stopSetupTimer(s)
+  s.swapping = true
+  s.swappingSetupId = setup.id
+  s.controlBusy = 'setup'
+  log(`session ${s.id}: restarting the ${s.harness} harness on set-up ${setup.id}`)
+  try {
+    const background = countBackgroundTasks(s.backgroundTasks)
+    if (!(await retireDriver(s, retireGrace(background)))) return await abandonDaemon(s, setup)
+    const stopped = countBackgroundTasks(s.backgroundTasks)
+    clearTaskLedger(s.backgroundTasks)
+    s.backgroundTasks = createTaskLedger()
+    // Whatever the old harness was still doing on its way out is over, its
+    // background tasks included: an idle already reported carried their count,
+    // which no idle flip would correct.
+    if (!isDone(s) && s.state !== 'idle') setState(s, 'idle')
+    else if (!isDone(s) && Math.max(background, stopped) > 0) s.pusher.emit('session.status', { state: 'idle', background_tasks: 0 })
+    if (s.ending || shuttingDown || isDone(s)) {
+      dropHeld(s, 'session ended during the set-up change')
+      endNeverStartedSession(s)
+      return
+    }
+    const resumedFrom = s.sdkSessionId || s.spec.resume_sdk_session_id || null
+    const spec = setupSpec(s.spec, setup.fields, resumedFrom)
+    const driver = await constructDriver(s, spec, s.helpers)
+    s.spec = spec
+    s.driver = driver
+    driver.start()
+    // Ended while the new harness was being built: it winds down like any.
+    if (s.ending || shuttingDown) {
+      dropHeld(s, 'session ended during the set-up change')
+      if (shuttingDown) await driver.shutdownStop()
+      else driver.beginEnd()
+      return
+    }
+    s.appliedSetupId = setup.id
+    s.pusher.emit('session.setup_applied', { setup_id: setup.id, instructions_scope: spec.instructions_scope || '', resumed_from: resumedFrom })
+    log(`session ${s.id}: set-up ${setup.id} applied; the ${s.harness} harness resumed ${resumedFrom || '(a new conversation)'}`)
+    // A later set-up arrived during the swap: what is held waits for it.
+    if (!s.setup) replayHeld(s)
+  } catch (err) {
+    failSetup(s, setup, err)
+  } finally {
+    s.swapping = false
+    s.swappingSetupId = null
+    if (s.controlBusy === 'setup') s.controlBusy = null
+    if (s.setup) {
+      armSetupTimer(s)
+      maybeApplySetup(s)
+    } else {
+      // The new set-up runs: what it asks is anyone's to answer again.
+      s.answersFrom = ''
+    }
+  }
+}
+
+// retireDriver stops the harness quietly, bounded throughout: one that won't
+// stop on its own within grace is killed, and false means even that wasn't
+// confirmed — a second harness must never run on the same transcript.
+async function retireDriver(s, grace) {
+  const d = s.driver
+  // A wind-down that fails can't vouch the harness is gone.
+  const stopped = d.retire().then(() => true, (err) => {
+    log(`session ${s.id}: harness wind-down failed: ${err?.message || err}`)
+    return false
+  })
+  if (await settledWithin(stopped, grace)) return true
+  log(`session ${s.id}: harness still running ${grace / 1000}s into the set-up change; stopping it`)
+  try {
+    const force = typeof d.forceStop === 'function' ? d.forceStop() : d.shutdownStop()
+    await settledWithin(Promise.resolve(force).catch((err) => log(`session ${s.id}: harness stop failed: ${err?.message || err}`)), RETIRE_ABORT_MS)
+  } catch (err) {
+    log(`session ${s.id}: harness stop failed: ${err?.message || err}`)
+  }
+  return await settledWithin(stopped, RETIRE_ABORT_MS)
+}
+
+// abandonDaemon is the last resort of a swap whose old harness could not be
+// confirmed gone: starting another would put two on one transcript, and this
+// daemon can no longer vouch for the VM. The session errors, and the daemon
+// exits; nothing restarts it, so the control plane finalizes the session on
+// that error, releases the VM, and the next session boots on a fresh one.
+async function abandonDaemon(s, setup) {
+  log(`session ${s.id}: FATAL: the ${s.harness} harness did not stop for set-up ${setup.id}; ending the session and exiting so no second harness can start on its transcript`)
+  dropHeld(s, 'the harness did not stop')
+  if (!isDone(s)) {
+    s.state = 'error'
+    s.pusher.emit('session.error', { message: "failed to restart the session on the chat's new sharing: the old harness did not stop" })
+  }
+  await s.pusher.drain(5000)
+  process.exit(1)
+}
+
+// replayHeld hands the held input to the new harness, in order. Each is
+// marked held on the timeline: it arrived after the control plane sent it,
+// so its turn can't be told from the one it was sent during (#1837).
+function replayHeld(s) {
+  const items = s.held.splice(0)
+  for (const [i, item] of items.entries()) {
+    const pendingCount = s.pendingContexts.length
+    const prompt = pendingCount > 0
+      ? `${item.prompt}\n\n${s.pendingContexts.slice(0, pendingCount).join('\n\n')}`
+      : item.prompt
+    if (!s.driver.queueMessage(prompt)) {
+      log(`session ${s.id}: the restarted harness refused held input; dropping ${items.length - i} message(s)`)
+      forgetHeld(s, items.slice(i))
+      return
+    }
+    if (pendingCount > 0) s.pendingContexts.splice(0, pendingCount)
+    emitUserMessage(s, heldMessage(item.visible))
+  }
+}
+
+function failSetup(s, setup, err) {
+  log(`session ${s.id}: set-up ${setup.id} failed: ${err?.stack || err}`)
+  dropHeld(s, 'the set-up change failed')
+  if (isDone(s)) return
+  s.state = 'error'
+  s.pusher.emit('session.error', { message: `failed to restart the session on the chat's new sharing: ${err?.message || err}` })
 }
 
 // endUndeliverable ends a live session whose events can no longer reach the
@@ -1388,7 +1735,13 @@ const server = createServer(async (req, res) => {
         // CP resolves it with the task's result or question, or the deadline
         // passes; a member's message ends the wait. The CP sets task_waits
         // only on a daemon with it.
-        caps: ['mcp', 'escalation', 'files', 'file-search', 'message-context', 'bulk-attachments', 'park', 'reclaim', 'skillfetch', 'pi-multiprovider', 'pi-gateway', 'opencode-gateway', 'background-tasks', 'tool-policy', 'agent-identity', 'commands', 'shell', 'model-switch', 'compact', 'image-mcp', 'desktop', 'speaker-attribution', 'session-instructions', 'platform-messages', 'task-questions', 'task-waits', ...HARNESS_CAPS],
+        // 'session-setup' (#2004): POST /v1/sessions/{id}/setup carries a
+        // chat's new sharing into its live session: input is held from then
+        // on, and at the next turn boundary, once …/setup/apply says the
+        // workspace is re-seeded, the harness restarts in place on the new
+        // instructions, resuming the conversation (session.setup_applied).
+        // Without it the CP ends the session to change its set-up.
+        caps: ['mcp', 'escalation', 'files', 'file-search', 'message-context', 'bulk-attachments', 'park', 'reclaim', 'skillfetch', 'pi-multiprovider', 'pi-gateway', 'opencode-gateway', 'background-tasks', 'tool-policy', 'agent-identity', 'commands', 'shell', 'model-switch', 'compact', 'image-mcp', 'desktop', 'speaker-attribution', 'session-instructions', 'platform-messages', 'task-questions', 'task-waits', 'session-setup', ...HARNESS_CAPS],
         active_session: session && !isDone(session) ? session.id : null,
         state: session?.state ?? null,
         // A session ended because its events could no longer reach the
@@ -1463,6 +1816,8 @@ const server = createServer(async (req, res) => {
       if (req.method === 'POST' && action === 'model' && parts.length === 4) return await handleModel(req, res, s)
       if (req.method === 'POST' && action === 'compact' && parts.length === 4) return await handleCompact(req, res, s)
       if (req.method === 'POST' && action === 'end' && parts.length === 4) return handleEnd(res, s)
+      if (req.method === 'POST' && action === 'setup' && parts.length === 4) return await handleSetup(req, res, s)
+      if (req.method === 'POST' && action === 'setup' && parts.length === 5 && parts[4] === 'apply') return await handleSetupApply(req, res, s)
     }
     send(res, 404, { error: 'not found' })
   } catch (err) {
