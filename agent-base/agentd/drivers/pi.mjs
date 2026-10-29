@@ -406,6 +406,14 @@ export async function createPiDriver(s, spec, h) {
     }
   }
 
+  // Context usage after a compaction (#2093): pi's own estimate of what is
+  // left, against the model's window, so the reading drops at once rather
+  // than at the next turn's end.
+  function emitCompactedUsage(result) {
+    const usage = contextUsagePayload(result?.estimatedTokensAfter, resolved.model?.contextWindow)
+    if (usage) s.pusher.emit('context.usage', usage, { turnId: null })
+  }
+
   const unsubscribe = session.subscribe((ev) => {
     try {
       switch (ev.type) {
@@ -469,6 +477,10 @@ export async function createPiDriver(s, spec, h) {
             break
           }
           s.pusher.emit('context.compacted', { trigger: 'auto', ...compactionTokens(ev.result) })
+          // Behind the turn's own result on the chain: a compaction at the
+          // end of a run lands after agent_end, and its smaller reading must
+          // not be overtaken by the result's, which waits on a disk sync.
+          chain(() => emitCompactedUsage(ev.result))
           break
         }
         default:
@@ -528,6 +540,7 @@ export async function createPiDriver(s, spec, h) {
         // Explicit null: a compaction is not a turn (the daemon syncs
         // before answering).
         s.pusher.emit('context.compacted', payload, { turnId: null })
+        emitCompactedUsage(result)
         return payload
       } catch (err) {
         const message = String(err?.message || err)
