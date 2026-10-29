@@ -738,3 +738,28 @@ test('forceStop kills a CLI that will not leave, through the abort the SDK honou
   assert.equal(s.state, 'idle')
   assert.deepEqual(events.slice(mark).map((e) => e.type), [], 'still no session.ended or session.error')
 })
+
+test("each turn's context usage is its own: a turn with no call reports none (#2095)", async () => {
+  const { driver, fake, events } = build()
+  const turnsDone = (n) => (ev) => ev.filter((e) => e.type === 'turn.completed').length >= n
+  const readings = () => events.filter((e) => e.type === 'context.usage').map((e) => e.payload)
+  const modelUsage = { 'claude-opus-5-5': { contextWindow: 200_000 } }
+
+  driver.queueMessage('first')
+  fake.send(init)
+  fake.send({
+    type: 'assistant',
+    parent_tool_use_id: null,
+    message: { content: [{ type: 'text', text: 'hi' }], usage: { input_tokens: 10, output_tokens: 90, cache_read_input_tokens: 40_000, cache_creation_input_tokens: 900 } },
+  })
+  fake.send({ ...result, modelUsage })
+  await until(events, turnsDone(1), 'the first turn to end')
+  assert.deepEqual(readings(), [{ tokens: 41_000, window: 200_000 }])
+
+  // A turn that ends before the model answers carries no new size.
+  driver.queueMessage('second')
+  fake.send({ ...result, subtype: 'error_during_execution', is_error: true, modelUsage })
+  await until(events, turnsDone(2), 'the second turn to end')
+  assert.deepEqual(readings(), [{ tokens: 41_000, window: 200_000 }])
+  fake.end()
+})

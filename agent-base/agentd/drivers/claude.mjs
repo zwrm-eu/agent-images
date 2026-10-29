@@ -790,9 +790,12 @@ export function createClaudeDriver(s, spec, h, { startQuery = query, drainGraceM
             s.pusher.emit('sdk.result', msg)
             // Context usage (#1553) from what the turn already carried: the
             // last call's usage against the window the result reports for
-            // the session's model. Session-level, so outside any turn.
+            // the session's model. Session-level, so outside any turn. The
+            // reading is this turn's own: a turn that made no call reports
+            // none, rather than the previous turn's size again (#2095).
             {
               const usage = contextUsagePayload(contextTokensFromUsage(lastAssistantUsage), sessionModelWindow(msg.modelUsage))
+              lastAssistantUsage = null
               if (usage) s.pusher.emit('context.usage', usage, { turnId: null })
             }
             // handleInterrupt owns the idle decision for an aborted provider

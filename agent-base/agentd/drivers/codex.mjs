@@ -373,11 +373,7 @@ export async function createCodexDriver(s, spec, h) {
       numTurns: 1,
       durationMS,
     }))
-    // Context usage (#1553): this turn's request size against the model's
-    // window, both from the app-server's own accounting (totalTokens already
-    // counts the cached input, which is a subset of inputTokens).
-    const usage = contextUsagePayload(lastUsage?.totalTokens, lastContextWindow)
-    if (usage) s.pusher.emit('context.usage', usage, { turnId: null })
+    emitContextUsage()
     if (finished) return
     if (closed || s.ending) {
       await finish()
@@ -594,6 +590,16 @@ export async function createCodexDriver(s, spec, h) {
     const post = pick('tokensAfter', 'tokens_after', 'activeContextTokensAfter', 'active_context_tokens_after', 'textTokensAfter', 'text_tokens_after')
     return { ...(pre !== undefined ? { pre_tokens: pre } : {}), ...(post !== undefined ? { post_tokens: post } : {}) }
   }
+  // Context usage (#1553): the last request's size against the model's
+  // window, both from the app-server's own accounting (totalTokens already
+  // counts the cached input, which is a subset of inputTokens). After a
+  // compaction the app-server re-estimates the history and reports that as
+  // `last` before the compaction item completes (codex-rs compact.rs,
+  // recompute_token_usage), so the same reading reflects it (#2093).
+  function emitContextUsage() {
+    const usage = contextUsagePayload(lastUsage?.totalTokens, lastContextWindow)
+    if (usage) s.pusher.emit('context.usage', usage, { turnId: null })
+  }
   function onCompacted(tokens, fromItem) {
     if (owedSignal) {
       owedSignal = false
@@ -607,10 +613,14 @@ export async function createCodexDriver(s, spec, h) {
       // Explicit null: a compaction is not a turn (the daemon syncs before
       // answering).
       s.pusher.emit('context.compacted', payload, { turnId: null })
+      emitContextUsage()
       waiting.resolve(payload)
       return
     }
-    if (fromItem) s.pusher.emit('context.compacted', { trigger: 'auto', ...tokens })
+    if (fromItem) {
+      s.pusher.emit('context.compacted', { trigger: 'auto', ...tokens })
+      emitContextUsage()
+    }
   }
 
   function failCompaction(message) {

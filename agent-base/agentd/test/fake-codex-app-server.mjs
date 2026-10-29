@@ -98,12 +98,25 @@ function ask(method, params) {
   })
 }
 
+// The usage codex-rs reports after a compaction: `last` holds only the
+// re-estimated history in totalTokens.
+function compactedUsage(estimate) {
+  return {
+    total: { totalTokens: 30, inputTokens: 10, cachedInputTokens: 2, outputTokens: 20, reasoningOutputTokens: 0 },
+    last: { totalTokens: estimate, inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0 },
+    modelContextWindow: 400000,
+  }
+}
+
 async function runTurn(turnId) {
   notify('turn/started', { threadId: THREAD_ID, turn: { id: turnId, items: [], status: 'inProgress', error: null } })
 
   if (scenario === 'auto-compaction') {
     // The app-server compacted on its own mid-turn (#1553): no request
-    // preceded it, so the driver must record it itself, once.
+    // preceded it, so the driver must record it itself, once. The
+    // re-estimated history comes first, as codex-rs recompute_token_usage
+    // sends it before the item completes (#2093).
+    notify('thread/tokenUsage/updated', { threadId: THREAD_ID, turnId, tokenUsage: compactedUsage(8) })
     notify('item/completed', {
       threadId: THREAD_ID, turnId,
       item: { type: 'contextCompaction', id: 'compact-auto' },
@@ -426,7 +439,9 @@ rl.on('line', async (line) => {
       trace('thread/compact/start', msg.params)
       send({ id: msg.id, result: {} })
       await sleep(5)
-      // codex-cli 0.160.0's item is id-only (no token counts).
+      // codex-cli 0.160.0's item is id-only (no token counts); the size
+      // left comes as `last` just before it (#2093).
+      notify('thread/tokenUsage/updated', { threadId: THREAD_ID, turnId: null, tokenUsage: compactedUsage(12) })
       notify('item/completed', {
         threadId: THREAD_ID, turnId: null,
         item: { type: 'contextCompaction', id: 'compact-1' },

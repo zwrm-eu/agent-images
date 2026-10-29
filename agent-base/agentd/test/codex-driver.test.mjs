@@ -239,6 +239,11 @@ test('compact asks the app-server between turns and resolves on its signal; auto
   assert.equal(recorded[0].turnId, null, 'recorded outside any turn')
   assert.deepEqual(recorded[0].payload, outcome)
   assert.equal(ctx.s.state, 'idle', 'a compaction is not a turn')
+  // The reading drops with the compaction, not at the next turn (#2093).
+  const after = ofType(ctx.events, 'context.usage')
+  assert.equal(after.length, 2)
+  assert.deepEqual(after[1].payload, { tokens: 12, window: 400000 })
+  assert.equal(after[1].turnId, null)
 
   assert.equal(ctx.driver.queueMessage('second'), true)
   await until(ctx.events, (e) => ofType(e, 'sdk.result').length === 2, 'second result')
@@ -254,6 +259,11 @@ test('an automatic codex compaction lands on the timeline as one context.compact
   const compacted = ofType(ctx.events, 'context.compacted')
   assert.equal(compacted.length, 1, 'both signals describe one compaction')
   assert.deepEqual(compacted[0].payload, { trigger: 'auto' })
+  // The size left after it, then the turn's own last request (#2093).
+  assert.deepEqual(ofType(ctx.events, 'context.usage').map((e) => e.payload), [
+    { tokens: 8, window: 400000 },
+    { tokens: 30, window: 400000 },
+  ])
   await ctx.driver.shutdownStop()
 })
 
