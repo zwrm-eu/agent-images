@@ -63,7 +63,7 @@ import {
 import { buildRunTools } from './pi-run-tools.mjs'
 import { platformToolNames } from './run-tools.mjs'
 import { evaluateToolPolicy } from './tool-policy.mjs'
-import { providerForModel } from './pi-provider.mjs'
+import { compactionReserves, keepCompactionReserves, providerForModel } from './pi-provider.mjs'
 
 // pi's tool_search tool (createToolSearchExtension), by the name pi gives it;
 // pi does not export the constant.
@@ -266,6 +266,11 @@ export async function createPiDriver(s, spec, h) {
     },
   }
 
+  // One settings manager for the loader and the session, carrying the
+  // platform's compaction size (COMPACT_AT_TOKENS) on top of settings.json.
+  const settingsManager = SettingsManager.create(cwd, agentDir)
+  keepCompactionReserves(settingsManager, compactionReserves(agentDir))
+
   // Deferred connector tools (#2026): the bridge leaves the tools of servers
   // past its budget out of every request (exposure "deferred"), and the
   // model loads the ones it needs with pi's tool_search, which is switched
@@ -296,7 +301,7 @@ export async function createPiDriver(s, spec, h) {
   const resourceLoader = new DefaultResourceLoader({
     cwd,
     agentDir,
-    settingsManager: SettingsManager.create(cwd, agentDir),
+    settingsManager,
     // Belt for the platform-managed skill library (#1064): settings.json's
     // skills entry (seeded by init, #1062) normally points here, but the
     // file is user-editable — managed skills must survive its loss.
@@ -332,6 +337,7 @@ export async function createPiDriver(s, spec, h) {
       model: spec.gateway_url ? { ...resolved.model, baseUrl: spec.gateway_url } : resolved.model,
       ...(mapEffort(spec.effort) ? { thinkingLevel: mapEffort(spec.effort) } : {}),
       sessionManager,
+      settingsManager,
       resourceLoader,
       ...(customTools.length > 0 ? { customTools } : {}),
     })

@@ -1,7 +1,12 @@
 import { strict as assert } from 'node:assert'
 import test from 'node:test'
 
-import { providerForModel } from '../drivers/pi-provider.mjs'
+import { readFile } from 'node:fs/promises'
+import { fileURLToPath } from 'node:url'
+
+import { SettingsManager, shouldCompact } from '@earendil-works/pi-coding-agent'
+
+import { COMPACT_AT_TOKENS, compactionReserves, keepCompactionReserves, providerForModel } from '../drivers/pi-provider.mjs'
 
 // The real shape the platform seeds (#1142): providers keyed by name, each with
 // its own model list.
@@ -140,4 +145,96 @@ test('duplicate ids resolve deterministically to the first key', () => {
     },
   })
   assert.equal(providerForModel('/a', 'shared/model', reader(dup)), 'lyceum')
+})
+
+// The models.json groups the platform writes (state.PiCatalogGroupName),
+// with real catalog windows.
+const WINDOWS = JSON.stringify({
+  providers: {
+    'zwrm-azure_openai': {
+      models: [
+        { id: 'openai/gpt-6.1-sol', contextWindow: 1_050_000 },
+        { id: 'openai/gpt-6-luna', contextWindow: 1_050_000 },
+      ],
+    },
+    'zwrm-bedrock': { models: [{ id: 'anthropic/claude-opus-5-5', contextWindow: 1_000_000 }] },
+    lyceum: {
+      models: [
+        { id: 'z-ai/glm-5.2', contextWindow: 262_144 },
+        { id: 'moonshotai/kimi-k2.7-code', contextWindow: 128_000 },
+        { id: 'no-window' },
+        { id: 'float-window', contextWindow: 1_050_000.5 },
+        { id: 'negative-window', contextWindow: -1 },
+        { id: 'string-window', contextWindow: '1050000' },
+      ],
+    },
+    nebius: { models: 'not a list' },
+    zwrm: { models: [{ id: 'zwrm/auto', contextWindow: 'large' }, null] },
+  },
+}).replace('"zwrm-bedrock":', '// pi\'s loader allows comments\n"zwrm-bedrock":')
+
+const SOL = { provider: 'zwrm-azure_openai', id: 'openai/gpt-6.1-sol', contextWindow: 1_050_000 }
+const OPUS = { provider: 'zwrm-bedrock', id: 'anthropic/claude-opus-5-5', contextWindow: 1_000_000 }
+const GLM = { provider: 'lyceum', id: 'z-ai/glm-5.2', contextWindow: 262_144 }
+
+test('large-window models get a reserve that compacts them at COMPACT_AT_TOKENS', () => {
+  assert.equal(COMPACT_AT_TOKENS, 256_000)
+  assert.deepEqual(compactionReserves('/a', reader(WINDOWS)), {
+    'zwrm-azure_openai/openai/gpt-6.1-sol': 794_000,
+    'zwrm-azure_openai/openai/gpt-6-luna': 794_000,
+    'zwrm-bedrock/anthropic/claude-opus-5-5': 744_000,
+  })
+})
+
+test('an unreadable catalog leaves pi\'s own compaction alone', () => {
+  for (const body of [null, 'not json', '{}', '{"providers":[]}', '{"providers":{"x":{"models":[{"id":"m"}]}}}']) {
+    assert.deepEqual(compactionReserves('/a', reader(body)), {})
+  }
+})
+
+// Against pi's own SettingsManager and threshold: the reserves reach the
+// check pi runs before each request, and nothing that rebuilds pi's
+// settings from the files drops them.
+test('pi compacts the session at COMPACT_AT_TOKENS, whatever rebuilds its settings', async () => {
+  const sm = SettingsManager.inMemory({ compaction: { keepRecentTokens: 30_000 } })
+  keepCompactionReserves(sm, compactionReserves('/a', reader(WINDOWS)))
+  const compactsAt = (model) => model.contextWindow - sm.getCompactionSettings(model).reserveTokens
+  const check = (when) => {
+    for (const model of [SOL, OPUS]) {
+      const settings = sm.getCompactionSettings(model)
+      assert.equal(shouldCompact(COMPACT_AT_TOKENS, model.contextWindow, settings), false, `${model.id} ${when}`)
+      assert.equal(shouldCompact(COMPACT_AT_TOKENS + 1, model.contextWindow, settings), true, `${model.id} ${when}`)
+      assert.equal(settings.keepRecentTokens, 30_000, `the user's other settings stay ${when}`)
+    }
+    // pi's default already compacts a 262k window below 256k.
+    assert.ok(compactsAt(GLM) < COMPACT_AT_TOKENS, when)
+  }
+  check('at start')
+  await sm.reload()
+  check('after a reload')
+  sm.setDefaultThinkingLevel('high')
+  check('after a save')
+  sm.setProjectTrusted(false)
+  check('after a trust change')
+  await sm.reload()
+  check('after another reload')
+})
+
+test('a larger reserve of the user\'s own still wins', () => {
+  const sm = SettingsManager.inMemory({
+    compaction: { modelOverrides: { 'zwrm-azure_openai/openai/gpt-6.1-sol': { reserveTokens: 900_000 } } },
+  })
+  keepCompactionReserves(sm, compactionReserves('/a', reader(WINDOWS)))
+  assert.equal(sm.getCompactionReserveTokens(SOL), 900_000)
+  assert.equal(sm.getCompactionReserveTokens(OPUS), 744_000)
+  assert.equal(sm.getCompactionReserveTokens(undefined), 16_384)
+})
+
+// Source-text pin: createAgentSession builds a settings manager of its own
+// unless given one, which would compact near the window again.
+test('the pi driver gives the session the settings manager that carries the reserves', async () => {
+  const src = await readFile(fileURLToPath(new URL('../drivers/pi.mjs', import.meta.url)), 'utf8')
+  assert.match(src, /keepCompactionReserves\(settingsManager, compactionReserves\(agentDir\)\)/)
+  const create = src.slice(src.indexOf('await createAgentSession({'))
+  assert.match(create.slice(0, create.indexOf('\n    })')), /\n\s+settingsManager,\n/)
 })

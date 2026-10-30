@@ -82,6 +82,19 @@ function stripJsonComments(text) {
 // rather than dependent on insertion order.
 export function providerForModel(agentDir, modelId, readFile = readFileSync) {
   if (!modelId) return null
+  const providers = readProviders(agentDir, readFile)
+  if (!providers) return null
+  for (const [name, provider] of Object.entries(providers)) {
+    const models = provider?.models
+    if (!Array.isArray(models)) continue
+    if (models.some((m) => m?.id === modelId)) return name
+  }
+  return null
+}
+
+// readProviders returns models.json's provider map, or null when the file is
+// missing, unparseable or not shaped like a catalog.
+function readProviders(agentDir, readFile) {
   let doc
   try {
     doc = JSON.parse(stripJsonComments(readFile(pathResolve(agentDir, 'models.json'), 'utf8')))
@@ -92,10 +105,55 @@ export function providerForModel(agentDir, modelId, readFile = readFileSync) {
   // Arrays are typeof 'object': an array-shaped catalog would otherwise yield a
   // numeric index ("0") as the provider name, which exists in no runtime.
   if (!providers || typeof providers !== 'object' || Array.isArray(providers)) return null
-  for (const [name, provider] of Object.entries(providers)) {
-    const models = provider?.models
-    if (!Array.isArray(models)) continue
-    if (models.some((m) => m?.id === modelId)) return name
+  return providers
+}
+
+// COMPACT_AT_TOKENS is the context size at which a managed pi session
+// compacts, whatever its model's window. pi compacts only near the window
+// (contextWindow - reserveTokens, 16384 by default), and the GPT-6 window is
+// 1.05M: every step resent the whole conversation, ~265k tokens a step on a
+// busy agent, which exhausted the Azure deployment's per-minute token quota
+// and passed GPT-6's long-context price step at 272k (twice the rate).
+export const COMPACT_AT_TOKENS = 256_000
+
+// pi's own reserveTokens default (DEFAULT_COMPACTION_SETTINGS).
+const PI_DEFAULT_RESERVE_TOKENS = 16_384
+
+// compactionReserves returns, for every catalog model whose window is
+// larger, the reserveTokens that makes it compact at COMPACT_AT_TOKENS: the
+// window minus that size. Smaller windows keep pi's default, which already
+// compacts below it. pi also caps a compaction's summaries by the reserve
+// (0.8 x for the history, 0.5 x for a split turn's prefix); with these
+// reserves the model's own maxTokens is the tighter cap.
+//
+// Keyed "<provider>/<id>" as pi keys a model's compaction settings, so a
+// model switched to mid-session is covered too. Empty when the catalog
+// cannot be read: the session then compacts as pi would on its own.
+export function compactionReserves(agentDir, readFile = readFileSync) {
+  const reserves = {}
+  for (const [name, provider] of Object.entries(readProviders(agentDir, readFile) ?? {})) {
+    const models = Array.isArray(provider?.models) ? provider.models : []
+    for (const m of models) {
+      const window = m?.contextWindow
+      if (typeof m?.id !== 'string' || !Number.isSafeInteger(window)) continue
+      const reserve = window - COMPACT_AT_TOKENS
+      if (reserve > PI_DEFAULT_RESERVE_TOKENS) reserves[`${name}/${m.id}`] = reserve
+    }
   }
-  return null
+  return reserves
+}
+
+// keepCompactionReserves makes a pi SettingsManager answer with reserves for
+// their models, at the getter every compaction reads its reserve through
+// (getCompactionSettings calls this.getCompactionReserveTokens). An override
+// in pi's settings would not hold: reload, save, saveProjectSettings and
+// setProjectTrusted all rebuild them from the files. A larger reserve of the
+// user's own (settings.json) still wins, since it compacts sooner.
+export function keepCompactionReserves(settingsManager, reserves) {
+  const own = settingsManager.getCompactionReserveTokens.bind(settingsManager)
+  settingsManager.getCompactionReserveTokens = (model) => {
+    const reserve = own(model)
+    const platform = model ? reserves[`${model.provider}/${model.id}`] : undefined
+    return platform === undefined ? reserve : Math.max(reserve, platform)
+  }
 }
