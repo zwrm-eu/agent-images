@@ -22,6 +22,12 @@ test('mcp tools are allowed', () => {
   assert.equal(evaluateToolPolicy('platform', 'mcp__github__create_issue', {}).allow, true)
 })
 
+// pi's tool_search (#2026) loads deferred tools, all of them bridged mcp__
+// tools: the platform assistant must reach them like the declared ones.
+test('platform allows tool_search', () => {
+  assert.equal(evaluateToolPolicy('platform', 'tool_search', { query: 'send mail' }).allow, true)
+})
+
 test('platform park tools are allowed', () => {
   assert.equal(evaluateToolPolicy('platform', 'sleep', {}).allow, true)
   assert.equal(evaluateToolPolicy('platform', 'sleep_until', {}).allow, true)

@@ -33,6 +33,7 @@ import { contextTokensFromUsage, contextUsagePayload } from '../event-payloads.m
 import { resolve as pathResolve } from 'node:path'
 import {
   createAgentSession,
+  createToolSearchExtension,
   DefaultResourceLoader,
   ModelRuntime,
   SessionManager,
@@ -52,11 +53,26 @@ import {
   turnErrorMessage,
   usagePayload,
 } from './pi-translate.mjs'
-import { buildBridgedTools } from './mcp-bridge.mjs'
+import {
+  buildBridgedTools,
+  DEFERRED_TOOLS_SECTION,
+  deferredToolsSection,
+  searchLoadedToolNames,
+  toolBudgetChars,
+} from './mcp-bridge.mjs'
 import { buildRunTools } from './pi-run-tools.mjs'
 import { platformToolNames } from './run-tools.mjs'
 import { evaluateToolPolicy } from './tool-policy.mjs'
 import { providerForModel } from './pi-provider.mjs'
+
+// pi's tool_search tool (createToolSearchExtension), by the name pi gives it;
+// pi does not export the constant.
+const TOOL_SEARCH = 'tool_search'
+// How many tools one tool_search may load (#2026): pi loads every match up
+// to its limit, 8 unless the model asks for more, and nothing unloads them,
+// so the declared tools would only grow.
+const TOOL_SEARCH_DEFAULT_LIMIT = 5
+const TOOL_SEARCH_MAX_LIMIT = 8
 
 // Belt only, and deliberately NOT kept in lockstep with state.PiModels[0] —
 // that is now z-ai/glm-5.2 (lyceum), and hardcoding a second vendor's model as
@@ -186,7 +202,8 @@ export async function createPiDriver(s, spec, h) {
 
   // The platform tools this session has (#803, #1911): they park the turn
   // and run nothing, so no person is ever asked to approve one, in any mode.
-  const platformTools = new Set(platformToolNames(spec))
+  // tool_search (#2026) runs nothing either: it only loads tool definitions.
+  const platformTools = new Set([...platformToolNames(spec), TOOL_SEARCH])
 
   // The gate extension is registered unconditionally and consults `mode` at
   // call time, so a mid-session mode switch applies to the next tool call —
@@ -249,6 +266,33 @@ export async function createPiDriver(s, spec, h) {
     },
   }
 
+  // Deferred connector tools (#2026): the bridge leaves the tools of servers
+  // past its budget out of every request (exposure "deferred"), and the
+  // model loads the ones it needs with pi's tool_search, which is switched
+  // on once the session exists (below). Set once the bridge is built; the
+  // extension reads it before each prompt.
+  let deferredTools = []
+  const toolLoadingExtension = {
+    name: 'zwrm-tool-loading',
+    factory: (pi) => {
+      // pi's documented argument patch: input is mutated in place.
+      pi.on('tool_call', (ev) => {
+        if (ev.toolName !== TOOL_SEARCH || !ev.input || typeof ev.input !== 'object') return undefined
+        const asked = Number.isInteger(ev.input.limit) && ev.input.limit > 0 ? ev.input.limit : TOOL_SEARCH_DEFAULT_LIMIT
+        ev.input.limit = Math.min(asked, TOOL_SEARCH_MAX_LIMIT)
+        return undefined
+      })
+      // tool_search lists no servers, so the prompt names them.
+      pi.on('before_agent_start', (event) => {
+        const sections = event.systemPromptOptions?.sections
+        if (!sections) return
+        const section = deferredToolsSection(deferredTools)
+        if (section) sections[DEFERRED_TOOLS_SECTION] = section
+        else delete sections[DEFERRED_TOOLS_SECTION]
+      })
+    },
+  }
+
   const resourceLoader = new DefaultResourceLoader({
     cwd,
     agentDir,
@@ -262,7 +306,7 @@ export async function createPiDriver(s, spec, h) {
     // message into the current one unless the provider's compat sets
     // supportsMidConvoSystemMessages, which build/pi_models.go never does.
     ...(spec.append_system_prompt ? { appendSystemPrompt: [spec.append_system_prompt] } : {}),
-    extensionFactories: [gateExtension],
+    extensionFactories: [gateExtension, createToolSearchExtension(), toolLoadingExtension],
   })
   await resourceLoader.reload()
 
@@ -274,7 +318,9 @@ export async function createPiDriver(s, spec, h) {
   // spec.task_waits (#1911), on runs and chats alike.
   // Built LAST among the fallible construction steps so an earlier throw
   // (resume jail, model resolution, loader) can't leak connected clients.
-  const bridge = await buildBridgedTools(spec.mcp_servers, h.log, { cwd })
+  const bridge = await buildBridgedTools(spec.mcp_servers, h.log,
+    { cwd, toolBudgetChars: toolBudgetChars(resolved.model?.contextWindow) })
+  deferredTools = bridge.deferred
   const customTools = [...bridge.tools, ...buildRunTools(s, h, spec)]
 
   let session
@@ -291,6 +337,18 @@ export async function createPiDriver(s, spec, h) {
     })
     session = created.session
     if (created.modelFallbackMessage) h.log(`pi session ${s.id}: ${created.modelFallbackMessage}`)
+    // pi registers tool_search inactive, and its session_start (where pi's
+    // own MCP support switches it on) fires only from bindExtensions, which
+    // this driver does not call. A resumed session also gets back the
+    // deferred tools its tool_search calls had loaded.
+    if (deferredTools.length > 0) {
+      const deferredNames = new Set(bridge.tools.filter((t) => t.exposure === 'deferred').map((t) => t.name))
+      const loaded = searchLoadedToolNames(session.sessionManager.getBranch(), TOOL_SEARCH)
+        .filter((name) => deferredNames.has(name))
+      const active = session.getActiveToolNames()
+      const next = [...new Set([...active, TOOL_SEARCH, ...loaded])]
+      if (next.length !== active.length) session.setActiveToolsByName(next)
+    }
   } catch (err) {
     bridge.close()
     const e = new Error(`failed to start pi session: ${err?.message || err}`)

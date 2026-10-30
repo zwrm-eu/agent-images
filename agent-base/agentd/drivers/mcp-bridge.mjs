@@ -66,13 +66,21 @@ export function mapMCPResult(result) {
 // back to JSON-Schema coercion when the TypeBox kind symbol is absent), so
 // the MCP inputSchema passes through unchanged. The execute abort signal is
 // forwarded into the MCP call. Exported for tests.
-export function toolDefinitionFor(slug, tool, call) {
+//
+// opts.deferred marks the tool deferred (#2026): pi leaves it out of the
+// tools declared to the model until tool_search loads it, and searches it
+// under the server's namespace, `mcp__<slug>`. Not with the server's
+// instructions: tool_search adds a namespace's text to each of its tools'
+// search text, where words every tool shares only make unrelated tools
+// match.
+export function toolDefinitionFor(slug, tool, call, opts = {}) {
   const name = `mcp__${slug}__${tool.name}`
   return {
     name,
     label: `${slug}: ${tool.name}`,
     description: tool.description || `${tool.name} (via ${slug})`,
     parameters: tool.inputSchema || { type: 'object', properties: {} },
+    ...(opts.deferred ? { exposure: 'deferred', namespace: { name: `mcp__${slug}` } } : {}),
     async execute(_toolCallId, params, signal) {
       return mapMCPResult(await call(tool.name, params, signal))
     },
@@ -120,16 +128,123 @@ async function connectServer(slug, cfg, opts = {}) {
   return client
 }
 
+// The platform's own session server (memory, skills, tasks, delegation): its
+// tools are always declared, whatever the budget. So are the image's own
+// stdio servers (#1676, e.g. a browser template's browser): they are what
+// the template is for.
+const PLATFORM_SERVER = 'zwrm'
+
+// The connector tool definitions (name, description and input schema, as
+// JSON) declared to the model with every request are kept within a budget
+// (#2026). pi resends every declared tool with each request, so one large
+// connector made every step expensive: an agent with Microsoft 365's 323
+// tools (~1.7M characters) sent ~218k tokens per call before it had said
+// anything. Like Claude Code's tool search, the budget is a tenth of the
+// model's context window (at ~4 characters a token), between 40k and 160k
+// characters. Connectors are declared smallest first while they fit; the
+// rest are deferred, and the model loads the tools it needs from them with
+// tool_search.
+export const TOOL_BUDGET_MIN_CHARS = 40_000
+export const TOOL_BUDGET_MAX_CHARS = 160_000
+
+// toolBudgetChars returns the budget for a model's context window in
+// tokens; an unknown window gets the smallest.
+export function toolBudgetChars(contextWindow) {
+  const share = Number.isFinite(contextWindow) && contextWindow > 0 ? Math.floor(contextWindow * 0.1 * 4) : 0
+  return Math.min(TOOL_BUDGET_MAX_CHARS, Math.max(TOOL_BUDGET_MIN_CHARS, share))
+}
+
+function toolSize(tool) {
+  return JSON.stringify({ name: tool.name, description: tool.description ?? '', inputSchema: tool.inputSchema ?? {} }).length
+}
+
+// deferredServers returns the slugs of the servers whose tools are deferred:
+// the connectors, smallest first, from the first one that no longer fits in
+// the budget. Exported for tests.
+export function deferredServers(entries, budget = TOOL_BUDGET_MIN_CHARS) {
+  const sized = entries
+    .filter((e) => e.slug !== PLATFORM_SERVER && e.type !== 'stdio')
+    .map((e) => ({ slug: e.slug, size: e.tools.reduce((n, t) => n + toolSize(t), 0) }))
+    .sort((a, b) => a.size - b.size || a.slug.localeCompare(b.slug))
+  const deferred = new Set()
+  let used = 0
+  for (const { slug, size } of sized) {
+    if (deferred.size === 0 && used + size <= budget) used += size
+    else deferred.add(slug)
+  }
+  return deferred
+}
+
+// The system prompt section that names the deferred servers, keyed like
+// pi's own sections. pi's tool_search lists no servers, so without it the
+// model would not know these tools exist; and a tool named in a skill, a
+// memory or a trigger's prompt, called before it is loaded, comes back
+// "not found".
+export const DEFERRED_TOOLS_SECTION = 'zwrm_deferred_tools'
+const SECTION_MAX_CHARS = 4096
+const SERVER_SUMMARY_MAX_CHARS = 200
+// A deferred server's tool names are listed when it has at most this many,
+// so the model can load one by its exact name.
+export const LISTED_TOOLS_MAX = 40
+
+// deferredToolsSection renders that section for the deferred servers
+// ({slug, tools, names?, instructions?}), or undefined when there are none.
+// A server's tool names are dropped, then its whole line, as the section
+// would outgrow its limit. Exported for tests.
+export function deferredToolsSection(servers) {
+  if (!servers?.length) return undefined
+  const intro = 'To keep each request small, the tools of these connectors are not declared to you up front. ' +
+    'Load the ones you need with `tool_search` before calling them: describe the action ' +
+    '(for example "upload a file to OneDrive"), or give a tool\'s exact name with limit 1. ' +
+    'A tool that has not been loaded yet answers "not found"; that does not mean it is missing. ' +
+    'Loaded tools stay available for the rest of this chat.'
+  const sorted = [...servers].sort((a, b) => a.slug.localeCompare(b.slug))
+  const lines = []
+  let size = intro.length
+  for (const [i, s] of sorted.entries()) {
+    let summary = (s.instructions ?? '').trim().split('\n', 1)[0].trim()
+    if (summary.length > SERVER_SUMMARY_MAX_CHARS) summary = `${summary.slice(0, SERVER_SUMMARY_MAX_CHARS - 1).trimEnd()}…`
+    const head = `- mcp__${s.slug} (${s.tools} tool${s.tools === 1 ? '' : 's'})${summary ? `: ${summary}` : ''}`
+    const named = s.names?.length ? `${head}\n  ${s.names.join(', ')}` : head
+    // Room for this line and, should a later one not fit, the closing line.
+    const room = SECTION_MAX_CHARS - size - 80
+    const line = named.length + 1 <= room ? named : head
+    if (line.length + 1 > room) {
+      lines.push(`- … ${sorted.length - i} more; find their tools with tool_search`)
+      break
+    }
+    lines.push(line)
+    size += line.length + 1
+  }
+  return [intro, ...lines].join('\n')
+}
+
 // buildBridgedTools connects every server and returns the pi ToolDefinitions
-// for all their tools. Per-server failures are logged and skipped; the
-// returned closer tears the clients down at session end.
-export async function buildBridgedTools(servers, log, opts) {
+// for all their tools, those of the deferred servers marked deferred, and
+// the deferred servers themselves ({slug, tools, names?, instructions?}).
+// opts.toolBudgetChars is the budget (toolBudgetChars of the session's
+// model). Per-server failures are logged and skipped; the returned closer
+// tears the clients down at session end.
+export async function buildBridgedTools(servers, log, opts = {}) {
   const { entries, close } = await connectServers(servers, log, opts)
+  const deferred = deferredServers(entries, opts.toolBudgetChars)
   const tools = []
   for (const e of entries) {
-    for (const t of e.tools) tools.push(toolDefinitionFor(e.slug, t, e.call))
+    const defer = deferred.has(e.slug)
+    for (const t of e.tools) tools.push(toolDefinitionFor(e.slug, t, e.call, defer ? { deferred: true } : {}))
   }
-  return { tools, close }
+  const deferredList = entries
+    .filter((e) => deferred.has(e.slug))
+    .map((e) => ({
+      slug: e.slug,
+      tools: e.tools.length,
+      ...(e.tools.length <= LISTED_TOOLS_MAX ? { names: e.tools.map((t) => `mcp__${e.slug}__${t.name}`) } : {}),
+      ...(e.instructions ? { instructions: e.instructions } : {}),
+    }))
+  if (deferredList.length > 0) {
+    log(`mcp bridge: deferred behind tool_search: ${deferredList.map((d) => `${d.slug} (${d.tools})`).join(', ')}`)
+  }
+  return { tools, close, deferred: deferredList }
 }
 
 // connectServers is the harness-neutral half of the bridge: it connects every
@@ -211,7 +326,8 @@ export async function connectServers(servers, log, opts = {}) {
         }
       }
 
-      entries.push({ slug, tools: listed.tools || [], call })
+      const instructions = client.getInstructions?.()
+      entries.push({ slug, type: cfg.type, tools: listed.tools || [], call, ...(typeof instructions === 'string' && instructions.trim() ? { instructions } : {}) })
       log(`mcp bridge: ${slug} exposes ${listed.tools?.length ?? 0} tool(s)`)
     } catch (err) {
       // Degrade per-server: the session proceeds without this server's
@@ -239,4 +355,24 @@ export async function connectServers(servers, log, opts = {}) {
       return Promise.race([Promise.all(closing), late]).finally(() => clearTimeout(timer))
     },
   }
+}
+
+// searchLoadedToolNames returns the tools tool_search loaded in a pi
+// session's branch (its results' details.loaded), which compaction keeps.
+// pi records the declared tools in the transcript but restores them only
+// when navigating the session tree, not when a session is opened from its
+// file, so the driver brings back what a resumed session had loaded. Only
+// what tool_search loaded: a chat from before a server was deferred
+// declared all of its tools, and must not get them back. Exported for
+// tests.
+export function searchLoadedToolNames(entries, toolSearchName = 'tool_search') {
+  const names = new Set()
+  for (const e of entries ?? []) {
+    const m = e?.type === 'message' ? e.message : undefined
+    if (m?.role !== 'toolResult' || m.toolName !== toolSearchName || m.isError) continue
+    for (const name of Array.isArray(m.details?.loaded) ? m.details.loaded : []) {
+      if (typeof name === 'string') names.add(name)
+    }
+  }
+  return [...names]
 }

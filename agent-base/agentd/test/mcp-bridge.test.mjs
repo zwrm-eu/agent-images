@@ -202,3 +202,134 @@ test('stdio servers (#1676): spawned with manifest env + session cwd, images sur
     bridge.close()
   }
 })
+
+// ---- Deferred connector tools (#2026): servers past the budget are left out
+// of pi's declared tools and loaded with tool_search.
+
+import {
+  deferredServers,
+  deferredToolsSection,
+  searchLoadedToolNames,
+  TOOL_BUDGET_MAX_CHARS,
+  TOOL_BUDGET_MIN_CHARS,
+  toolBudgetChars,
+} from '../drivers/mcp-bridge.mjs'
+
+const toolOfSize = (name, chars) => ({ name, description: 'x'.repeat(chars), inputSchema: { type: 'object', properties: {} } })
+
+test('toolDefinitionFor marks a deferred tool and names its namespace', () => {
+  const call = async () => ({ content: [] })
+  const direct = toolDefinitionFor('crm', { name: 'find' }, call)
+  assert.equal(direct.exposure, undefined)
+  assert.equal(direct.namespace, undefined)
+  const deferred = toolDefinitionFor('crm', { name: 'find' }, call, { deferred: true })
+  assert.equal(deferred.name, 'mcp__crm__find')
+  assert.equal(deferred.exposure, 'deferred')
+  assert.deepEqual(deferred.namespace, { name: 'mcp__crm' })
+})
+
+test('the budget is a tenth of the context window, within its bounds', () => {
+  assert.equal(toolBudgetChars(undefined), TOOL_BUDGET_MIN_CHARS)
+  assert.equal(toolBudgetChars(32_000), TOOL_BUDGET_MIN_CHARS)
+  assert.equal(toolBudgetChars(262_144), 104_857)
+  assert.equal(toolBudgetChars(1_050_000), TOOL_BUDGET_MAX_CHARS)
+})
+
+test('deferredServers declares connectors smallest first within the budget, never the platform or image servers', () => {
+  const budget = 40_000
+  const entries = [
+    { slug: 'zwrm', type: 'http', tools: [toolOfSize('a', 3 * budget)] },
+    { slug: 'browser', type: 'stdio', tools: [toolOfSize('b', 3 * budget)] },
+    { slug: 'huge', type: 'http', tools: Array.from({ length: 300 }, (_, i) => toolOfSize(`t${i}`, 5000)) },
+    { slug: 'small', type: 'http', tools: [toolOfSize('s', 1000)] },
+    { slug: 'medium', type: 'http', tools: [toolOfSize('m', budget / 2)] },
+    { slug: 'medium2', type: 'http', tools: [toolOfSize('m', budget / 2)] },
+  ]
+  // small and one medium fit; the second medium and huge do not.
+  assert.deepEqual([...deferredServers(entries, budget)].sort(), ['huge', 'medium2'])
+  assert.deepEqual([...deferredServers(entries.slice(0, 2).concat(entries[3]), budget)], [])
+  assert.deepEqual([...deferredServers([], budget)], [])
+})
+
+test('deferredToolsSection names the deferred servers and the tools of small ones, or nothing', () => {
+  assert.equal(deferredToolsSection([]), undefined)
+  assert.equal(deferredToolsSection(undefined), undefined)
+  const section = deferredToolsSection([
+    { slug: 'microsoft', tools: 323, instructions: 'Microsoft 365: mail, calendar and files.\nSecond line.' },
+    { slug: 'front', tools: 2, names: ['mcp__front__read_conversation', 'mcp__front__reply'] },
+  ])
+  assert.match(section, /tool_search/)
+  assert.match(section, /"not found"/)
+  const lines = section.split('\n')
+  assert.equal(lines[1], '- mcp__front (2 tools)')
+  assert.equal(lines[2], '  mcp__front__read_conversation, mcp__front__reply')
+  assert.equal(lines[3], '- mcp__microsoft (323 tools): Microsoft 365: mail, calendar and files.')
+  const many = deferredToolsSection(Array.from({ length: 200 }, (_, i) => ({
+    slug: `server-${i}`, tools: 30, names: Array.from({ length: 30 }, (_, j) => `mcp__server-${i}__tool_${j}`), instructions: 'y'.repeat(500),
+  })))
+  assert.ok(many.length <= 4096, `section is ${many.length} chars`)
+  assert.match(many.split('\n').at(-1), /^- … \d+ more; find their tools with tool_search$/)
+})
+
+test('searchLoadedToolNames brings back only what tool_search loaded', () => {
+  const result = (toolName, details, isError = false) => ({ type: 'message', message: { role: 'toolResult', toolName, details, isError } })
+  const entries = [
+    // A chat from before deferral declared every tool directly: not counted.
+    { type: 'message', message: { role: 'system', toolsAdded: [{ name: 'mcp__ms__all_of_them' }] } },
+    result('tool_search', { loaded: ['mcp__ms__upload', 'mcp__ms__send'] }),
+    result('mcp__ms__upload', { loaded: ['mcp__ms__ignored'] }),
+    result('tool_search', { loaded: ['mcp__ms__failed'] }, true),
+    { type: 'compaction', summary: 's' },
+    result('tool_search', { loaded: ['mcp__ms__send', 'mcp__ms__events'] }),
+  ]
+  assert.deepEqual(searchLoadedToolNames(entries).sort(), ['mcp__ms__events', 'mcp__ms__send', 'mcp__ms__upload'])
+  assert.deepEqual(searchLoadedToolNames(undefined), [])
+})
+
+function toolsMCPServer(tools, instructions) {
+  return createServer((req, res) => {
+    if (req.method !== 'POST') {
+      res.writeHead(405, { allow: 'POST' })
+      return res.end()
+    }
+    let body = ''
+    req.on('data', (c) => { body += c })
+    req.on('end', () => {
+      const msg = JSON.parse(body)
+      if (msg.id === undefined) {
+        res.writeHead(202)
+        return res.end()
+      }
+      const result = msg.method === 'initialize'
+        ? { protocolVersion: msg.params.protocolVersion, capabilities: { tools: {} }, serverInfo: { name: 't', version: '1' }, ...(instructions ? { instructions } : {}) }
+        : { tools }
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result }))
+    })
+  })
+}
+
+test('buildBridgedTools defers a server past the budget and reports it', async () => {
+  const big = toolsMCPServer(Array.from({ length: 50 }, (_, i) => toolOfSize(`op${i}`, 2000)), 'Microsoft 365 tools.')
+  const small = toolsMCPServer([toolOfSize('ping', 10)])
+  for (const s of [big, small]) await new Promise((r) => s.listen(0, '127.0.0.1', r))
+  const logs = []
+  const bridge = await buildBridgedTools({
+    ms: { type: 'http', url: `http://127.0.0.1:${big.address().port}/mcp` },
+    crm: { type: 'http', url: `http://127.0.0.1:${small.address().port}/mcp` },
+  }, (m) => logs.push(m), { toolBudgetChars: TOOL_BUDGET_MIN_CHARS })
+  try {
+    const byName = new Map(bridge.tools.map((t) => [t.name, t]))
+    assert.equal(byName.size, 51)
+    assert.equal(byName.get('mcp__crm__ping').exposure, undefined)
+    assert.equal(byName.get('mcp__ms__op0').exposure, 'deferred')
+    assert.deepEqual(byName.get('mcp__ms__op0').namespace, { name: 'mcp__ms' })
+    // 50 tools, more than LISTED_TOOLS_MAX: the section gives the count, not the names.
+    assert.deepEqual(bridge.deferred, [{ slug: 'ms', tools: 50, instructions: 'Microsoft 365 tools.' }])
+    assert.ok(logs.some((l) => l.includes('deferred behind tool_search: ms (50)')), `logs: ${logs}`)
+  } finally {
+    await bridge.close()
+    big.close()
+    small.close()
+  }
+})

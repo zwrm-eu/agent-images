@@ -86,6 +86,9 @@ function evaluatePlatform(toolName, input) {
   // The platform's own turn-parking tools: sleep/sleep_until (unattended
   // runs) and wait_for_task (#1911, runs and chats). They run nothing.
   if (toolName === 'sleep' || toolName === 'sleep_until' || toolName === 'wait_for_task') return { allow: true }
+  // pi's tool_search (#2026) loads deferred tools, which are all bridged
+  // mcp__ tools here, so it reaches nothing the line above does not allow.
+  if (toolName === 'tool_search') return { allow: true }
   if (toolName === 'bash') return evaluateBash(input)
   return {
     block: true,
