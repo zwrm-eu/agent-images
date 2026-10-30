@@ -357,7 +357,7 @@ test('pi never asks a person to approve a platform tool, and builds them by the 
   // Source-text pin: the gate lives inside createPiDriver, which needs the
   // pi SDK and a model to construct.
   const src = await readFile(PI_DRIVER, 'utf8')
-  assert.match(src, /const platformTools = new Set\(platformToolNames\(spec\)\)/)
+  assert.match(src, /const platformTools = new Set\(\[\.\.\.platformToolNames\(spec\), TOOL_SEARCH\]\)/)
   const policy = src.indexOf('if (spec.tool_policy) {')
   const allow = src.indexOf('if (platformTools.has(ev.toolName) && !forceConfirm) return undefined')
   const ask = src.indexOf("s.pusher.emit('permission.request'")
