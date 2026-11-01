@@ -22,6 +22,16 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { ErrorCode } from '@modelcontextprotocol/sdk/types.js'
+import { readFileSync } from 'node:fs'
+
+// bridgeUserAgent is what the bridge's calls to the platform say they are,
+// naming the harness it serves: the gateway's safety alerts (#2132) tell
+// an agent's own harness from a script calling the gateway by the
+// User-Agent.
+const AGENTD_VERSION = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version
+export function bridgeUserAgent(harness = 'pi') {
+  return `zwrm-agentd/${AGENTD_VERSION} (${harness})`
+}
 
 // How long close() waits for the bridged servers to go (#2004); the stdio
 // transport's own SIGTERM-then-SIGKILL escalation fits inside it.
@@ -109,8 +119,13 @@ export function toolDefinitionFor(slug, tool, call, opts = {}) {
 async function connectServer(slug, cfg, opts = {}) {
   let transport
   if (cfg.type === 'http' && cfg.url) {
+    // Named on the same object, never a copy (the bearer rotates on it).
+    if (!cfg.headers) cfg.headers = {}
+    if (!Object.keys(cfg.headers).some((k) => k.toLowerCase() === 'user-agent')) {
+      cfg.headers['User-Agent'] = bridgeUserAgent(opts.harness)
+    }
     transport = new StreamableHTTPClientTransport(new URL(cfg.url), {
-      requestInit: { headers: cfg.headers || {} },
+      requestInit: { headers: cfg.headers },
     })
   } else if (cfg.type === 'stdio' && cfg.command) {
     transport = new StdioClientTransport({

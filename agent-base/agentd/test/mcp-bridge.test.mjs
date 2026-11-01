@@ -75,7 +75,7 @@ import { buildBridgedTools, isConnectionError } from '../drivers/mcp-bridge.mjs'
 
 function statelessMCPServer(requests) {
   return createServer((req, res) => {
-    requests.push({ method: req.method, auth: req.headers.authorization || '' })
+    requests.push({ method: req.method, auth: req.headers.authorization || '', ua: req.headers['user-agent'] || '' })
     if (req.method !== 'POST') {
       res.writeHead(405, { allow: 'POST' })
       return res.end()
@@ -126,6 +126,9 @@ test('bearer rides every request; dead servers degrade; abort rejects fast', asy
     assert.ok(requests.length >= 3, `requests: ${requests.length}`)
     for (const r of requests) {
       assert.equal(r.auth, 'Bearer sekrit', `missing bearer on ${r.method}`)
+      // And names agentd, so the gateway's safety alerts (#2132) don't take
+      // the agent's own harness for a script.
+      assert.match(r.ua, /^zwrm-agentd\/\d+\.\d+\.\d+ \(pi\)$/, `user agent on ${r.method}: ${r.ua}`)
     }
 
     // A pre-aborted signal rejects without touching the upstream again.
@@ -331,5 +334,20 @@ test('buildBridgedTools defers a server past the budget and reports it', async (
     await bridge.close()
     big.close()
     small.close()
+  }
+})
+
+test('the bridge names the harness it serves in its User-Agent (#2132)', async () => {
+  const requests = []
+  const srv = statelessMCPServer(requests)
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r))
+  const url = `http://127.0.0.1:${srv.address().port}/mcp`
+  const bridge = await buildBridgedTools({ svc: { type: 'http', url, headers: { Authorization: 'Bearer x' } } }, () => {}, { harness: 'codex' })
+  try {
+    assert.ok(requests.length > 0)
+    for (const r of requests) assert.match(r.ua, /^zwrm-agentd\/\d+\.\d+\.\d+ \(codex\)$/)
+  } finally {
+    bridge.close()
+    srv.close()
   }
 })

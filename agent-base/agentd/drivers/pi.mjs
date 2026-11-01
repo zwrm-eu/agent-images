@@ -324,7 +324,7 @@ export async function createPiDriver(s, spec, h) {
   // Built LAST among the fallible construction steps so an earlier throw
   // (resume jail, model resolution, loader) can't leak connected clients.
   const bridge = await buildBridgedTools(spec.mcp_servers, h.log,
-    { cwd, toolBudgetChars: toolBudgetChars(resolved.model?.contextWindow) })
+    { cwd, harness: 'pi', toolBudgetChars: toolBudgetChars(resolved.model?.contextWindow) })
   deferredTools = bridge.deferred
   const customTools = [...bridge.tools, ...buildRunTools(s, h, spec)]
 
