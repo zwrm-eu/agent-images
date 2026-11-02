@@ -396,3 +396,13 @@ test('401/403/404/410 still stop the pusher for good', async () => {
     assert.equal(cp.stops.length, 1, 'the daemon hears that delivery stopped (#1664)')
   }
 })
+
+test('a device screenshot never reaches the control plane', async () => {
+  const cp = fakeCP(() => 200)
+  cp.pusher.emit('sdk.assistant', { type: 'assistant', message: { content: [{ type: 'tool_use', id: 'd1', name: 'mcp__device__screenshot_window', input: {} }] } })
+  cp.pusher.emit('sdk.user', { type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'd1',
+    content: [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'iVBORw0K' } }] }] } })
+  await settled(cp.pusher)
+  assert.equal(cp.delivered.length, 2)
+  assert.ok(!JSON.stringify(cp.delivered).includes('iVBORw0K'))
+})

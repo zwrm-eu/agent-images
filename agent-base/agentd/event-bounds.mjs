@@ -99,6 +99,42 @@ function stripBase64Node(obj) {
   return omitted > 0 ? { ...out, omitted_bytes: omitted } : obj
 }
 
+// A person's real screen stays out of the chat's stored events (#1930): the
+// model has had the image by the time an event is emitted, and a chat's events
+// reach everyone it is shared with and, for a private chat, an admin reading
+// it. A device tool's tool_use is named mcp__device__<tool> on every harness,
+// and only claude's events carry the bytes at all (the others flatten results
+// to text), so this keeps the ids of those calls and takes the images from
+// their results, whatever the event's size.
+export const DEVICE_SCREEN_PLACEHOLDER = "[A screenshot of the person's screen: shown to the agent, not stored.]"
+
+function dropScreenNode(obj) {
+  if (obj.type !== 'image') return obj
+  return { type: 'text', text: DEVICE_SCREEN_PLACEHOLDER }
+}
+
+export class DeviceScreens {
+  ids = new Set()
+
+  // strip returns payload itself unless it carries a device call's result.
+  strip(payload) {
+    const blocks = payload?.message?.content
+    if (!Array.isArray(blocks)) return payload
+    let hit = false
+    const content = blocks.map((b) => {
+      if (b?.type === 'tool_use' && typeof b.name === 'string' && b.name.startsWith('mcp__device__')) this.ids.add(b.id)
+      if (b?.type !== 'tool_result' || !this.ids.has(b.tool_use_id)) return b
+      hit = true
+      return rewrite(b, { object: dropScreenNode })
+    })
+    if (!hit) return payload
+    const out = { ...payload, message: { ...payload.message, content } }
+    // The CLI's duplicate of the tool output has the image too.
+    if (out.tool_use_result !== undefined) out.tool_use_result = rewrite(out.tool_use_result, { object: dropScreenNode })
+    return out
+  }
+}
+
 // The marker item is an object with a type, so code walking content blocks
 // by type skips it like any block it does not know.
 function shortenArray(arr) {

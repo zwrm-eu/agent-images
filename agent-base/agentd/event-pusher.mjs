@@ -7,7 +7,7 @@
 
 import { TurnEventContext } from './turn-events.mjs'
 import { ChangedFileTracker } from './changed-files.mjs'
-import { boundEventPayload, rejectedEventStub, MAX_EVENT_PAYLOAD_BYTES } from './event-bounds.mjs'
+import { boundEventPayload, rejectedEventStub, DeviceScreens, MAX_EVENT_PAYLOAD_BYTES } from './event-bounds.mjs'
 
 // One in-flight batch keeps ordering; the short flush window coalesces token
 // partials without adding visible latency.
@@ -86,6 +86,7 @@ export class EventPusher {
     this.truncatedPermissionRequests = new Set()
     this.stopped = false
     this.turns = new TurnEventContext()
+    this.deviceScreens = new DeviceScreens()
     this.changedFiles = new ChangedFileTracker()
   }
 
@@ -146,7 +147,8 @@ export class EventPusher {
     // shedding them is always safe.
     let queued = payload
     if (!ephemeral) {
-      const bounded = boundEventPayload(payload)
+      queued = this.deviceScreens.strip(queued)
+      const bounded = boundEventPayload(queued)
       if (bounded.shrunk) {
         this.log(`event seq ${this.seq} (${type}) for session ${this.sessionId}: payload of ${bounded.originalBytes} bytes is over the ${MAX_EVENT_PAYLOAD_BYTES}-byte cap; shrunk to ${bounded.bytes} bytes`)
         queued = bounded.payload

@@ -8,6 +8,8 @@ import assert from 'node:assert/strict'
 
 import {
   boundEventPayload,
+  DeviceScreens,
+  DEVICE_SCREEN_PLACEHOLDER,
   jsonBytes,
   rejectedEventStub,
   MAX_ARRAY_ITEMS,
@@ -256,4 +258,32 @@ test('a rejected-event stub keeps seq, ts, type, turn and the payload’s identi
   assert.deepEqual(rejectedEventStub({ seq: 9, ts: 'x', type: 'sdk.user', payload: cyclic }, null).payload, {
     type: 'user', zwrm_truncated: true, zwrm_rejected: true,
   })
+})
+
+// #1930: a screenshot of a person's real screen reaches the model, never the
+// stored events, whatever its size. Other tools' images stay.
+test('a device tool result loses its image, and the same call only', () => {
+  const image = { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'iVBORw0K' } }
+  const text = { type: 'text', text: 'The window, 800×600 pixels' }
+  const result = (id) => ({ type: 'tool_result', tool_use_id: id, content: [image, text] })
+  const screens = new DeviceScreens()
+
+  const use = { type: 'assistant', message: { content: [
+    { type: 'tool_use', id: 'dev', name: 'mcp__device__screenshot_window', input: {} },
+    { type: 'tool_use', id: 'other', name: 'mcp__chrome__screenshot', input: {} },
+  ] } }
+  assert.equal(screens.strip(use), use)
+
+  const other = { type: 'user', message: { content: [result('other')] }, tool_use_result: [image, text] }
+  assert.equal(screens.strip(other), other, 'another tool keeps its image')
+
+  const placeholder = { type: 'text', text: DEVICE_SCREEN_PLACEHOLDER }
+  const payload = { type: 'user', message: { content: [result('dev')] }, tool_use_result: [image, text] }
+  const out = screens.strip(payload)
+  assert.deepEqual(out.message.content, [{ type: 'tool_result', tool_use_id: 'dev', content: [placeholder, text] }])
+  assert.deepEqual(out.tool_use_result, [placeholder, text])
+  assert.ok(!JSON.stringify(out).includes('iVBORw0K'))
+  assert.ok(JSON.stringify(payload).includes('iVBORw0K'), "the caller's payload is left alone")
+
+  for (const p of [null, undefined, 'text', { type: 'status' }, { message: { content: 'hi' } }]) assert.equal(screens.strip(p), p)
 })
