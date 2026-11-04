@@ -247,6 +247,7 @@ export async function createOpenCodeDriver(s, spec, h) {
   // re-delivered update cannot double-render (SSE reconnect replays nothing,
   // but updates for one part legitimately arrive many times).
   let toolEmitted = new Map() // callID -> 'use' | 'result'
+  const toolInputs = new Map() // callID -> the call's arguments
   // Text parts stream by growing in place: keep the emitted length per part
   // for delta extraction, and the flushed length for the boundary flush.
   let textParts = new Map() // partID -> {text, emittedLen, flushedLen}
@@ -457,6 +458,18 @@ export async function createOpenCodeDriver(s, spec, h) {
 
   // One ask at a time is OpenCode's own behavior (the tool pauses); the
   // pending map still supports several, matching the other drivers.
+  // The arguments a call started with, briefly waited for: the part and the ask
+  // race on the bus. Without them the request shows what the ask itself says,
+  // and the gateway finds no yes for the real call.
+  async function toolCallInput(callID) {
+    for (let waited = 0; callID && waited < 2000; waited += 50) {
+      const input = toolInputs.get(callID)
+      if (input) return input
+      await new Promise((resolve) => setTimeout(resolve, 50))
+    }
+    return callID ? toolInputs.get(callID) : undefined
+  }
+
   async function onAsk(ask) {
     const askId = ask?.id
     if (!askId) return
@@ -465,11 +478,11 @@ export async function createOpenCodeDriver(s, spec, h) {
     // After /end nothing may block on a human (server semantics: pending
     // asks were already denied); auto-deny new ones.
     if (s.ending) return reply('reject')
-    if (mode === 'bypassPermissions') return reply('once')
     // The gate and the escalation policy match the CANONICAL name: an MCP
     // ask arrives under OpenCode's wire name (`<slug>_<tool>`), and
     // mcp__<slug>__<tool> is what every harness's policy speaks (#731).
     const canonical = canonicalOpenCodeToolName(ask.permission ?? '', mcpSlugs)
+    if (mode === 'bypassPermissions' && !h.isEscalatedTool(canonical, spec.escalate_servers)) return reply('once')
     // The session config allows the platform tools; should OpenCode ask
     // anyway, no person is asked to approve one (#1911).
     if (platformTools.has(canonical)) return reply('once')
@@ -477,10 +490,13 @@ export async function createOpenCodeDriver(s, spec, h) {
     if (spec.auto_approve && !h.isEscalatedTool(canonical, spec.escalate_servers)) {
       return reply('once')
     }
+    // OpenCode's ask for an MCP tool carries no arguments: they're on the tool
+    // part, which the bus sends as the call starts.
+    const called = canonical.startsWith('mcp__') ? await toolCallInput(ask.tool?.callID) : undefined
     const decision = await awaitDecision({
       requestId: askId,
       toolName: canonical,
-      input: gateInputFor(ask),
+      input: called ?? gateInputFor(ask),
       toolUseId: ask.tool?.callID ?? '',
       openSet: openAsks,
     })
@@ -619,6 +635,7 @@ export async function createOpenCodeDriver(s, spec, h) {
           } else if (part.type === 'tool') {
             const callID = part.callID ?? part.id
             const status = part.state?.status
+            if (status === 'running' && part.state?.input && typeof part.state.input === 'object') toolInputs.set(callID, part.state.input)
             const stage = toolEmitted.get(callID)
             // The transcript speaks canonical names too — one tool call must
             // not appear under two names across harnesses (the codex rule).

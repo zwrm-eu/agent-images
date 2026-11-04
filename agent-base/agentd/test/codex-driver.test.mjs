@@ -1702,3 +1702,15 @@ test('forceStop kills the app-server and the retire still waits for its exit (#2
     'no session.ended, no session.error')
   assert.equal(ctx.driver.queueMessage('too late'), false)
 })
+
+test('full access keeps asking for a tool an org rule names (#2135)', async () => {
+  const ctx = await build(newHarness({
+    scenario: 'approval',
+    spec: { permission_mode: 'bypassPermissions', escalate_servers: ['nothing__matches'] },
+  }))
+  ctx.driver.start()
+  ctx.driver.queueMessage('go')
+  await until(ctx.events, (e) => ofType(e, 'sdk.result').length > 0, 'sdk.result')
+  assert.equal(ofType(ctx.events, 'permission.request').length, 0, 'what no rule names goes through')
+  await ctx.driver.shutdownStop()
+})

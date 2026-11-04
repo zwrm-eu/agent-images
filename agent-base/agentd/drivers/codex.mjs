@@ -419,7 +419,7 @@ export async function createCodexDriver(s, spec, h) {
     // A question (#1555) is not a tool approval: bypass and run auto-approve
     // must not answer it — an allow without answers is a refusal below.
     if (kind !== 'question') {
-      if (mode === 'bypassPermissions') return { allow: true }
+      if (mode === 'bypassPermissions' && !h.isEscalatedTool(toolName, spec.escalate_servers)) return { allow: true }
       if (spec.auto_approve && !h.isEscalatedTool(toolName, spec.escalate_servers)) {
         return { allow: true }
       }

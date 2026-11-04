@@ -341,6 +341,22 @@ export function createClaudeDriver(s, spec, h, { startQuery = query, drainGraceM
   // The mode the CLI runs in: the spec's, then what setPermissionMode asks
   // for and what the CLI reports (it moves itself into and out of plan mode).
   let permissionMode = spec.permission_mode || 'bypassPermissions'
+  // Full access with tools that ask (#2135): the CLI asks this callback only
+  // outside bypass, so it runs in default and the callback allows the rest.
+  const cliMode = (mode) => (mode === 'bypassPermissions' && spec.escalate_servers?.length ? 'default' : mode)
+  // Plan mode returns to what the CLI ran in before it, which then reads as
+  // default: where it came from says whether that was full access.
+  let planFrom = null
+  const followCliMode = (reported) => {
+    if (reported === cliMode(permissionMode)) return
+    if (reported === 'plan') {
+      planFrom = permissionMode
+      permissionMode = 'plan'
+      return
+    }
+    permissionMode = reported === cliMode(planFrom) && permissionMode === 'plan' ? planFrom : reported
+    planFrom = null
+  }
   // setPermissionMode calls in flight; meanwhile the CLI may still report the
   // mode it is leaving.
   let modeChanges = 0
@@ -367,7 +383,7 @@ export function createClaudeDriver(s, spec, h, { startQuery = query, drainGraceM
     // stop a run nobody watches and a chat whose client shows no such prompt
     // (kaizen renders questions only). Still for the person: a question, a
     // plan to approve, and a call someone's permissions.ask rule names.
-    if (permissionMode === 'bypassPermissions' && !PERSON_TOOLS.has(toolName) && !opts.matchedAskRule) {
+    if (permissionMode === 'bypassPermissions' && !PERSON_TOOLS.has(toolName) && !opts.matchedAskRule && !h.isEscalatedTool(toolName, spec.escalate_servers)) {
       h.log(`full access: allowing ${toolName}${typeof opts.decisionReason === 'string' ? ` (${opts.decisionReason})` : ''}`)
       return { behavior: 'allow' }
     }
@@ -433,7 +449,7 @@ export function createClaudeDriver(s, spec, h, { startQuery = query, drainGraceM
     pathToClaudeCodeExecutable: claudeExecutable,
     includePartialMessages: true,
     abortController,
-    permissionMode,
+    permissionMode: cliMode(permissionMode),
     // The Agent SDK refuses both an initial bypass mode and a later
     // setPermissionMode('bypassPermissions') unless this construction-time
     // opt-in is present. Setting it does not itself bypass anything — the
@@ -739,7 +755,7 @@ export function createClaudeDriver(s, spec, h, { startQuery = query, drainGraceM
             if (msg.subtype === 'compact_boundary') onCompactBoundary(msg)
             if (msg.subtype === 'status') onCompactStatus(msg)
             if ((msg.subtype === 'init' || msg.subtype === 'status') && typeof msg.permissionMode === 'string' && modeChanges === 0) {
-              permissionMode = msg.permissionMode
+              followCliMode(msg.permissionMode)
             }
             applyTaskLedger(msg)
             s.pusher.emit('sdk.system', msg)
@@ -959,14 +975,20 @@ export function createClaudeDriver(s, spec, h, { startQuery = query, drainGraceM
       }
     },
 
+    // The tools that ask changed (#2135): full access runs the CLI where this
+    // callback hears them. Any other mode is left as it is.
+    async askToolsChanged() {
+      if (permissionMode === 'bypassPermissions') await q.setPermissionMode(cliMode(permissionMode))
+    },
     async setPermissionMode(mode) {
       // Leaving full access holds from the request on, entering it once the
       // CLI is in it: an ask in between goes to the person either way.
       const previous = permissionMode
+      planFrom = mode === 'plan' ? previous : null
       if (mode !== 'bypassPermissions') permissionMode = mode
       modeChanges++
       try {
-        await q.setPermissionMode(mode)
+        await q.setPermissionMode(cliMode(mode))
       } catch (err) {
         permissionMode = previous
         throw err

@@ -763,3 +763,36 @@ test("each turn's context usage is its own: a turn with no call reports none (#2
   assert.deepEqual(readings(), [{ tokens: 41_000, window: 200_000 }])
   fake.end()
 })
+
+test('full access keeps asking for a tool an org rule names, and only that tool (#2135)', async () => {
+  const { h, fake, events } = build({ permission_mode: 'bypassPermissions', escalate_servers: ['crm__send_mail'] })
+  h.isEscalatedTool = (tool, servers) => servers.some((name) => tool === `mcp__${name}`)
+  // The CLI asks this callback only outside bypass, and reports what it runs in.
+  assert.equal(fake.options.permissionMode, 'default')
+  fake.send({ ...init, permissionMode: 'default' })
+  await until(events, (ev) => ev.some(isInit), 'the init')
+  assert.equal((await fake.options.canUseTool('Bash', { command: 'ls' }, { toolUseID: 'toolu_bash' })).behavior, 'allow')
+  assert.equal((await fake.options.canUseTool('mcp__crm__read_mail', {}, { toolUseID: 'toolu_read' })).behavior, 'allow')
+  assert.equal(requests(events).length, 0)
+  fake.options.canUseTool('mcp__crm__send_mail', { to: 'a@example.com' }, { toolUseID: 'toolu_send' })
+  await until(events, (ev) => requests(ev).length === 1, 'the request')
+  assert.equal(requests(events)[0].payload.tool_name, 'mcp__crm__send_mail')
+  fake.end()
+})
+
+test('leaving plan mode returns to full access with tools that ask (#2135)', async () => {
+  const { h, fake, events } = build({ permission_mode: 'bypassPermissions', escalate_servers: ['crm__send_mail'] })
+  h.isEscalatedTool = (tool, servers) => servers.some((name) => tool === `mcp__${name}`)
+  const status = (permissionMode) => fake.send({ type: 'system', subtype: 'status', status: null, permissionMode, session_id: 'sdk' })
+  fake.send({ ...init, permissionMode: 'default' })
+  await until(events, (ev) => ev.some(isInit), 'the init')
+  const statuses = (ev) => ev.filter((e) => e.type === 'sdk.system' && e.payload.subtype === 'status').length
+  status('plan')
+  await until(events, (ev) => statuses(ev) === 1, 'the plan status')
+  fake.options.canUseTool(rmCheck.toolName, rmCheck.input, rmCheck.opts)
+  await until(events, (ev) => requests(ev).length === 1, 'plan mode asking')
+  status('default')
+  await until(events, (ev) => statuses(ev) === 2, 'the status')
+  assert.equal((await fake.options.canUseTool('Bash', { command: 'ls' }, { toolUseID: 'toolu_after' })).behavior, 'allow')
+  fake.end()
+})

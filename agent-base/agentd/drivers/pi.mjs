@@ -230,7 +230,7 @@ export async function createPiDriver(s, spec, h) {
           forceConfirm = Boolean(verdict.confirm)
         }
         if (platformTools.has(ev.toolName) && !forceConfirm) return undefined
-        if (mode === 'bypassPermissions' && !forceConfirm) return undefined
+        if (mode === 'bypassPermissions' && !forceConfirm && !h.isEscalatedTool(ev.toolName, spec.escalate_servers)) return undefined
         if (spec.auto_approve && !forceConfirm && !h.isEscalatedTool(ev.toolName, spec.escalate_servers)) {
           return undefined
         }

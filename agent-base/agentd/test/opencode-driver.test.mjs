@@ -557,6 +557,44 @@ test('a run (auto_approve) approves native asks without a platform event', async
   }
 })
 
+test('full access keeps asking for a tool an org rule names, and only that tool (#2135)', async () => {
+  const fake = await startFakeOpenCode()
+  try {
+    const { s, driver, events } = await build(fake, newHarness({
+      spec: { permission_mode: 'bypassPermissions', escalate_servers: ['bash'], mcp_servers: {} },
+    }))
+    driver.start()
+    driver.queueMessage('go')
+    await until(events, () => fake.state.prompts.length === 1, 'prompt')
+    fake.emit('permission.asked', { id: 'per_r', sessionID: s.sdkSessionId, permission: 'edit', metadata: {} })
+    await until([], () => fake.state.replies.length === 1, 'the tool no rule names')
+    assert.equal(ofType(events, 'permission.request').length, 0)
+    fake.assertNoViolations(assert)
+  } finally {
+    await fake.close()
+  }
+})
+
+test('an MCP ask shows the call its tool part started with (#2135)', async () => {
+  const fake = await startFakeOpenCode()
+  try {
+    const { s, driver, events } = await build(fake, newHarness({
+      spec: { permission_mode: 'default', mcp_servers: { crm: { type: 'http', url: 'http://x' } } },
+    }))
+    driver.start()
+    driver.queueMessage('go')
+    await until(events, () => fake.state.prompts.length === 1, 'prompt')
+    fake.emit('message.part.updated', { part: { id: 'p1', type: 'tool', sessionID: s.sdkSessionId, callID: 'call_1', tool: 'crm_send', state: { status: 'running', input: { to: 'a@example.com' } } } })
+    fake.emit('permission.asked', { id: 'per_c', sessionID: s.sdkSessionId, permission: 'crm_send', metadata: {}, patterns: ['*'], always: ['*'], tool: { messageID: 'm1', callID: 'call_1' } })
+    await until(events, (ev) => ofType(ev, 'permission.request').length === 1, 'the request')
+    const request = ofType(events, 'permission.request')[0].payload
+    assert.equal(request.tool_name, 'mcp__crm__send')
+    assert.deepEqual(request.input, { to: 'a@example.com' })
+  } finally {
+    await fake.close()
+  }
+})
+
 test('a failed turn still emits exactly one result (the run-completion gate)', async () => {
   const fake = await startFakeOpenCode()
   try {

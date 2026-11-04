@@ -488,3 +488,12 @@ test('while a sharing change is in flight only its owner allows what the old tur
   assert.match(handlerBody(src, 'handleSetup'), /s\.answersFrom = setup\.answersFrom/)
   assert.match(handlerBody(src, 'applySetup'), /s\.answersFrom = ''/, 'cleared once the swap completes')
 })
+
+test('a rule saved while a chat is live reaches it like a mode change (#2135)', async () => {
+  const src = await readFile(SERVER, 'utf8')
+  const handler = handlerBody(src, 'handleAskTools')
+  assert.match(handler, /s\.spec\.escalate_servers = body\.tools/)
+  assert.match(handler, /askToolsChanged/)
+  assert.match(handler, /inputHeld\(s\)/)
+  assert.match(src, /'tool-asks'/)
+})

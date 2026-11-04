@@ -1282,6 +1282,18 @@ async function handleMode(req, res, s) {
   send(res, 200, { mode: body.mode })
 }
 
+// A rule saved while a chat is live (#2135): the tools that ask from here on,
+// read at each call. A driver whose harness must move to hear them is told.
+async function handleAskTools(req, res, s) {
+  const body = await readBody(req)
+  if (!Array.isArray(body.tools) || body.tools.some((t) => typeof t !== 'string')) throw badRequest('tools must be a list of names')
+  if (isDone(s)) return send(res, 409, { error: 'session is finished', state: s.state })
+  if (inputHeld(s)) throw switchingConflict(s)
+  s.spec.escalate_servers = body.tools
+  await s.driver.askToolsChanged?.()
+  send(res, 200, { tools: body.tools })
+}
+
 // Graceful end: the current turn finishes (an abrupt stop is what /interrupt
 // is for), but nothing may block on a human anymore — pending approvals are
 // denied and later tool prompts auto-deny via s.ending.
@@ -1741,7 +1753,7 @@ const server = createServer(async (req, res) => {
         // workspace is re-seeded, the harness restarts in place on the new
         // instructions, resuming the conversation (session.setup_applied).
         // Without it the CP ends the session to change its set-up.
-        caps: ['mcp', 'escalation', 'files', 'file-search', 'message-context', 'bulk-attachments', 'park', 'reclaim', 'skillfetch', 'pi-multiprovider', 'pi-gateway', 'opencode-gateway', 'background-tasks', 'tool-policy', 'agent-identity', 'commands', 'shell', 'model-switch', 'compact', 'image-mcp', 'desktop', 'speaker-attribution', 'session-instructions', 'platform-messages', 'task-questions', 'task-waits', 'session-setup', ...HARNESS_CAPS],
+        caps: ['mcp', 'escalation', 'tool-asks', 'files', 'file-search', 'message-context', 'bulk-attachments', 'park', 'reclaim', 'skillfetch', 'pi-multiprovider', 'pi-gateway', 'opencode-gateway', 'background-tasks', 'tool-policy', 'agent-identity', 'commands', 'shell', 'model-switch', 'compact', 'image-mcp', 'desktop', 'speaker-attribution', 'session-instructions', 'platform-messages', 'task-questions', 'task-waits', 'session-setup', ...HARNESS_CAPS],
         active_session: session && !isDone(session) ? session.id : null,
         state: session?.state ?? null,
         // A session ended because its events could no longer reach the
@@ -1813,6 +1825,7 @@ const server = createServer(async (req, res) => {
       if (req.method === 'POST' && action === 'permissions' && parts.length === 5) return await handlePermission(req, res, s, parts[4])
       if (req.method === 'POST' && action === 'parks' && parts.length === 6 && parts[5] === 'resolve') return await handleParkResolve(req, res, s, parts[4])
       if (req.method === 'POST' && action === 'mode' && parts.length === 4) return await handleMode(req, res, s)
+      if (req.method === 'POST' && action === 'ask-tools' && parts.length === 4) return await handleAskTools(req, res, s)
       if (req.method === 'POST' && action === 'model' && parts.length === 4) return await handleModel(req, res, s)
       if (req.method === 'POST' && action === 'compact' && parts.length === 4) return await handleCompact(req, res, s)
       if (req.method === 'POST' && action === 'end' && parts.length === 4) return handleEnd(res, s)
