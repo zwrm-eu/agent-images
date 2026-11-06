@@ -29,7 +29,7 @@ import {
 // WHY THE NAMES DIFFER FROM EVERY OTHER HARNESS: codex RESERVES the `mcp__`
 // prefix. Declaring `mcp__github__create_issue` is rejected outright —
 // "dynamic tool name is reserved" — and so is a namespace of that shape
-// (verified against the pinned 0.160.0). So the wire name the model sees is
+// (verified against the pinned 0.166.0). So the wire name the model sees is
 // `zwrm__<slug>__<tool>`, and the driver canonicalizes it back to
 // `mcp__<slug>__<tool>` before anything platform-side sees it: the escalation
 // gate matches the canonical name, and so does the transcript, so a codex run

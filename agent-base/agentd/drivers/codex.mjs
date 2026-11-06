@@ -182,7 +182,7 @@ export async function createCodexDriver(s, spec, h) {
     // harness is broken" and sends them hunting in the wrong place.
     //
     // The checks mirror what codex itself enforces when it reads the file,
-    // measured against the pinned 0.160.0 with `codex login status`:
+    // measured against the pinned 0.166.0 with `codex login status`:
     //   - `tokens` must be an object; a bare token string is rejected with
     //     "invalid type: string, expected struct TokenData";
     //   - `id_token` is MANDATORY ("missing field `id_token`") and is parsed
@@ -576,7 +576,7 @@ export async function createCodexDriver(s, spec, h) {
   // The model's context window, from thread/tokenUsage/updated (#1553).
   let lastContextWindow = null
   // The pinned app-server's contextCompaction item carries only an id (no
-  // counts, checked in codex-cli 0.160.0), so this yields {} today; the
+  // counts, checked in codex-cli 0.166.0), so this yields {} today; the
   // names are read defensively for a build that adds them.
   function compactionTokens(source) {
     const pick = (...keys) => {
@@ -953,7 +953,7 @@ export async function createCodexDriver(s, spec, h) {
   // KNOWN, genuinely different connector set forfeits the thread.
   //
   // Codex freezes the developer instructions too, and that one is a privacy
-  // matter (#1832). Measured on the pinned 0.160.0: thread/resume re-sends
+  // matter (#1832). Measured on the pinned 0.166.0: thread/resume re-sends
   // the developer message rebuilt from the rollout and silently ignores the
   // new developerInstructions (config.developer_instructions, thread/fork and
   // a compaction after resume all fare no better: the compaction even hands
@@ -1026,7 +1026,7 @@ export async function createCodexDriver(s, spec, h) {
   // below), then injected with the experimental thread/inject_items, which
   // records raw items into the new thread's history right after the initial
   // context thread/start wrote: the new developer message, the old turns,
-  // then the next message. Measured on the pinned 0.160.0.
+  // then the next message. Measured on the pinned 0.166.0.
   //
   // Any failure to read the old conversation starts a plain fresh thread,
   // which loses the model's context but never its privacy. Only thread/start
@@ -1064,7 +1064,7 @@ export async function createCodexDriver(s, spec, h) {
   }
 
   // The old thread's CURRENT rollout, as the app-server resolves it
-  // (thread.path, marked [UNSTABLE] in 0.160.0). A paginated thread that was
+  // (thread.path, marked [UNSTABLE] in 0.166.0). A paginated thread that was
   // reverted has several rollout files, and only the app-server's state
   // database knows which one is current, so the search under sessions/ that
   // stands in when thread/read fails accepts a single candidate only.
@@ -1632,7 +1632,7 @@ const CODEX_SUMMARY_PREFIX = 'Another language model started to solve this probl
   'summary produced by the other language model, use the information in this summary to assist with your ' +
   'own analysis:'
 
-// The ResponseItem variants codex 0.160.0 keeps in history (protocol
+// The ResponseItem variants codex 0.166.0 keeps in history (protocol
 // models.rs, context_manager/history.rs is_api_message). Any other type
 // deserializes as `Other`, which codex drops.
 const HISTORY_ITEM_TYPES = new Set([

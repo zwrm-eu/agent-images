@@ -122,9 +122,9 @@ const PI_DEFAULT_RESERVE_TOKENS = 16_384
 // compactionReserves returns, for every catalog model whose window is
 // larger, the reserveTokens that makes it compact at COMPACT_AT_TOKENS: the
 // window minus that size. Smaller windows keep pi's default, which already
-// compacts below it. pi also caps a compaction's summaries by the reserve
-// (0.8 x for the history, 0.5 x for a split turn's prefix); with these
-// reserves the model's own maxTokens is the tighter cap.
+// compacts below it. The reserve only decides when pi compacts: since pi 1.4
+// a compaction's summaries are capped by the model's own output limit, not
+// by the reserve.
 //
 // Keyed "<provider>/<id>" as pi keys a model's compaction settings, so a
 // model switched to mid-session is covered too. Empty when the catalog
