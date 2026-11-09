@@ -34,7 +34,13 @@ ENV PATH="/usr/local/go/bin:${PATH}"
 # start; these are the tools those instructions drive (derived from the
 # pinned anthropics/skills SKILL.mds — soffice/qpdf/poppler/tesseract for
 # conversion+inspection, the python libs for authoring, docx/pptxgenjs for
-# the skills' JS creation paths).
+# the skills' JS creation paths, react-icons/react/react-dom/sharp for the
+# pptx skill's icons, Carlito/Caladea/URW base35 so the fonts the pptx skill
+# calls safe (Calibri, Cambria, Bookman, Century Schoolbook) render at their
+# real widths in its LibreOffice QA, pyyaml for skill-creator's validator).
+# Since the 2026-11 pin the docx and pptx skills say
+# their JS packages are preinstalled and require() them straight away, so
+# NODE_PATH points plain require() at the global modules.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libreoffice-writer \
     libreoffice-calc \
@@ -45,13 +51,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     tesseract-ocr \
     fonts-liberation \
     fonts-dejavu-core \
+    fonts-crosextra-carlito \
+    fonts-crosextra-caladea \
+    fonts-urw-base35 \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 RUN python3 -m pip install --no-cache-dir \
     openpyxl python-docx python-pptx pypdf pdfplumber reportlab \
-    pdf2image pytesseract Pillow lxml defusedxml "markitdown[docx,pptx,xlsx,pdf]"
+    pdf2image pytesseract Pillow lxml defusedxml pyyaml "markitdown[docx,pptx,xlsx,pdf]"
 
-RUN npm install -g docx pptxgenjs && npm cache clean --force
+RUN npm install -g docx pptxgenjs react-icons react react-dom sharp && npm cache clean --force
+ENV NODE_PATH=/usr/local/lib/node_modules
 
 # -- Rust (system-wide: /usr/local, NOT /home/agent — #1347) --------------------
 # Everything under /home/agent is copied into /etc/skel/agent-skel and seeded
