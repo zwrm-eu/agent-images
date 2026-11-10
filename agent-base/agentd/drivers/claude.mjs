@@ -155,7 +155,7 @@ export const CLAUDE_SESSION_ENV = Object.freeze({
 // would take the daemon down too (no event), and the platform's own stop
 // paths (interrupt/end) never SIGKILL the child. dmesg/kmsg confirmation
 // strengthens the detail but the heuristic stands without it.
-function classifyRunError(err) {
+export function classifyRunError(err) {
   // Full stack (incl. frames/paths) drives the pattern match, but the
   // user-facing fallback message uses the SHORT message — a stack trace must
   // never render verbatim in the operator's timeline (#793 review).
@@ -174,6 +174,19 @@ function classifyRunError(err) {
     return {
       cause: 'crashed',
       message: `The agent process was terminated (${sig[1]}). See the session timeline for its last action.`,
+      detail: raw,
+    }
+  }
+  // The CLI's text for a turn that ended without a usable reply: aborted, or
+  // finished on a message it doesn't count as one. When the CLI then exits
+  // non-zero, the SDK throws this result text in place of the exit error, even
+  // a signal's, so what ended the session can't be told from here. Any errors
+  // the CLI adds after the marker do say something, so they stay.
+  const diagnostic = shortMsg.match(/^Claude Code returned an error result: \[ede_diagnostic\][^;]*(?:; ([\s\S]*))?$/)
+  if (diagnostic) {
+    return {
+      cause: 'crashed',
+      message: `The agent's session ended unexpectedly. ${diagnostic[1] || 'See the session timeline for its last action.'}`,
       detail: raw,
     }
   }

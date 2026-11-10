@@ -497,3 +497,8 @@ test('a rule saved while a chat is live reaches it like a mode change (#2135)', 
   assert.match(handler, /inputHeld\(s\)/)
   assert.match(src, /'tool-asks'/)
 })
+
+test('a command aimed at node processes does not match the daemon', async () => {
+  const src = await readFile(SERVER, 'utf8')
+  assert.match(src, /^process\.title = 'zwrm-agentd'$/m)
+})

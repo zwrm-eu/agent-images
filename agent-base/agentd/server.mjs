@@ -83,6 +83,12 @@ import {
   withControl,
 } from './session-control.mjs'
 
+// An agent's `pkill -x node` or `pkill -f node` must not reach the daemon: it
+// runs under the same user, nothing restarts it, and its session and VM go with
+// it. This renames the process and its command line, so those miss it. A signal
+// sent to its pid still stops it.
+process.title = 'zwrm-agentd'
+
 const DEFAULT_PORT = 9924
 const MAX_BODY_BYTES = 1024 * 1024
 

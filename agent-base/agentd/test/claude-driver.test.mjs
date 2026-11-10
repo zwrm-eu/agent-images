@@ -5,7 +5,7 @@
 // the test scripts the messages the CLI would send back.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { CLAUDE_SESSION_ENV, createClaudeDriver } from '../drivers/claude.mjs'
+import { CLAUDE_SESSION_ENV, classifyRunError, createClaudeDriver } from '../drivers/claude.mjs'
 import { TurnEventContext } from '../turn-events.mjs'
 import { createTaskLedger, levelTaskTtlMs } from '../drivers/claude-tasks.mjs'
 
@@ -795,4 +795,35 @@ test('leaving plan mode returns to full access with tools that ask (#2135)', asy
   await until(events, (ev) => statuses(ev) === 2, 'the status')
   assert.equal((await fake.options.canUseTool('Bash', { command: 'ls' }, { toolUseID: 'toolu_after' })).behavior, 'allow')
   fake.end()
+})
+
+const ERROR_RESULT = 'Claude Code returned an error result:'
+
+test('a turn that ended with no usable reply reads as a session ending, with the raw text kept', () => {
+  // The CLI writes this for aborted turns and for finished ones alike.
+  for (const stop of ['stop_reason=tool_use', 'stop_reason=null', 'stop_reason=pause_turn']) {
+    const c = classifyRunError(new Error(`${ERROR_RESULT} [ede_diagnostic] result_type=user last_content_type=n/a ${stop}`))
+    assert.equal(c.cause, 'crashed')
+    assert.equal(c.message, "The agent's session ended unexpectedly. See the session timeline for its last action.")
+    assert.match(c.detail, /\[ede_diagnostic\] result_type=user/)
+  }
+})
+
+test('errors the CLI adds after the diagnostic stay in the message', () => {
+  const c = classifyRunError(new Error(`${ERROR_RESULT} [ede_diagnostic] result_type=user last_content_type=n/a stop_reason=null; Error: Connection to MCP failed: 401; Error: second`))
+  assert.equal(c.message, "The agent's session ended unexpectedly. Error: Connection to MCP failed: 401; Error: second")
+  assert.doesNotMatch(c.message, /ede_diagnostic/)
+})
+
+test('any other error result keeps its own text, even one quoting the diagnostic', () => {
+  for (const text of [`${ERROR_RESULT} API Error: 401 invalid x-api-key`, `${ERROR_RESULT} tool said [ede_diagnostic] somewhere`]) {
+    const c = classifyRunError(new Error(text))
+    assert.equal(c.cause, 'error')
+    assert.equal(c.message, text)
+  }
+})
+
+test('a kill the error names still reads as out of memory, ahead of the diagnostic', () => {
+  const c = classifyRunError(new Error(`${ERROR_RESULT} [ede_diagnostic] result_type=user terminated by signal SIGKILL`))
+  assert.equal(c.cause, 'oom')
 })
