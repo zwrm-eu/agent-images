@@ -367,6 +367,27 @@ test('a subscription secret is written verbatim as the codex login', async () =>
   await ctx.driver.shutdownStop()
 })
 
+test('a subscription session runs on the platform\'s live login (#2328)', async () => {
+  const codexHome = mkdtempSync(join(tmpdir(), 'codexhome-'))
+  const live = subscriptionRecord({ last_refresh: '2026-11-19T10:00:00Z', tokens: { ...subscriptionRecord().tokens, refresh_token: 'rt-live' } })
+  const ctx = newHarness({ spec: { env: { CODEX_HOME: codexHome, OPENAI_CODEX_AUTH: JSON.stringify(subscriptionRecord()) } } })
+  ctx.h.codexLogin = { fetch: async () => ({ record: live, version: 7 }), writeBack: async () => { throw new Error('unexpected') } }
+  const built = await build(ctx)
+  assert.deepEqual(JSON.parse(readFileSync(join(codexHome, 'auth.json'), 'utf8')), live)
+  assert.match(readFileSync(join(codexHome, '.zwrm-auth-source'), 'utf8'), /^OPENAI_CODEX_AUTH [0-9a-f]{64} 7\n$/)
+  await built.driver.shutdownStop()
+})
+
+test('an expired ChatGPT login refuses the session with the fix (#2328)', async () => {
+  const codexHome = mkdtempSync(join(tmpdir(), 'codexhome-'))
+  const ctx = newHarness({ spec: { env: { CODEX_HOME: codexHome, OPENAI_CODEX_AUTH: JSON.stringify(subscriptionRecord()) } } })
+  ctx.h.codexLogin = {
+    fetch: async () => { throw Object.assign(new Error("The ChatGPT login (OPENAI_CODEX_AUTH) has expired. Run 'codex login' again."), { status: 409 }) },
+    writeBack: async () => { throw new Error('unexpected') },
+  }
+  await assert.rejects(build(ctx), (err) => err.status === 400 && /codex login/.test(err.message))
+})
+
 test('the subscription wins when both credentials are set', async () => {
   // Already-paid capacity beats surprise API charges: a leftover API key must
   // not quietly start billing an org that has a ChatGPT plan.

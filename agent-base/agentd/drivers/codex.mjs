@@ -51,6 +51,7 @@ import {
 } from './codex-translate.mjs'
 import { asksQuestions, codexQuestionInput, codexQuestionReply } from './questions.mjs'
 import { imageMessage } from './codex-images.mjs'
+import { CodexLoginSync } from './codex-login.mjs'
 // Pure naming/dispatch helpers — no MCP SDK import, so they load unconditionally.
 import {
   buildCodexRunTools,
@@ -211,10 +212,15 @@ export async function createCodexDriver(s, spec, h) {
     }
   }
 
+  // A ChatGPT login is kept current by the platform (#2328): the session
+  // runs on its live copy, and renewals codex makes here go back to it.
+  const loginSync = subscriptionRecord
+    ? new CodexLoginSync({ client: h.codexLogin || null, authPath, markerPath: authMarkerPath, log: h.log })
+    : null
   let authWriteErr = null
   try {
     if (subscriptionRecord) {
-      await writeAuth(subscriptionRecord, 'OPENAI_CODEX_AUTH')
+      await loginSync.start(subscriptionRecord)
     } else if (apiKey) {
       await writeAuth({ auth_mode: 'apikey', OPENAI_API_KEY: apiKey }, 'OPENAI_API_KEY')
     } else {
@@ -238,6 +244,9 @@ export async function createCodexDriver(s, spec, h) {
       }
     }
   } catch (err) {
+    // OpenAI refused the login for good: say so, with the fix, rather than
+    // start a codex that fails every turn with an opaque system error.
+    if (err?.codexLoginExpired) throw err
     // Not fatal on its own: an existing login may still carry the session.
     // Failing here would turn a recoverable state into a hard refusal.
     h.log(`codex: could not update ${authPath}: ${err?.message || err}`)
@@ -768,6 +777,9 @@ export async function createCodexDriver(s, spec, h) {
             if (gen !== abortGen || status === 'interrupted') return
             await emitResult(status === 'failed' ? 'error_during_execution' : 'success')
           })
+          // Off the reaction chain: a slow platform must not hold up the
+          // next turn's events.
+          if (loginSync) void loginSync.afterTurn()
           break
         }
 
@@ -1215,6 +1227,9 @@ export async function createCodexDriver(s, spec, h) {
 
   function startTurn(text) {
     const myGen = abortGen
+    // A session idle across a platform renewal holds the spent refresh token
+    // in memory: put the live login on disk, where codex re-reads it.
+    if (loginSync) void loginSync.afterTurn()
     turnActive = true
     // turn/started supplies the id we steer against; until it lands, further
     // messages queue in pendingSteers rather than racing a second turn.

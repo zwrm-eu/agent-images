@@ -70,6 +70,7 @@ import {
 import { loadImageMCPServers, withImageServers } from './image-mcp.mjs'
 import { desktopStatus, loadDesktop, relayVNC, startDesktop, writeControl } from './desktop.mjs'
 import { byteRange, UploadCounter, uploadBudget, volumeFullError } from './workspace-files.mjs'
+import { codexLoginClient } from './drivers/codex-login.mjs'
 import {
   executeShellCommand,
   MAX_SHELL_OUTPUT_BYTES,
@@ -393,6 +394,8 @@ async function startSession(spec) {
     isEscalatedTool,
     VERSION,
     MAX_SLEEP_SECONDS,
+    // The codex ChatGPT login, kept current by the control plane (#2328).
+    codexLogin: codexLoginClient(broker, spec),
   }
   s.helpers = helpers
 
