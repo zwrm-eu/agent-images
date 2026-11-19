@@ -50,6 +50,7 @@ import {
   usagePayload,
 } from './codex-translate.mjs'
 import { asksQuestions, codexQuestionInput, codexQuestionReply } from './questions.mjs'
+import { imageMessage } from './codex-images.mjs'
 // Pure naming/dispatch helpers — no MCP SDK import, so they load unconditionally.
 import {
   buildCodexRunTools,
@@ -103,6 +104,10 @@ export const SUPPORTED_PERMISSION_MODES = new Set(['default', 'bypassPermissions
 export async function createCodexDriver(s, spec, h) {
   const home = process.env.HOME || '/home/agent'
   const cwd = spec.cwd || home
+  // Where images from codex's image tool land (#2328): the deliverables
+  // folder (#903), top level, as only top-level files there are a run's
+  // deliverables. The helpers bag may point elsewhere (tests).
+  const imagesDir = h.outputsDir || `${home}/outputs`
 
   let mode = spec.permission_mode || 'bypassPermissions'
   if (!SUPPORTED_PERMISSION_MODES.has(mode)) {
@@ -707,9 +712,19 @@ export async function createCodexDriver(s, spec, h) {
             else h.log('codex: todoList item with unrecognized shape dropped')
           } else if (item?.type === 'contextCompaction') {
             onCompacted(compactionTokens(item), true)
+          } else if (item?.type === 'imageGeneration') {
+            // codex's built-in image tool (#2328): the image goes into the
+            // deliverables folder and into the chat as an image.
+            try {
+              const payload = imageMessage(item, imagesDir, currentModel)
+              if (payload) s.pusher.emit('sdk.assistant', payload)
+              else h.log(`codex: image item ${item.id} (status ${item.status}) carried no image file`)
+            } catch (err) {
+              h.log(`codex: could not save generated image ${item.id}: ${err?.message || err}`)
+            }
           } else if (item?.type) {
-            // ThreadItem is a growing union (plan, collabAgentToolCall,
-            // imageGeneration, …). Dropping a shape this
+            // ThreadItem is a growing union (plan, collabAgentToolCall, …).
+            // Dropping a shape this
             // build cannot render beats putting an unreadable payload in the
             // durable timeline — but it must not be silent, because the pin
             // will move and a dropped TOOL CALL would be invisible.

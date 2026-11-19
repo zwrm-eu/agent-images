@@ -213,6 +213,18 @@ async function runTurn(turnId) {
     })
   }
 
+  if (scenario === 'image') {
+    // codex's built-in image tool (#2328): the item names the file codex
+    // saved; FAKE_CODEX_IMAGE points at one the test wrote.
+    notify('item/completed', {
+      threadId: THREAD_ID, turnId,
+      item: {
+        type: 'imageGeneration', id: 'item-img', status: 'completed', generationId: 'ig_fake',
+        revisedPrompt: 'A calm stock chart at dawn', savedPath: process.env.FAKE_CODEX_IMAGE,
+      },
+    })
+  }
+
   if (scenario === 'interrupt' || scenario === 'steer-precondition') {
     // Never completes on its own: the turn stays live so the driver must
     // interrupt it, or (steer-precondition) so a second message genuinely

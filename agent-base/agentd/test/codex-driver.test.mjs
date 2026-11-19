@@ -191,6 +191,32 @@ test('a todoList thread item becomes a todo.updated snapshot, not a transcript e
   await ctx.driver.shutdownStop()
 })
 
+test('an imageGeneration item lands in the outputs folder and in the chat as an image (#2328)', async () => {
+  const genDir = mkdtempSync(join(tmpdir(), 'codexgen-'))
+  const src = join(genDir, 'ig_fake.png')
+  writeFileSync(src, 'png-bytes')
+  const ctx = newHarness({ scenario: 'image', spec: { env: { FAKE_CODEX_IMAGE: src } } })
+  ctx.h.outputsDir = mkdtempSync(join(tmpdir(), 'outputs-'))
+  const built = await build(ctx)
+  built.driver.start()
+  assert.equal(built.driver.queueMessage('draw it'), true)
+  await until(built.events, (e) => ofType(e, 'sdk.result').length > 0, 'sdk.result')
+
+  const dest = join(ctx.h.outputsDir, 'ig_fake.png')
+  assert.equal(readFileSync(dest, 'utf8'), 'png-bytes')
+  const texts = ofType(built.events, 'sdk.assistant')
+    .flatMap((e) => e.payload?.message?.content ?? [])
+    .filter((b) => b?.type === 'text')
+    .map((b) => b.text)
+  const image = `![A calm stock chart at dawn](${dest})`
+  assert.ok(texts.includes(image), `no image message in ${JSON.stringify(texts)}`)
+  assert.ok(texts.indexOf(image) < texts.indexOf('MARKER'), 'the image keeps its place before the reply')
+  // The turn's result is still the agent's own reply, not the image.
+  assert.equal(ofType(built.events, 'sdk.result')[0].payload.result, 'MARKER')
+
+  await built.driver.shutdownStop()
+})
+
 test('setModel re-points the NEXT turn/start and leaves the thread alone (#1552)', async () => {
   const ctx = await build(newHarness({ scenario: 'simple', spec: { model: 'gpt-5.5', effort: 'medium' } }))
   ctx.driver.start()
